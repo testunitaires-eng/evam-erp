@@ -8,4 +8,5 @@ drf-spectacular==0.30.0
 PyJWT==2.7.0
 python-dotenv==1.2.2
 sqlparse==0.6.0
+gunicorn==23.0.0
 

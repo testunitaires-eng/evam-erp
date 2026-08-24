@@ -19,7 +19,8 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # --- Sécurité ---------------------------------------------------------
 SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", "cle-de-developpement-a-changer-en-production")
 DEBUG = os.getenv("DJANGO_DEBUG", "True") == "True"
-ALLOWED_HOSTS = os.getenv("DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1").split(",")
+# ALLOWED_HOSTS = os.getenv("DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1").split(",")
+ALLOWED_HOSTS = os.getenv("DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1,evam-erp-production.up.railway.app").split(",")
 
 # --- Applications -------------------------------------------------------
 INSTALLED_APPS = [

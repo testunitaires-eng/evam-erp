@@ -105,6 +105,10 @@ AUTH_PASSWORD_VALIDATORS = [
     {"NAME": "django.contrib.auth.password_validation.NumericPasswordValidator"},
 ]
 
+
+CSRF_TRUSTED_ORIGINS = [
+    "https://evam-erp-production.up.railway.app",
+]
 # --- Internationalisation ----------------------------------------------
 LANGUAGE_CODE = "fr-fr"
 TIME_ZONE = "Africa/Brazzaville"

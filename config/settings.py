@@ -171,6 +171,16 @@ SIMPLE_JWT = {
     "ROTATE_REFRESH_TOKENS": True,
 }
 
-CORS_ALLOW_ALL_ORIGINS = DEBUG  # à restreindre explicitement en production
+# CORS_ALLOW_ALL_ORIGINS = DEBUG  # à restreindre explicitement en production
+# Autoriser explicitement ton front local et ton futur front en prod
+CORS_ALLOWED_ORIGINS = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    # Ajoute ici l'URL de ton front Vercel quand tu le déployeras :
+    # "https://ton-front.vercel.app",
+]
+
+# Optionnel si tu utilises des cookies d'authentification (session) :
+CORS_ALLOW_CREDENTIALS = True
 
 LOGIN_REDIRECT_URL = "/admin/"

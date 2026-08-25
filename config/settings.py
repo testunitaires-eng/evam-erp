@@ -10,6 +10,8 @@ import os
 from pathlib import Path
 from datetime import timedelta
 from dotenv import load_dotenv
+import dj_database_url
+
 
 load_dotenv()
 
@@ -88,13 +90,20 @@ WSGI_APPLICATION = "config.wsgi.application"
 # --- Base de données ------------------------------------------------
 # Par défaut : SQLite pour démarrer rapidement en développement.
 # En production, définir DATABASE_URL (ex. postgres://user:pass@host:5432/nom_bdd)
-DATABASES = {
-    "default": {
-        "ENGINE": "django.db.backends.sqlite3",
-        "NAME": BASE_DIR / "db.sqlite3",
-    }
-}
+# DATABASES = {
+#     "default": {
+#         "ENGINE": "django.db.backends.sqlite3",
+#         "NAME": BASE_DIR / "db.sqlite3",
+#     }
+# }
 
+
+DATABASES = {
+    "default": dj_database_url.config(
+        default=f"sqlite:///{BASE_DIR / 'db.sqlite3'}",
+        conn_max_age=600,
+    )
+}
 # --- Utilisateur personnalisé -----------------------------------------
 AUTH_USER_MODEL = "comptes.Utilisateur"
 
@@ -109,6 +118,7 @@ AUTH_PASSWORD_VALIDATORS = [
 CSRF_TRUSTED_ORIGINS = [
     "https://evam-erp-production.up.railway.app",
 ]
+
 # --- Internationalisation ----------------------------------------------
 LANGUAGE_CODE = "fr-fr"
 TIME_ZONE = "Africa/Brazzaville"

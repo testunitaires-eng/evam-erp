@@ -8,12 +8,16 @@ lecture), mais jamais modifiable via l'API (traçabilité intègre).
 """
 
 from rest_framework import viewsets
+from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
+from rest_framework.serializers import ModelSerializer
 from . import models, serializers
 from .permissions import role_required
 from .models import Profil
 
-class MoiSerializer(drf_serializers.ModelSerializer):
+
+class MoiSerializer(ModelSerializer):
     """
     Sérialiseur minimal pour /api/comptes/moi/ : uniquement ce dont le
     frontend a besoin pour savoir "qui est connecté et avec quel
@@ -43,7 +47,6 @@ def moi(request):
     une fois après connexion et sait exactement à qui il parle.
     """
     return Response(MoiSerializer(request.user).data)
-
 
 
 class UtilisateurViewSet(viewsets.ModelViewSet):

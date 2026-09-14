@@ -1,3 +1,4 @@
+from django.urls import path
 from rest_framework.routers import DefaultRouter
 from . import views
 
@@ -12,4 +13,3 @@ urlpatterns = [
     # UtilisateurViewSet (qui exige le profil ADMIN_SI).
     path("moi/", views.moi, name="moi"),
 ] + router.urls
-

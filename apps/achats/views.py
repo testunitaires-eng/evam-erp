@@ -1,29 +1,23 @@
 """
 Vues du module achats.
 
-Le Responsable Achat pilote l'intégralité du module : fournisseurs,
-contrats, catalogue, demandes, commandes. Le Magasinier reste
-responsable de la réception PHYSIQUE (cohérent avec son rôle dans les
-autres modules) mais le Responsable Achat peut aussi réceptionner et
-consulte tout en lecture. Comptabilité/DAF garde un accès transversal
-en lecture seule (contrôle).
+Droits gérés par la matrice (module ACHATS). Le Responsable Achat
+pilote l'essentiel ; le Magasinier a des droits partagés sur les
+réceptions et retours (cohérent avec son rôle physique).
 """
 
 from rest_framework import viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from . import models, serializers
-from apps.comptes.permissions import role_required, lecture_seule_pour
-from apps.comptes.models import Profil
-
-PROFILS_ACHATS = (Profil.RESPONSABLE_ACHATS, Profil.ADMIN_SI)
-PROFILS_LECTURE_ACHATS = (Profil.RESPONSABLE_ACHATS, Profil.ADMIN_SI, Profil.COMPTABILITE_DAF, Profil.RESPONSABLE_PRODUCTION)
+from apps.comptes.permissions import droit_matrice, a_le_droit
+from apps.comptes.models import Module
 
 
 class FournisseurViewSet(viewsets.ModelViewSet):
     queryset = models.Fournisseur.objects.all()
     serializer_class = serializers.FournisseurSerializer
-    permission_classes = [lecture_seule_pour(*PROFILS_ACHATS)]
+    permission_classes = [droit_matrice(Module.ACHATS)]
     filterset_fields = ["actif"]
     search_fields = ["code", "nom"]
 
@@ -32,10 +26,9 @@ class FournisseurViewSet(viewsets.ModelViewSet):
 
 
 class ContratFournisseurViewSet(viewsets.ModelViewSet):
-    """Gestion des contrats fournisseurs - exclusivement le Responsable Achat."""
     queryset = models.ContratFournisseur.objects.all()
     serializer_class = serializers.ContratFournisseurSerializer
-    permission_classes = [role_required(*PROFILS_ACHATS)]
+    permission_classes = [droit_matrice(Module.ACHATS)]
     filterset_fields = ["fournisseur", "statut"]
     search_fields = ["numero"]
 
@@ -44,26 +37,23 @@ class ContratFournisseurViewSet(viewsets.ModelViewSet):
 
 
 class ArticleFournisseurViewSet(viewsets.ModelViewSet):
-    """Le catalogue des produits fournis par chaque fournisseur, avec leur prix."""
     queryset = models.ArticleFournisseur.objects.all()
     serializer_class = serializers.ArticleFournisseurSerializer
-    permission_classes = [lecture_seule_pour(*PROFILS_ACHATS)]
+    permission_classes = [droit_matrice(Module.ACHATS)]
     filterset_fields = ["fournisseur", "article", "contrat"]
 
 
 class BesoinApprovisionnementViewSet(viewsets.ModelViewSet):
     queryset = models.BesoinApprovisionnement.objects.all()
     serializer_class = serializers.BesoinApprovisionnementSerializer
-    permission_classes = [lecture_seule_pour(*PROFILS_ACHATS)]
+    permission_classes = [droit_matrice(Module.ACHATS)]
     filterset_fields = ["article", "origine", "satisfait"]
 
 
 class DemandeAchatViewSet(viewsets.ModelViewSet):
     queryset = models.DemandeAchat.objects.all()
     serializer_class = serializers.DemandeAchatSerializer
-    permission_classes = [role_required(
-        *PROFILS_ACHATS, Profil.RESPONSABLE_PRODUCTION, Profil.MAGASINIER,
-    )]
+    permission_classes = [droit_matrice(Module.ACHATS)]
     filterset_fields = ["article", "statut", "demandeur"]
 
     def perform_create(self, serializer):
@@ -71,18 +61,18 @@ class DemandeAchatViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["post"])
     def approuver(self, request, pk=None):
-        """POST /api/achats/demandes/{id}/approuver/ - réservé au Responsable Achat."""
-        if request.user.profil != Profil.RESPONSABLE_ACHATS and not request.user.is_superuser:
-            return Response({"erreur": "Seul le Responsable Achat peut approuver une demande."}, status=403)
+        """POST /api/achats/demandes/{id}/approuver/ - nécessite peut_valider=True sur ACHATS."""
+        if not a_le_droit(request.user, Module.ACHATS, "peut_valider"):
+            return Response({"erreur": "Votre profil ne peut pas approuver une demande d'achat."}, status=403)
         demande = self.get_object()
         demande.approuver(request.user)
         return Response(self.get_serializer(demande).data)
 
     @action(detail=True, methods=["post"])
     def rejeter(self, request, pk=None):
-        """POST /api/achats/demandes/{id}/rejeter/ - réservé au Responsable Achat."""
-        if request.user.profil != Profil.RESPONSABLE_ACHATS and not request.user.is_superuser:
-            return Response({"erreur": "Seul le Responsable Achat peut rejeter une demande."}, status=403)
+        """POST /api/achats/demandes/{id}/rejeter/ - nécessite peut_valider=True sur ACHATS."""
+        if not a_le_droit(request.user, Module.ACHATS, "peut_valider"):
+            return Response({"erreur": "Votre profil ne peut pas rejeter une demande d'achat."}, status=403)
         demande = self.get_object()
         demande.rejeter(request.user)
         return Response(self.get_serializer(demande).data)
@@ -91,7 +81,7 @@ class DemandeAchatViewSet(viewsets.ModelViewSet):
 class CommandeFournisseurViewSet(viewsets.ModelViewSet):
     queryset = models.CommandeFournisseur.objects.all()
     serializer_class = serializers.CommandeFournisseurSerializer
-    permission_classes = [lecture_seule_pour(*PROFILS_ACHATS)]
+    permission_classes = [droit_matrice(Module.ACHATS)]
     filterset_fields = ["fournisseur", "statut"]
     search_fields = ["numero"]
 
@@ -100,7 +90,9 @@ class CommandeFournisseurViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["post"])
     def envoyer(self, request, pk=None):
-        """POST /api/achats/commandes/{id}/envoyer/ - passe la commande de Brouillon à Envoyée."""
+        """POST /api/achats/commandes/{id}/envoyer/ - nécessite peut_valider=True sur ACHATS."""
+        if not a_le_droit(request.user, Module.ACHATS, "peut_valider"):
+            return Response({"erreur": "Votre profil ne peut pas envoyer une commande fournisseur."}, status=403)
         commande = self.get_object()
         try:
             commande.envoyer()
@@ -112,14 +104,23 @@ class CommandeFournisseurViewSet(viewsets.ModelViewSet):
 class LigneCommandeFournisseurViewSet(viewsets.ModelViewSet):
     queryset = models.LigneCommandeFournisseur.objects.all()
     serializer_class = serializers.LigneCommandeFournisseurSerializer
-    permission_classes = [role_required(*PROFILS_ACHATS)]
+    permission_classes = [droit_matrice(Module.ACHATS)]
     filterset_fields = ["commande", "article"]
 
 
 class ReceptionAchatViewSet(viewsets.ModelViewSet):
+    """
+    Le Magasinier n'a pas peut_creer/peut_modifier sur ACHATS (réservés
+    au Responsable Achat pour fournisseurs/contrats/commandes) : on
+    réutilise donc peut_valider, que le Magasinier possède
+    spécifiquement pour réceptionner, sans lui donner accès au reste
+    du module.
+    """
     queryset = models.ReceptionAchat.objects.all()
     serializer_class = serializers.ReceptionAchatSerializer
-    permission_classes = [role_required(Profil.MAGASINIER, *PROFILS_ACHATS)]
+    permission_classes = [droit_matrice(Module.ACHATS, actions_supplementaires={
+        "create": "peut_valider", "update": "peut_valider", "partial_update": "peut_valider",
+    })]
     filterset_fields = ["commande", "conforme"]
 
     def perform_create(self, serializer):
@@ -129,11 +130,13 @@ class ReceptionAchatViewSet(viewsets.ModelViewSet):
 class LigneReceptionAchatViewSet(viewsets.ModelViewSet):
     queryset = models.LigneReceptionAchat.objects.all()
     serializer_class = serializers.LigneReceptionAchatSerializer
-    permission_classes = [role_required(Profil.MAGASINIER, *PROFILS_ACHATS)]
+    permission_classes = [droit_matrice(Module.ACHATS, actions_supplementaires={
+        "create": "peut_valider", "update": "peut_valider", "partial_update": "peut_valider",
+    })]
     filterset_fields = ["reception", "ligne_commande"]
 
     def perform_create(self, serializer):
-        """Met à jour automatiquement la quantité reçue de la ligne de commande et le stock."""
+        """Met à jour automatiquement la quantité reçue de la ligne de commande et le statut de la commande."""
         ligne = serializer.save()
         ligne_commande = ligne.ligne_commande
         ligne_commande.quantite_recue += ligne.quantite_recue
@@ -149,7 +152,9 @@ class LigneReceptionAchatViewSet(viewsets.ModelViewSet):
 class RetourFournisseurViewSet(viewsets.ModelViewSet):
     queryset = models.RetourFournisseur.objects.all()
     serializer_class = serializers.RetourFournisseurSerializer
-    permission_classes = [role_required(Profil.MAGASINIER, *PROFILS_ACHATS)]
+    permission_classes = [droit_matrice(Module.ACHATS, actions_supplementaires={
+        "create": "peut_valider", "update": "peut_valider", "partial_update": "peut_valider",
+    })]
     filterset_fields = ["reception", "article", "motif"]
 
     def perform_create(self, serializer):

@@ -1,39 +1,48 @@
 """
 Sérialiseurs DRF du module comptes.
-
-Chaque sérialiseur expose automatiquement tous les champs de son
-modèle (fields = "__all__") : les libellés visibles dans
-l'API (navigable browsable API de DRF) sont ceux définis en
-verbose_name dans models.py, donc déjà en français.
 """
 
 from rest_framework import serializers
 from . import models
 
+
 class UtilisateurSerializer(serializers.ModelSerializer):
-    password = serializers.CharField(write_only=True, required=False)
+    """
+    Expose explicitement les champs (plutôt que "__all__") pour ne
+    jamais renvoyer le mot de passe haché, et pour exposer le champ
+    Django natif `is_active` sous son nom métier français `actif`.
+    """
+    actif = serializers.BooleanField(source="is_active", read_only=True)
+
     class Meta:
         model = models.Utilisateur
-        fields = "__all__"
-
+        fields = [
+            "id", "username", "password", "first_name", "last_name", "email",
+            "profil", "telephone", "actif", "date_creation",
+            "desactive_par", "date_desactivation",
+        ]
+        extra_kwargs = {
+            "password": {"write_only": True},
+            "desactive_par": {"read_only": True},
+            "date_desactivation": {"read_only": True},
+        }
 
     def create(self, validated_data):
-        password = validated_data.pop("password", None)
-        user = models.Utilisateur(**validated_data)
-        if password:
-            user.set_password(password)
-        user.save()
-        return user
+        """Hache le mot de passe correctement (create() ne le fait pas par défaut)."""
+        mot_de_passe = validated_data.pop("password", None)
+        utilisateur = models.Utilisateur(**validated_data)
+        if mot_de_passe:
+            utilisateur.set_password(mot_de_passe)
+        utilisateur.save()
+        return utilisateur
 
     def update(self, instance, validated_data):
-        password = validated_data.pop("password", None)
-        for attr, value in validated_data.items():
-            setattr(instance, attr, value)
-        if password:
-            instance.set_password(password)
-        instance.save()
-        return instance
-
+        mot_de_passe = validated_data.pop("password", None)
+        utilisateur = super().update(instance, validated_data)
+        if mot_de_passe:
+            utilisateur.set_password(mot_de_passe)
+            utilisateur.save()
+        return utilisateur
 
 
 class MatriceDroitSerializer(serializers.ModelSerializer):
@@ -46,4 +55,3 @@ class JournalActionSerializer(serializers.ModelSerializer):
     class Meta:
         model = models.JournalAction
         fields = "__all__"
-

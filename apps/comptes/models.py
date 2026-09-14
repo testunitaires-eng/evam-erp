@@ -41,31 +41,55 @@ class Utilisateur(AbstractUser):
     """
     Compte utilisateur de l'application.
 
-    Hérite du modèle utilisateur standard de Django (login, mot de
-    passe, email...) et y ajoute le profil métier et le téléphone.
+    Hérite du modèle utilisateur standard de Django, qui fournit déjà
+    `is_active` : ce champ est LE mécanisme réel d'activation/
+    désactivation. SimpleJWT vérifie `is_active` à CHAQUE requête (pas
+    seulement à la connexion), donc désactiver un compte le coupe
+    immédiatement, même s'il a déjà un jeton JWT valide en cours.
+
+    (Une ancienne version de ce modèle avait un champ `actif` distinct
+    qui n'était jamais vérifié nulle part - un compte "désactivé" via
+    ce champ pouvait donc continuer à se connecter normalement. Ce
+    champ a été supprimé pour ne garder qu'un seul mécanisme, le bon.)
     """
     profil = models.CharField(
         "Profil",
         max_length=32,
         choices=Profil.choices,
         help_text="Rôle métier de l'utilisateur dans l'application. "
-                   "Détermine ses droits d'accès par défaut.",
+                   "Détermine ses droits d'accès via la matrice de droits.",
     )
     telephone = models.CharField("Téléphone", max_length=30, blank=True)
-    actif = models.BooleanField(
-        "Compte actif",
-        default=True,
-        help_text="Un compte désactivé ne peut plus se connecter, "
-                   "sans supprimer son historique d'actions.",
-    )
     date_creation = models.DateTimeField("Date de création", auto_now_add=True)
+    desactive_par = models.ForeignKey(
+        "self", verbose_name="Désactivé par", on_delete=models.SET_NULL,
+        null=True, blank=True, related_name="comptes_desactives",
+        help_text="Traçabilité : qui a désactivé ce compte, le cas échéant.",
+    )
+    date_desactivation = models.DateTimeField("Date de désactivation", null=True, blank=True)
 
     class Meta:
         verbose_name = "Utilisateur"
         verbose_name_plural = "Utilisateurs"
 
     def __str__(self):
-        return f"{self.get_full_name() or self.username} ({self.get_profil_display()})"
+        etat = "actif" if self.is_active else "désactivé"
+        return f"{self.get_full_name() or self.username} ({self.get_profil_display()}, {etat})"
+
+    def desactiver(self, par_utilisateur):
+        """Désactive le compte. Effectif immédiatement sur toute requête suivante."""
+        from django.utils import timezone
+        self.is_active = False
+        self.desactive_par = par_utilisateur
+        self.date_desactivation = timezone.now()
+        self.save()
+
+    def activer(self):
+        """Réactive le compte."""
+        self.is_active = True
+        self.desactive_par = None
+        self.date_desactivation = None
+        self.save()
 
 
 class Module(models.TextChoices):

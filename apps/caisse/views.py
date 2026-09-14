@@ -1,30 +1,37 @@
 """
 Vues du module caisse.
 
+Droits gérés par la matrice (module CAISSE). La configuration des
+caisses physiques (CaisseViewSet) exige peut_parametrer=True - par
+défaut seul l'Admin SI l'a, donc le Caissier peut ouvrir des sessions
+sur une caisse existante mais pas en créer/modifier la fiche.
+
 Le Caissier ne peut PAS supprimer un écart -> aucune route DELETE
-n'est exposée sur EcartCaisse (on utilise un ModelViewSet mais on
-retire explicitement la méthode destroy), il doit toujours le
-justifier via un enregistrement.
+n'est exposée sur EcartCaisse, il doit toujours le justifier via un
+enregistrement.
 """
 
 from rest_framework import viewsets, mixins
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from . import models, serializers
-from apps.comptes.permissions import role_required
-from apps.comptes.models import Profil
+from apps.comptes.permissions import droit_matrice
+from apps.comptes.models import Module
 
 
 class CaisseViewSet(viewsets.ModelViewSet):
     queryset = models.Caisse.objects.all()
     serializer_class = serializers.CaisseSerializer
-    permission_classes = [role_required(Profil.ADMIN_SI)]
+    permission_classes = [droit_matrice(Module.CAISSE, actions_supplementaires={
+        "create": "peut_parametrer", "update": "peut_parametrer", "partial_update": "peut_parametrer",
+        "destroy": "peut_parametrer",
+    })]
 
 
 class SessionCaisseViewSet(viewsets.ModelViewSet):
     queryset = models.SessionCaisse.objects.all()
     serializer_class = serializers.SessionCaisseSerializer
-    permission_classes = [role_required(Profil.CAISSIER, Profil.ADMIN_SI, Profil.COMPTABILITE_DAF)]
+    permission_classes = [droit_matrice(Module.CAISSE)]
     filterset_fields = ["caisse", "caissier", "statut"]
 
     def perform_create(self, serializer):
@@ -55,7 +62,7 @@ class SessionCaisseViewSet(viewsets.ModelViewSet):
 class EncaissementViewSet(viewsets.ModelViewSet):
     queryset = models.Encaissement.objects.all()
     serializer_class = serializers.EncaissementSerializer
-    permission_classes = [role_required(Profil.CAISSIER, Profil.ADMIN_SI, Profil.COMPTABILITE_DAF)]
+    permission_classes = [droit_matrice(Module.CAISSE)]
     filterset_fields = ["session_caisse", "facture", "mode_paiement"]
     search_fields = ["numero"]
 
@@ -67,10 +74,9 @@ class EcartCaisseViewSet(
 ):
     """
     Volontairement PAS de DestroyModelMixin : un écart de caisse ne se
-    supprime jamais, il se justifie (règle explicite du cahier des
-    charges : "il doit le justifier").
+    supprime jamais, il se justifie.
     """
     queryset = models.EcartCaisse.objects.all()
     serializer_class = serializers.EcartCaisseSerializer
-    permission_classes = [role_required(Profil.CAISSIER, Profil.ADMIN_SI, Profil.COMPTABILITE_DAF)]
+    permission_classes = [droit_matrice(Module.CAISSE)]
     filterset_fields = ["session_caisse"]

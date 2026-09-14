@@ -1,19 +1,11 @@
 """
 Vues du module production.
 
-Contient les actions les plus importantes du workflow métier :
-- OrdreFabricationViewSet.avancer_statut : fait progresser l'OF dans
-  son workflow officiel et calcule automatiquement les besoins matières
-  au passage à "Lancé".
-- SortieMatiereViewSet : impose le motif obligatoire pour les sorties
-  complémentaires et exige la validation du Responsable Production.
-
-Le Responsable Production crée le plan et lance les OF ; l'Agent
-Production a un accès plus restreint (seulement ses OF affectés,
-saisie de quantités/temps/pertes/incidents) — cette restriction fine
-("uniquement les OF qui lui sont affectés") est un point à affiner
-avec le client (ajout probable d'un champ agents_affectes sur OF, ou
-d'un filtre côté queryset ici).
+Droits gérés par la matrice (module PRODUCTION). L'accès fin "un
+Agent Production ne voit que ses OF affectés" reste géré par
+get_queryset() (agents_affectes) : la matrice de droits gère le POUVOIR
+FAIRE une action, get_queryset() gère le PÉRIMÈTRE des données visibles
+- les deux mécanismes sont complémentaires, pas redondants.
 """
 
 from rest_framework import viewsets
@@ -21,14 +13,14 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from django.core.exceptions import ValidationError as DjangoValidationError
 from . import models, serializers
-from apps.comptes.permissions import role_required
-from apps.comptes.models import Profil
+from apps.comptes.permissions import droit_matrice, a_le_droit
+from apps.comptes.models import Profil, Module
 
 
 class PlanProductionViewSet(viewsets.ModelViewSet):
     queryset = models.PlanProduction.objects.all()
     serializer_class = serializers.PlanProductionSerializer
-    permission_classes = [role_required(Profil.RESPONSABLE_PRODUCTION, Profil.ADMIN_SI)]
+    permission_classes = [droit_matrice(Module.PRODUCTION)]
     filterset_fields = ["article", "statut", "priorite"]
 
     def perform_create(self, serializer):
@@ -38,9 +30,7 @@ class PlanProductionViewSet(viewsets.ModelViewSet):
 class OrdreFabricationViewSet(viewsets.ModelViewSet):
     queryset = models.OrdreFabrication.objects.all()
     serializer_class = serializers.OrdreFabricationSerializer
-    permission_classes = [role_required(
-        Profil.RESPONSABLE_PRODUCTION, Profil.AGENT_PRODUCTION, Profil.ADMIN_SI,
-    )]
+    permission_classes = [droit_matrice(Module.PRODUCTION)]
     filterset_fields = ["article", "statut"]
     search_fields = ["numero"]
 
@@ -48,7 +38,6 @@ class OrdreFabricationViewSet(viewsets.ModelViewSet):
         """
         Un Agent Production ne voit que les OF où il est affecté
         (agents_affectes), conformément au cahier des charges.
-        Le Responsable Production et l'Administrateur SI voient tout.
         """
         queryset = super().get_queryset()
         utilisateur = self.request.user
@@ -65,15 +54,13 @@ class OrdreFabricationViewSet(viewsets.ModelViewSet):
     def avancer_statut(self, request, pk=None):
         """
         POST /api/production/ordres-fabrication/{id}/avancer_statut/
-        Fait passer l'OF à l'étape suivante du workflow officiel
-        (Brouillon -> Planifié -> Lancé -> ... -> Clôturé, §8.3).
-        Réservé au Responsable Production (l'Agent Production ne peut
-        pas faire progresser le workflow, seulement saisir des données
-        d'exécution).
+        Nécessite peut_valider=True sur le module PRODUCTION (par
+        défaut : Responsable Production et Admin SI, pas l'Agent
+        Production qui saisit seulement des données d'exécution).
         """
-        if request.user.profil not in (Profil.RESPONSABLE_PRODUCTION, Profil.ADMIN_SI) and not request.user.is_superuser:
+        if not a_le_droit(request.user, Module.PRODUCTION, "peut_valider"):
             return Response(
-                {"erreur": "Seul le Responsable Production peut faire avancer le statut de l'OF."},
+                {"erreur": "Votre profil ne peut pas faire avancer le statut d'un OF."},
                 status=403,
             )
         of = self.get_object()
@@ -88,16 +75,14 @@ class BesoinMatierePrevuViewSet(viewsets.ReadOnlyModelViewSet):
     """Lecture seule : calculé automatiquement, jamais saisi à la main."""
     queryset = models.BesoinMatierePrevu.objects.all()
     serializer_class = serializers.BesoinMatierePrevuSerializer
-    permission_classes = [role_required(
-        Profil.RESPONSABLE_PRODUCTION, Profil.MAGASINIER, Profil.ADMIN_SI,
-    )]
+    permission_classes = [droit_matrice(Module.PRODUCTION)]
     filterset_fields = ["ordre_fabrication", "matiere"]
 
 
 class SortieMatiereViewSet(viewsets.ModelViewSet):
     queryset = models.SortieMatiere.objects.all()
     serializer_class = serializers.SortieMatiereSerializer
-    permission_classes = [role_required(Profil.MAGASINIER, Profil.ADMIN_SI)]
+    permission_classes = [droit_matrice(Module.PRODUCTION)]
     filterset_fields = ["ordre_fabrication", "matiere", "type_sortie"]
 
     def perform_create(self, serializer):
@@ -117,16 +102,14 @@ class SortieMatiereViewSet(viewsets.ModelViewSet):
 class RetourMatiereViewSet(viewsets.ModelViewSet):
     queryset = models.RetourMatiere.objects.all()
     serializer_class = serializers.RetourMatiereSerializer
-    permission_classes = [role_required(Profil.MAGASINIER, Profil.ADMIN_SI)]
+    permission_classes = [droit_matrice(Module.PRODUCTION)]
     filterset_fields = ["ordre_fabrication", "matiere"]
 
 
 class EtapeProductionViewSet(viewsets.ModelViewSet):
     queryset = models.EtapeProduction.objects.all()
     serializer_class = serializers.EtapeProductionSerializer
-    permission_classes = [role_required(
-        Profil.RESPONSABLE_PRODUCTION, Profil.AGENT_PRODUCTION, Profil.ADMIN_SI,
-    )]
+    permission_classes = [droit_matrice(Module.PRODUCTION)]
     filterset_fields = ["ordre_fabrication", "etape"]
 
     def get_queryset(self):
@@ -146,9 +129,7 @@ class EtapeProductionViewSet(viewsets.ModelViewSet):
 class PerteProductionViewSet(viewsets.ModelViewSet):
     queryset = models.PerteProduction.objects.all()
     serializer_class = serializers.PerteProductionSerializer
-    permission_classes = [role_required(
-        Profil.RESPONSABLE_PRODUCTION, Profil.AGENT_PRODUCTION, Profil.ADMIN_SI,
-    )]
+    permission_classes = [droit_matrice(Module.PRODUCTION)]
     filterset_fields = ["ordre_fabrication", "motif"]
 
     def get_queryset(self):

@@ -1,23 +1,23 @@
 """
 Vues du module qualité.
 
-Seul le Responsable Qualité peut faire passer un lot à LIBERE.
-Le Magasinier et le Commercial peuvent CONSULTER les lots (pour savoir
-ce qui est vendable/sortable) mais jamais modifier leur statut.
+Droits gérés par la matrice (module QUALITE). Par défaut : Responsable
+Qualité peut tout ; Magasinier et Commercial peuvent seulement
+consulter (savoir ce qui est vendable/sortable).
 """
 
 from rest_framework import viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from . import models, serializers
-from apps.comptes.permissions import role_required, lecture_seule_pour
-from apps.comptes.models import Profil
+from apps.comptes.permissions import droit_matrice, a_le_droit
+from apps.comptes.models import Module
 
 
 class LotViewSet(viewsets.ModelViewSet):
     queryset = models.Lot.objects.all()
     serializer_class = serializers.LotSerializer
-    permission_classes = [lecture_seule_pour(Profil.RESPONSABLE_QUALITE, Profil.ADMIN_SI)]
+    permission_classes = [droit_matrice(Module.QUALITE)]
     filterset_fields = ["article", "statut", "ordre_fabrication"]
     search_fields = ["numero_lot"]
 
@@ -25,11 +25,11 @@ class LotViewSet(viewsets.ModelViewSet):
     def liberer(self, request, pk=None):
         """
         POST /api/qualite/lots/{id}/liberer/
-        Réservé au Responsable Qualité. Ne fonctionne que si le lot
-        est au statut Conforme.
+        Nécessite peut_valider=True sur le module QUALITE. Ne
+        fonctionne que si le lot est au statut Conforme.
         """
-        if request.user.profil != Profil.RESPONSABLE_QUALITE and not request.user.is_superuser:
-            return Response({"erreur": "Seul le Responsable Qualité peut libérer un lot."}, status=403)
+        if not a_le_droit(request.user, Module.QUALITE, "peut_valider"):
+            return Response({"erreur": "Votre profil ne peut pas libérer un lot."}, status=403)
         lot = self.get_object()
         try:
             lot.liberer(request.user)
@@ -39,9 +39,9 @@ class LotViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["post"])
     def bloquer(self, request, pk=None):
-        """POST /api/qualite/lots/{id}/bloquer/ - réservé au Responsable Qualité."""
-        if request.user.profil != Profil.RESPONSABLE_QUALITE and not request.user.is_superuser:
-            return Response({"erreur": "Seul le Responsable Qualité peut bloquer un lot."}, status=403)
+        """POST /api/qualite/lots/{id}/bloquer/ - nécessite peut_valider=True sur QUALITE."""
+        if not a_le_droit(request.user, Module.QUALITE, "peut_valider"):
+            return Response({"erreur": "Votre profil ne peut pas bloquer un lot."}, status=403)
         lot = self.get_object()
         lot.bloquer(motif=request.data.get("motif", ""))
         return Response(self.get_serializer(lot).data)
@@ -50,7 +50,7 @@ class LotViewSet(viewsets.ModelViewSet):
 class ControleQualiteViewSet(viewsets.ModelViewSet):
     queryset = models.ControleQualite.objects.all()
     serializer_class = serializers.ControleQualiteSerializer
-    permission_classes = [role_required(Profil.RESPONSABLE_QUALITE, Profil.ADMIN_SI)]
+    permission_classes = [droit_matrice(Module.QUALITE)]
     filterset_fields = ["lot", "resultat"]
 
     def perform_create(self, serializer):

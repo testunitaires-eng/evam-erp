@@ -3,10 +3,8 @@ Module 12 - Administration / Droits.
 
 Ce module définit :
 - Utilisateur : le compte de connexion, avec un "profil" métier unique
-  (un des 11 acteurs identifiés dans le cahier des charges).
-- MatriceDroit : la matrice de droits configurable par profil et par
-  module (consulter / créer / modifier / valider / annuler / exporter /
-  paramétrer), telle que décrite dans le cahier des charges.
+  (un des 12 acteurs identifiés dans le projet).
+- JournalAction : la traçabilité systématique des actions importantes.
 
 Les autres applications importent PROFIL_CHOICES depuis ce fichier
 pour restreindre leurs permissions (voir apps/comptes/permissions.py).
@@ -106,39 +104,6 @@ class Module(models.TextChoices):
     COUTS = "COUTS", "Coûts & Rentabilité"
     COMPTABILITE = "COMPTABILITE", "Pilotage / Comptabilité"
     ADMINISTRATION = "ADMINISTRATION", "Administration / Droits"
-
-
-class MatriceDroit(models.Model):
-    """
-    Une ligne de la matrice de droits : pour un profil donné et un
-    module donné, quelles actions sont autorisées.
-
-    Exemple métier du cahier des charges : le Magasinier ne peut PAS
-    créer/modifier une fiche technique -> une ligne
-    (MAGASINIER, REFERENTIEL, peut_modifier=False) formalise cette règle.
-
-    Cette table permet à l'Administrateur SI d'ajuster les droits
-    sans toucher au code (voir §Module 12 du cahier des charges).
-    """
-    profil = models.CharField("Profil", max_length=32, choices=Profil.choices)
-    module = models.CharField("Module", max_length=32, choices=Module.choices)
-
-    peut_consulter = models.BooleanField("Peut consulter", default=False)
-    peut_creer = models.BooleanField("Peut créer", default=False)
-    peut_modifier = models.BooleanField("Peut modifier", default=False)
-    peut_valider = models.BooleanField("Peut valider", default=False)
-    peut_annuler = models.BooleanField("Peut annuler", default=False)
-    peut_exporter = models.BooleanField("Peut exporter", default=False)
-    peut_parametrer = models.BooleanField("Peut paramétrer", default=False)
-
-    class Meta:
-        verbose_name = "Droit d'accès"
-        verbose_name_plural = "Matrice des droits d'accès"
-        unique_together = ("profil", "module")
-        ordering = ["profil", "module"]
-
-    def __str__(self):
-        return f"{self.get_profil_display()} / {self.get_module_display()}"
 
 
 class JournalAction(models.Model):

@@ -1,36 +1,42 @@
 """
 Vues du module stocks.
 
-Droits gérés par la matrice (module STOCKS). Par défaut, le Commercial
-a peut_consulter=True mais pas peut_modifier, ce qui reproduit la
-règle "consulte le stock disponible mais ne le modifie jamais" - sans
-que ce soit figé dans le code : un Administrateur SI peut ajuster ça
-depuis la matrice de droits si le besoin métier change.
+Le Commercial "consulte le stock disponible mais ne le modifie
+jamais" : StockArticle est donc en lecture seule pour tout le monde
+sauf Magasinier/Administrateur SI, alors que le Magasinier peut créer
+des mouvements (qui mettent StockArticle à jour, voir signals.py).
 """
 
 from rest_framework import viewsets
 from . import models, serializers
-from apps.comptes.permissions import droit_matrice
-from apps.comptes.models import Module
+from apps.comptes.permissions import role_required, lecture_seule_pour
+from apps.comptes.models import Profil
 
 
 class DepotViewSet(viewsets.ModelViewSet):
     queryset = models.Depot.objects.all()
     serializer_class = serializers.DepotSerializer
-    permission_classes = [droit_matrice(Module.STOCKS)]
+    permission_classes = [role_required(Profil.ADMIN_SI, Profil.MAGASINIER)]
 
 
 class StockArticleViewSet(viewsets.ModelViewSet):
+    """
+    Lecture ouverte à tous les profils authentifiés (Commercial doit
+    pouvoir consulter la disponibilité) ; écriture réservée au
+    Magasinier et à l'Administrateur SI.
+    """
     queryset = models.StockArticle.objects.all()
     serializer_class = serializers.StockArticleSerializer
-    permission_classes = [droit_matrice(Module.STOCKS)]
+    permission_classes = [lecture_seule_pour(Profil.MAGASINIER, Profil.ADMIN_SI)]
     filterset_fields = ["article", "depot"]
 
 
 class MouvementStockViewSet(viewsets.ModelViewSet):
     queryset = models.MouvementStock.objects.all()
     serializer_class = serializers.MouvementStockSerializer
-    permission_classes = [droit_matrice(Module.STOCKS)]
+    permission_classes = [role_required(
+        Profil.MAGASINIER, Profil.ADMIN_SI, Profil.COMPTABILITE_DAF,
+    )]
     filterset_fields = ["article", "depot", "type_mouvement"]
     search_fields = ["numero", "document_origine"]
 
@@ -58,7 +64,7 @@ def _appliquer_mouvement_au_stock(mouvement):
 class InventaireViewSet(viewsets.ModelViewSet):
     queryset = models.Inventaire.objects.all()
     serializer_class = serializers.InventaireSerializer
-    permission_classes = [droit_matrice(Module.STOCKS)]
+    permission_classes = [role_required(Profil.MAGASINIER, Profil.ADMIN_SI)]
     filterset_fields = ["depot", "statut"]
 
     def perform_create(self, serializer):
@@ -68,5 +74,5 @@ class InventaireViewSet(viewsets.ModelViewSet):
 class LigneInventaireViewSet(viewsets.ModelViewSet):
     queryset = models.LigneInventaire.objects.all()
     serializer_class = serializers.LigneInventaireSerializer
-    permission_classes = [droit_matrice(Module.STOCKS)]
+    permission_classes = [role_required(Profil.MAGASINIER, Profil.ADMIN_SI)]
     filterset_fields = ["inventaire", "article"]

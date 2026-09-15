@@ -14,12 +14,6 @@ class UtilisateurAdmin(admin.ModelAdmin):
     search_fields = ()
 
 
-@admin.register(models.MatriceDroit)
-class MatriceDroitAdmin(admin.ModelAdmin):
-    search_fields = ()
-
-
 @admin.register(models.JournalAction)
 class JournalActionAdmin(admin.ModelAdmin):
     search_fields = ()
-

@@ -1,11 +1,10 @@
 """
 Vues du module comptes.
 
-Les droits d'écriture sur ce module (créer un utilisateur, changer la
-matrice de droits) sont eux-mêmes régis par la matrice de droits, sur
-le module ADMINISTRATION - configurable comme le reste, mais avec une
-seule ligne cochée par défaut (ADMIN_SI) pour ne jamais se retrouver
-sans personne capable d'administrer les droits.
+Seul l'Administrateur SI (ou un superutilisateur) peut créer/modifier
+des utilisateurs. Le JournalAction est consultable par Comptabilité/
+DAF et Direction (accès transversal en lecture), mais jamais
+modifiable via l'API (traçabilité intègre).
 """
 
 from rest_framework import viewsets
@@ -14,8 +13,8 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.serializers import ModelSerializer
 from . import models, serializers
-from .permissions import droit_matrice
-from .models import Module
+from .permissions import role_required
+from .models import Profil, Module
 
 
 class MoiSerializer(ModelSerializer):
@@ -48,7 +47,7 @@ def moi(request):
 class UtilisateurViewSet(viewsets.ModelViewSet):
     queryset = models.Utilisateur.objects.all()
     serializer_class = serializers.UtilisateurSerializer
-    permission_classes = [droit_matrice(Module.ADMINISTRATION)]
+    permission_classes = [role_required(Profil.ADMIN_SI)]
     filterset_fields = ["profil", "is_active"]
     search_fields = ["username", "first_name", "last_name", "email"]
 
@@ -87,19 +86,12 @@ class UtilisateurViewSet(viewsets.ModelViewSet):
         return Response(self.get_serializer(utilisateur_cible).data)
 
 
-class MatriceDroitViewSet(viewsets.ModelViewSet):
-    queryset = models.MatriceDroit.objects.all()
-    serializer_class = serializers.MatriceDroitSerializer
-    permission_classes = [droit_matrice(Module.ADMINISTRATION, actions_supplementaires={
-        "create": "peut_parametrer", "update": "peut_parametrer", "partial_update": "peut_parametrer",
-    })]
-    filterset_fields = ["profil", "module"]
-
-
 class JournalActionViewSet(viewsets.ReadOnlyModelViewSet):
     """Lecture seule : le journal ne se modifie jamais depuis l'API."""
     queryset = models.JournalAction.objects.all()
     serializer_class = serializers.JournalActionSerializer
-    permission_classes = [droit_matrice(Module.ADMINISTRATION)]
+    permission_classes = [role_required(
+        Profil.ADMIN_SI, Profil.COMPTABILITE_DAF, Profil.DIRECTION,
+    )]
     filterset_fields = ["module", "utilisateur"]
     search_fields = ["action", "document_id"]

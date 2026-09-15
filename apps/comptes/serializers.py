@@ -45,12 +45,6 @@ class UtilisateurSerializer(serializers.ModelSerializer):
         return utilisateur
 
 
-class MatriceDroitSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = models.MatriceDroit
-        fields = "__all__"
-
-
 class JournalActionSerializer(serializers.ModelSerializer):
     class Meta:
         model = models.JournalAction

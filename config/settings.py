@@ -43,6 +43,9 @@ INSTALLED_APPS = [
     # Applications métier EVAM (un module = un "acteur principal"
     # du cahier des charges, voir README.md)
     "apps.core",            # Utilitaires transverses (numérotation, etc.)
+    "apps.fiscalite",
+    "apps.reporting",
+    "apps.reclamations",
     "apps.comptes",        # Module 12 - Utilisateurs, profils, droits
     "apps.referentiel",    # Module 2  - Articles, fiches techniques, conditionnement
     "apps.achats",         # Module 3  - Fournisseurs, besoins, commandes fournisseurs

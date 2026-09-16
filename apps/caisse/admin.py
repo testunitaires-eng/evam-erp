@@ -28,3 +28,8 @@ class EncaissementAdmin(admin.ModelAdmin):
 class EcartCaisseAdmin(admin.ModelAdmin):
     search_fields = ()
 
+
+
+@admin.register(models.Decaissement)
+class DecaissementAdmin(admin.ModelAdmin):
+    search_fields = ()

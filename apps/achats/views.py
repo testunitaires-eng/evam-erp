@@ -61,7 +61,7 @@ class DemandeAchatViewSet(viewsets.ModelViewSet):
     queryset = models.DemandeAchat.objects.all()
     serializer_class = serializers.DemandeAchatSerializer
     permission_classes = [role_required(
-        *PROFILS_ACHATS, Profil.RESPONSABLE_PRODUCTION,
+        *PROFILS_ACHATS, Profil.RESPONSABLE_PRODUCTION, Profil.MAGASINIER,
     )]
     filterset_fields = ["article", "statut", "demandeur"]
 

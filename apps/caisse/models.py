@@ -60,24 +60,57 @@ class SessionCaisse(models.Model):
     def __str__(self):
         return f"Session {self.caisse.nom} - {self.caissier} ({self.get_statut_display()})"
 
+    # @property
+    # def ecart(self):
+    #     if self.solde_theorique_cloture is None or self.solde_compte_cloture is None:
+    #         return None
+    #     return self.solde_compte_cloture - self.solde_theorique_cloture
+
+    # def cloturer(self, solde_theorique, solde_compte):
+    #     """
+    #     Clôture la session. Si un écart existe, il doit obligatoirement
+    #     être justifié via EcartCaisse (voir vue caisse).
+    #     """
+    #     from django.utils import timezone
+    #     self.solde_theorique_cloture = solde_theorique
+    #     self.solde_compte_cloture = solde_compte
+    #     self.statut = StatutSession.CLOTUREE
+    #     self.date_cloture = timezone.now()
+    #     self.save()
+
+
+
     @property
     def ecart(self):
         if self.solde_theorique_cloture is None or self.solde_compte_cloture is None:
             return None
         return self.solde_compte_cloture - self.solde_theorique_cloture
 
-    def cloturer(self, solde_theorique, solde_compte):
+    def calculer_solde_theorique(self):
         """
-        Clôture la session. Si un écart existe, il doit obligatoirement
-        être justifié via EcartCaisse (voir vue caisse).
+        §9.2 : solde théorique = ouverture + encaissements - décaissements.
+        Utilisé par défaut à la clôture si aucun solde_theorique n'est
+        fourni explicitement.
         """
+        from django.db.models import Sum
+        total_encaissements = self.encaissements.aggregate(total=Sum("montant"))["total"] or 0
+        total_decaissements = self.decaissements.aggregate(total=Sum("montant"))["total"] or 0
+        return self.solde_ouverture + total_encaissements - total_decaissements
+
+    def cloturer(self, solde_compte, solde_theorique=None):
+        """
+        Clôture la session. Si solde_theorique n'est pas fourni, il est
+        calculé automatiquement (ouverture + encaissements - décaissements).
+        Si un écart existe, il doit obligatoirement être justifié via
+        EcartCaisse (voir vue caisse).
+        """
+        from decimal import Decimal
         from django.utils import timezone
-        self.solde_theorique_cloture = solde_theorique
-        self.solde_compte_cloture = solde_compte
+        self.solde_theorique_cloture = Decimal(str(solde_theorique)) if solde_theorique is not None else self.calculer_solde_theorique()
+        self.solde_compte_cloture = Decimal(str(solde_compte))
         self.statut = StatutSession.CLOTUREE
         self.date_cloture = timezone.now()
         self.save()
-
 
 class ModePaiement(models.TextChoices):
     ESPECES = "ESPECES", "Espèces"
@@ -136,3 +169,47 @@ class EcartCaisse(models.Model):
 
     def __str__(self):
         return f"Écart {self.montant_ecart} - session {self.session_caisse_id}"
+
+
+
+
+
+
+class Decaissement(models.Model):
+    """
+    §9.1/§9.2 : sortie de caisse autorisée (remboursement client,
+    dépense de fonctionnement...), distincte d'un encaissement.
+    Toujours rattachée à une session et à un motif ; nécessite une
+    autorisation (le caissier seul ne peut pas sortir d'argent sans
+    validation).
+    """
+    numero = models.CharField("Numéro", max_length=30, unique=True, editable=False)
+    session_caisse = models.ForeignKey(
+        SessionCaisse, verbose_name="Session de caisse", on_delete=models.PROTECT,
+        related_name="decaissements",
+    )
+    montant = models.DecimalField("Montant", max_digits=14, decimal_places=2)
+    motif = models.TextField("Motif")
+    beneficiaire = models.CharField("Bénéficiaire", max_length=200, blank=True)
+    autorise_par = models.ForeignKey(
+        Utilisateur, verbose_name="Autorisé par", on_delete=models.PROTECT,
+        related_name="decaissements_autorises",
+    )
+    effectue_par = models.ForeignKey(
+        Utilisateur, verbose_name="Effectué par (caissier)", on_delete=models.PROTECT,
+        related_name="decaissements_effectues",
+    )
+    date_decaissement = models.DateTimeField("Date", auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Décaissement"
+        verbose_name_plural = "Décaissements"
+        ordering = ["-date_decaissement"]
+
+    def __str__(self):
+        return f"{self.numero} - {self.montant} ({self.beneficiaire or 'N/A'})"
+
+    def save(self, *args, **kwargs):
+        if not self.numero:
+            self.numero = generer_numero("DEC")
+        super().save(*args, **kwargs)

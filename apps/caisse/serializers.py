@@ -34,3 +34,10 @@ class EcartCaisseSerializer(serializers.ModelSerializer):
         model = models.EcartCaisse
         fields = "__all__"
 
+
+
+class DecaissementSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = models.Decaissement
+        fields = "__all__"
+        extra_kwargs = {"effectue_par": {"required": False}}

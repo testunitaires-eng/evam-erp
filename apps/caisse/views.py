@@ -72,3 +72,18 @@ class EcartCaisseViewSet(
     serializer_class = serializers.EcartCaisseSerializer
     permission_classes = [role_required(Profil.CAISSIER, Profil.ADMIN_SI, Profil.COMPTABILITE_DAF)]
     filterset_fields = ["session_caisse"]
+
+
+
+
+
+class DecaissementViewSet(viewsets.ModelViewSet):
+    """§9.1/§9.2 : sortie de caisse autorisée, distincte d'un encaissement."""
+    queryset = models.Decaissement.objects.all()
+    serializer_class = serializers.DecaissementSerializer
+    permission_classes = [role_required(Profil.CAISSIER, Profil.ADMIN_SI, Profil.COMPTABILITE_DAF)]
+    filterset_fields = ["session_caisse"]
+    search_fields = ["numero"]
+
+    def perform_create(self, serializer):
+        serializer.save(effectue_par=self.request.user)

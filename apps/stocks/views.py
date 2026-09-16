@@ -37,7 +37,8 @@ class MouvementStockViewSet(viewsets.ModelViewSet):
     permission_classes = [role_required(
         Profil.MAGASINIER, Profil.ADMIN_SI, Profil.COMPTABILITE_DAF,
     )]
-    filterset_fields = ["article", "depot", "type_mouvement"]
+    # filterset_fields = ["article", "depot", "type_mouvement"]
+    filterset_fields = ["article", "depot", "type_mouvement", "document_origine"]
     search_fields = ["numero", "document_origine"]
 
     def perform_create(self, serializer):

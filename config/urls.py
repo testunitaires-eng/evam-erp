@@ -25,6 +25,7 @@ urlpatterns = [
     # Modules métier (correspondance directe avec le cahier des charges)
     path("api/comptes/", include("apps.comptes.urls")),
     path("api/referentiel/", include("apps.referentiel.urls")),
+    path("api/fiscalite/", include("apps.fiscalite.urls")),
     path("api/achats/", include("apps.achats.urls")),
     path("api/stocks/", include("apps.stocks.urls")),
     path("api/production/", include("apps.production.urls")),
@@ -34,4 +35,6 @@ urlpatterns = [
     path("api/distribution/", include("apps.distribution.urls")),
     path("api/couts/", include("apps.couts.urls")),
     path("api/comptabilite/", include("apps.comptabilite.urls")),
+    path("api/reporting/", include("apps.reporting.urls")),
+    path("api/reclamations/", include("apps.reclamations.urls")),
 ]

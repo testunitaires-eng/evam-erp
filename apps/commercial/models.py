@@ -220,48 +220,48 @@ class Facture(models.Model):
     #         self.numero = generer_numero("FACT")
     #     super().save(*args, **kwargs)
 
-    # def ajouter_ligne(self, article, quantite, prix_unitaire_ht):
-    #     """
-    #     Ajoute une ligne à la facture en calculant et en FIGEANT les
-    #     taxes d'après le code fiscal de l'article au moment présent
-    #     (règle d'historisation du document fiscal : si la matrice
-    #     change plus tard, cette ligne garde les taux appliqués ici).
+    def ajouter_ligne(self, article, quantite, prix_unitaire_ht):
+        """
+        Ajoute une ligne à la facture en calculant et en FIGEANT les
+        taxes d'après le code fiscal de l'article au moment présent
+        (règle d'historisation du document fiscal : si la matrice
+        change plus tard, cette ligne garde les taux appliqués ici).
 
-    #     Lève ValueError si l'article n'a pas de code fiscal actif
-    #     (règle : un article non rattaché fiscalement ne peut pas être
-    #     facturé, voir Article.peut_etre_facture).
-    #     """
-    #     if not article.peut_etre_facture:
-    #         raise ValueError(
-    #             f"L'article {article.code} n'a pas de code fiscal actif : "
-    #             "impossible de le facturer tant qu'il n'est pas rattaché "
-    #             "à un code fiscal (voir le référentiel)."
-    #         )
-    #     montant_ht_ligne = quantite * prix_unitaire_ht
-    #     taxes = article.code_fiscal.calculer_taxes(montant_ht_ligne)
+        Lève ValueError si l'article n'a pas de code fiscal actif
+        (règle : un article non rattaché fiscalement ne peut pas être
+        facturé, voir Article.peut_etre_facture).
+        """
+        if not article.peut_etre_facture:
+            raise ValueError(
+                f"L'article {article.code} n'a pas de code fiscal actif : "
+                "impossible de le facturer tant qu'il n'est pas rattaché "
+                "à un code fiscal (voir le référentiel)."
+            )
+        montant_ht_ligne = quantite * prix_unitaire_ht
+        taxes = article.code_fiscal.calculer_taxes(montant_ht_ligne)
 
-    #     ligne = LigneFacture.objects.create(
-    #         facture=self, article=article, quantite=quantite,
-    #         prix_unitaire_ht=prix_unitaire_ht, code_fiscal=article.code_fiscal,
-    #         taux_tva_applique=taxes["taux_tva_applique"],
-    #         taux_accise_applique=taxes["taux_accise_applique"],
-    #         taux_centimes_applique=taxes["taux_centimes_applique"],
-    #         montant_ht=taxes["montant_ht"], montant_accise=taxes["montant_accise"],
-    #         montant_tva=taxes["montant_tva"], montant_centimes=taxes["montant_centimes"],
-    #         montant_ttc=taxes["montant_ttc"],
-    #     )
-    #     self.recalculer_totaux()
-    #     return ligne
+        ligne = LigneFacture.objects.create(
+            facture=self, article=article, quantite=quantite,
+            prix_unitaire_ht=prix_unitaire_ht, code_fiscal=article.code_fiscal,
+            taux_tva_applique=taxes["taux_tva_applique"],
+            taux_accise_applique=taxes["taux_accise_applique"],
+            taux_centimes_applique=taxes["taux_centimes_applique"],
+            montant_ht=taxes["montant_ht"], montant_accise=taxes["montant_accise"],
+            montant_tva=taxes["montant_tva"], montant_centimes=taxes["montant_centimes"],
+            montant_ttc=taxes["montant_ttc"],
+        )
+        self.recalculer_totaux()
+        return ligne
 
-    # def recalculer_totaux(self):
-    #     """Recalcule montant_ht_total, montant_taxes_total et montant_total à partir des lignes existantes."""
-    #     lignes = self.lignes_facture.all()
-    #     self.montant_ht_total = sum((l.montant_ht for l in lignes), start=0)
-    #     self.montant_taxes_total = sum(
-    #         (l.montant_accise + l.montant_tva + l.montant_centimes for l in lignes), start=0
-    #     )
-    #     self.montant_total = sum((l.montant_ttc for l in lignes), start=0)
-    #     self.save()
+    def recalculer_totaux(self):
+        """Recalcule montant_ht_total, montant_taxes_total et montant_total à partir des lignes existantes."""
+        lignes = self.lignes_facture.all()
+        self.montant_ht_total = sum((l.montant_ht for l in lignes), start=0)
+        self.montant_taxes_total = sum(
+            (l.montant_accise + l.montant_tva + l.montant_centimes for l in lignes), start=0
+        )
+        self.montant_total = sum((l.montant_ttc for l in lignes), start=0)
+        self.save()
 
     montant_total = models.DecimalField("Montant total TTC", max_digits=14, decimal_places=2, default=0)
     statut = models.CharField("Statut", max_length=25, choices=StatutFacture.choices, default=StatutFacture.EMISE)

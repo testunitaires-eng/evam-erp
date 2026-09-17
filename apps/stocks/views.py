@@ -13,12 +13,16 @@ from apps.comptes.permissions import role_required, lecture_seule_pour
 from apps.comptes.models import Profil
 
 
+# class DepotViewSet(viewsets.ModelViewSet):
+#     queryset = models.Depot.objects.all()
+#     serializer_class = serializers.DepotSerializer
+#     permission_classes = [role_required(Profil.ADMIN_SI, Profil.MAGASINIER)]
+
 class DepotViewSet(viewsets.ModelViewSet):
     queryset = models.Depot.objects.all()
     serializer_class = serializers.DepotSerializer
-    permission_classes = [role_required(Profil.ADMIN_SI, Profil.MAGASINIER)]
-
-
+    permission_classes = [lecture_seule_pour(Profil.ADMIN_SI, Profil.MAGASINIER)]
+    
 class StockArticleViewSet(viewsets.ModelViewSet):
     """
     Lecture ouverte à tous les profils authentifiés (Commercial doit

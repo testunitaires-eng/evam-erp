@@ -165,6 +165,7 @@ from django.core.exceptions import ValidationError as DjangoValidationError
 from . import models, serializers
 from apps.comptes.permissions import role_required
 from apps.comptes.models import Profil
+from apps.comptes.permissions import role_required, lecture_seule_pour
 
 
 class PlanProductionViewSet(viewsets.ModelViewSet):
@@ -191,10 +192,18 @@ class PlanProductionViewSet(viewsets.ModelViewSet):
         return Response(serializers.OrdreFabricationSerializer(of).data, status=201)
 
 
+# class OrdreFabricationViewSet(viewsets.ModelViewSet):
+#     queryset = models.OrdreFabrication.objects.all()
+#     serializer_class = serializers.OrdreFabricationSerializer
+#     permission_classes = [role_required(
+#         Profil.RESPONSABLE_PRODUCTION, Profil.AGENT_PRODUCTION, Profil.ADMIN_SI,
+#     )]
+#     filterset_fields = ["article", "statut"]
+
 class OrdreFabricationViewSet(viewsets.ModelViewSet):
     queryset = models.OrdreFabrication.objects.all()
     serializer_class = serializers.OrdreFabricationSerializer
-    permission_classes = [role_required(
+    permission_classes = [lecture_seule_pour(
         Profil.RESPONSABLE_PRODUCTION, Profil.AGENT_PRODUCTION, Profil.ADMIN_SI,
     )]
     filterset_fields = ["article", "statut"]
@@ -353,12 +362,16 @@ class DemandeComplementaireViewSet(viewsets.ModelViewSet):
         return Response(self.get_serializer(demande).data)
 
 
+# class SortieMatiereViewSet(viewsets.ModelViewSet):
+#     queryset = models.SortieMatiere.objects.all()
+#     serializer_class = serializers.SortieMatiereSerializer
+#     permission_classes = [role_required(Profil.MAGASINIER, Profil.ADMIN_SI)]
+#     filterset_fields = ["ordre_fabrication", "matiere", "type_sortie"]
 class SortieMatiereViewSet(viewsets.ModelViewSet):
     queryset = models.SortieMatiere.objects.all()
     serializer_class = serializers.SortieMatiereSerializer
-    permission_classes = [role_required(Profil.MAGASINIER, Profil.ADMIN_SI)]
+    permission_classes = [lecture_seule_pour(Profil.MAGASINIER, Profil.ADMIN_SI)]
     filterset_fields = ["ordre_fabrication", "matiere", "type_sortie"]
-
     def perform_create(self, serializer):
         instance = serializer.save()
         try:
@@ -368,12 +381,16 @@ class SortieMatiereViewSet(viewsets.ModelViewSet):
             raise DRFValidationError(erreur.messages if hasattr(erreur, "messages") else str(erreur))
 
 
+# class RetourMatiereViewSet(viewsets.ModelViewSet):
+#     queryset = models.RetourMatiere.objects.all()
+#     serializer_class = serializers.RetourMatiereSerializer
+#     permission_classes = [role_required(Profil.MAGASINIER, Profil.ADMIN_SI)]
+#     filterset_fields = ["ordre_fabrication", "matiere"]
 class RetourMatiereViewSet(viewsets.ModelViewSet):
     queryset = models.RetourMatiere.objects.all()
     serializer_class = serializers.RetourMatiereSerializer
-    permission_classes = [role_required(Profil.MAGASINIER, Profil.ADMIN_SI)]
+    permission_classes = [lecture_seule_pour(Profil.MAGASINIER, Profil.ADMIN_SI)]
     filterset_fields = ["ordre_fabrication", "matiere"]
-
 
 class SuiviProductionViewSet(viewsets.ModelViewSet):
     queryset = models.SuiviProduction.objects.all()

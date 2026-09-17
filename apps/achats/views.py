@@ -108,12 +108,17 @@ class CommandeFournisseurViewSet(viewsets.ModelViewSet):
         return Response(self.get_serializer(commande).data)
 
 
+# class LigneCommandeFournisseurViewSet(viewsets.ModelViewSet):
+#     queryset = models.LigneCommandeFournisseur.objects.all()
+#     serializer_class = serializers.LigneCommandeFournisseurSerializer
+#     permission_classes = [role_required(*PROFILS_ACHATS)]
+#     filterset_fields = ["commande", "article"]
+
 class LigneCommandeFournisseurViewSet(viewsets.ModelViewSet):
     queryset = models.LigneCommandeFournisseur.objects.all()
     serializer_class = serializers.LigneCommandeFournisseurSerializer
-    permission_classes = [role_required(*PROFILS_ACHATS)]
+    permission_classes = [lecture_seule_pour(*PROFILS_ACHATS)]
     filterset_fields = ["commande", "article"]
-
 
 class ReceptionAchatViewSet(viewsets.ModelViewSet):
     queryset = models.ReceptionAchat.objects.all()

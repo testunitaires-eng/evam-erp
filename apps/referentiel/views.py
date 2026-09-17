@@ -15,13 +15,19 @@ from apps.comptes.permissions import role_required, lecture_seule_pour
 from apps.comptes.models import Profil
 
 
+# class ArticleViewSet(viewsets.ModelViewSet):
+#     queryset = models.Article.objects.all()
+#     serializer_class = serializers.ArticleSerializer
+#     permission_classes = [lecture_seule_pour(Profil.RESPONSABLE_PRODUCTION, Profil.ADMIN_SI)]
+#     filterset_fields = ["type_article", "famille", "actif"]
+#     search_fields = ["code", "designation"]
+
 class ArticleViewSet(viewsets.ModelViewSet):
     queryset = models.Article.objects.all()
     serializer_class = serializers.ArticleSerializer
-    permission_classes = [lecture_seule_pour(Profil.RESPONSABLE_PRODUCTION, Profil.ADMIN_SI)]
+    permission_classes = [lecture_seule_pour(Profil.RESPONSABLE_PRODUCTION, Profil.RESPONSABLE_ACHATS, Profil.ADMIN_SI)]
     filterset_fields = ["type_article", "famille", "actif"]
     search_fields = ["code", "designation"]
-
 
 # class FicheTechniqueViewSet(viewsets.ModelViewSet):
 #     queryset = models.FicheTechnique.objects.all()
@@ -44,12 +50,18 @@ class ArticleViewSet(viewsets.ModelViewSet):
 
 
 
+# class FicheTechniqueViewSet(viewsets.ModelViewSet):
+#     queryset = models.FicheTechnique.objects.all()
+#     serializer_class = serializers.FicheTechniqueSerializer
+#     permission_classes = [role_required(Profil.RESPONSABLE_PRODUCTION, Profil.ADMIN_SI)]
+#     filterset_fields = ["article", "statut"]
+
+
 class FicheTechniqueViewSet(viewsets.ModelViewSet):
     queryset = models.FicheTechnique.objects.all()
     serializer_class = serializers.FicheTechniqueSerializer
-    permission_classes = [role_required(Profil.RESPONSABLE_PRODUCTION, Profil.ADMIN_SI)]
+    permission_classes = [lecture_seule_pour(Profil.RESPONSABLE_PRODUCTION, Profil.ADMIN_SI)]
     filterset_fields = ["article", "statut"]
-
     def perform_create(self, serializer):
         serializer.save(cree_par=self.request.user)
 

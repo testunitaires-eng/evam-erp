@@ -100,3 +100,43 @@ class ControleQualiteRequisViewSet(viewsets.ModelViewSet):
     serializer_class = serializers.ControleQualiteRequisSerializer
     permission_classes = [role_required(Profil.RESPONSABLE_PRODUCTION, Profil.RESPONSABLE_QUALITE, Profil.ADMIN_SI)]
     filterset_fields = ["article", "moment", "obligatoire"]
+
+
+
+
+
+
+class FamilleArticleViewSet(viewsets.ModelViewSet):
+    """Liste déroulante des familles - écriture Production/Achat/Admin, lecture ouverte à tous."""
+    queryset = models.FamilleArticle.objects.all()
+    serializer_class = serializers.FamilleArticleSerializer
+    permission_classes = [lecture_seule_pour(Profil.RESPONSABLE_PRODUCTION, Profil.RESPONSABLE_ACHATS, Profil.ADMIN_SI)]
+    filterset_fields = ["actif"]
+    search_fields = ["nom"]
+
+
+class FormatArticleViewSet(viewsets.ModelViewSet):
+    """Liste déroulante des formats."""
+    queryset = models.FormatArticle.objects.all()
+    serializer_class = serializers.FormatArticleSerializer
+    permission_classes = [lecture_seule_pour(Profil.RESPONSABLE_PRODUCTION, Profil.RESPONSABLE_ACHATS, Profil.ADMIN_SI)]
+    filterset_fields = ["actif"]
+    search_fields = ["valeur"]
+
+
+class ParfumViewSet(viewsets.ModelViewSet):
+    """Liste déroulante des parfums/variantes."""
+    queryset = models.Parfum.objects.all()
+    serializer_class = serializers.ParfumSerializer
+    permission_classes = [lecture_seule_pour(Profil.RESPONSABLE_PRODUCTION, Profil.RESPONSABLE_ACHATS, Profil.ADMIN_SI)]
+    filterset_fields = ["actif"]
+    search_fields = ["nom"]
+
+
+class UniteVenteArticleViewSet(viewsets.ModelViewSet):
+    """Liste déroulante des unités de vente."""
+    queryset = models.UniteVenteArticle.objects.all()
+    serializer_class = serializers.UniteVenteArticleSerializer
+    permission_classes = [lecture_seule_pour(Profil.RESPONSABLE_PRODUCTION, Profil.RESPONSABLE_ACHATS, Profil.ADMIN_SI)]
+    filterset_fields = ["actif"]
+    search_fields = ["nom"]

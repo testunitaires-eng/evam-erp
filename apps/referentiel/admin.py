@@ -1,9 +1,6 @@
-# """
-# Interface d'administration Django du module referentiel.
 
-# Accessible sur /admin/ - pratique pour vérifier ou corriger des
-# données rapidement sans passer par l'API, réservé en pratique à
-# l'Administrateur SI (superutilisateur Django).
+# """
+# Interface d'administration Django du module référentiel.
 # """
 
 # from django.contrib import admin
@@ -29,12 +26,38 @@
 #     search_fields = ()
 
 
+# @admin.register(models.ControleQualiteRequis)
+# class ControleQualiteRequisAdmin(admin.ModelAdmin):
+#     search_fields = ()
+
+
+
 """
 Interface d'administration Django du module référentiel.
 """
 
 from django.contrib import admin
 from . import models
+
+@admin.register(models.FamilleArticle)
+class FamilleArticleAdmin(admin.ModelAdmin):
+    search_fields = ()
+
+
+@admin.register(models.FormatArticle)
+class FormatArticleAdmin(admin.ModelAdmin):
+    search_fields = ()
+
+
+@admin.register(models.Parfum)
+class ParfumAdmin(admin.ModelAdmin):
+    search_fields = ()
+
+
+@admin.register(models.UniteVenteArticle)
+class UniteVenteArticleAdmin(admin.ModelAdmin):
+    search_fields = ()
+
 
 @admin.register(models.Article)
 class ArticleAdmin(admin.ModelAdmin):

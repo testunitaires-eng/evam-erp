@@ -187,7 +187,26 @@ from apps.core.validation import (
 )
 
 
-class Depot(models.Model):
+# Dépôts utilisés automatiquement par les autres modules, retrouvés PAR
+# LEUR NOM (voir depot_par_defaut). Ils sont créés par la migration
+# stocks/0002 et ne peuvent être ni renommés, ni désactivés, ni
+# supprimés : sinon les mouvements automatiques iraient dans un nouveau
+# dépôt vide (stock "introuvable", sorties refusées pour stock insuffisant).
+DEPOTS_SYSTEME = {
+    "Magasin principal": (
+        "Matières premières et emballages : réceptions achats, sorties et "
+        "retours matières de production, retours fournisseurs, réintégration "
+        "des retours clients."
+    ),
+    "Dépôt produits finis": (
+        "Produits finis : entrée à la libération qualité d'un lot, sortie "
+        "magasin pour livraison."
+    ),
+    "Quarantaine": "Retours clients en attente de contrôle.",
+}
+
+
+class Depot(ValidationAvantEnregistrement, models.Model):
     """Un lieu de stockage physique (usine, dépôt régional...)."""
     nom = models.CharField("Nom du dépôt", max_length=100)
     adresse = models.CharField("Adresse", max_length=255, blank=True)
@@ -199,6 +218,30 @@ class Depot(models.Model):
 
     def __str__(self):
         return self.nom
+
+    @property
+    def est_systeme(self):
+        return self.nom in DEPOTS_SYSTEME
+
+    def clean(self):
+        self.nom = (self.nom or "").strip()
+        if not self.nom:
+            raise ValidationError({"nom": "Le nom du dépôt est obligatoire."})
+        if Depot.objects.filter(nom__iexact=self.nom).exclude(pk=self.pk).exists():
+            raise ValidationError({"nom": f"Un dépôt nommé « {self.nom} » existe déjà."})
+        ancien_nom = valeur_en_base(self, "nom")
+        if ancien_nom in DEPOTS_SYSTEME:
+            if self.nom != ancien_nom:
+                raise ValidationError({"nom": (
+                    f"« {ancien_nom} » est un dépôt système utilisé automatiquement par "
+                    "les autres modules : il ne peut pas être renommé."
+                )})
+            if not self.actif:
+                raise ValidationError({"actif": f"« {ancien_nom} » est un dépôt système : il ne peut pas être désactivé."})
+
+    def verifier_suppression(self):
+        if self.est_systeme:
+            raise ValidationError(f"« {self.nom} » est un dépôt système : il ne peut pas être supprimé.")
 
 
 def depot_par_defaut(nom):

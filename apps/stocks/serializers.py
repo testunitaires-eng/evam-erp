@@ -12,9 +12,17 @@ from apps.core.serializers import ValidationModeleMixin
 from . import models
 
 class DepotSerializer(ValidationModeleMixin, serializers.ModelSerializer):
+    # Permet au frontend de verrouiller nom/actif et de masquer la
+    # suppression pour les dépôts utilisés automatiquement par le code.
+    est_systeme = serializers.BooleanField(read_only=True)
+    role = serializers.SerializerMethodField()
+
     class Meta:
         model = models.Depot
         fields = "__all__"
+
+    def get_role(self, depot):
+        return models.DEPOTS_SYSTEME.get(depot.nom, "")
 
 
 class StockArticleSerializer(ValidationModeleMixin, serializers.ModelSerializer):

@@ -320,3 +320,25 @@ class AchatsEtDistributionTests(BaseValidation):
         self.assertEqual(self.api.post(f"/api/distribution/preparations/{preparation.id}/confirmer_sortie/").status_code, 200)
         self.assert_refus(self.api.post(f"/api/distribution/preparations/{preparation.id}/confirmer_sortie/"))
         self.assertEqual(StockArticle.objects.get(article=self.produit).quantite_physique, Decimal("90"))
+
+
+class ParametrageTests(BaseValidation):
+    def test_depots_et_caisse_crees_par_les_migrations(self):
+        from apps.stocks.models import Depot, DEPOTS_SYSTEME
+        for nom in DEPOTS_SYSTEME:
+            self.assertTrue(Depot.objects.filter(nom=nom, actif=True).exists(), nom)
+        self.assertTrue(Caisse.objects.filter(nom="Caisse principale").exists())
+
+    def test_depot_systeme_protege(self):
+        depot = depot_par_defaut("Magasin principal")
+        url = f"/api/stocks/depots/{depot.id}/"
+        self.assertTrue(self.api.get(url).data["est_systeme"])
+        self.assert_refus(self.api.patch(url, {"nom": "Dépôt matières premières"}, format="json"))
+        self.assert_refus(self.api.patch(url, {"actif": False}, format="json"))
+        self.assert_refus(self.api.delete(url))
+        depot.refresh_from_db()
+        self.assertEqual((depot.nom, depot.actif), ("Magasin principal", True))
+
+    def test_nom_de_depot_en_double_refuse(self):
+        self.assert_refus(self.api.post("/api/stocks/depots/", {"nom": "dépôt produits finis"}, format="json"))
+        self.assertEqual(self.api.post("/api/stocks/depots/", {"nom": "Dépôt Pointe-Noire"}, format="json").status_code, 201)

@@ -1062,10 +1062,40 @@ utilisé par les modèles dépendants (SortieMatiere, RetourMatiere...)
 pour refuser toute nouvelle écriture une fois l'OF CLOTURE ou ANNULE.
 """
 
-from django.db import models
+from django.core.exceptions import ValidationError
+from django.db import models, transaction
 from apps.comptes.models import Utilisateur
 from apps.referentiel.models import Article
 from apps.core.models import generer_numero
+from apps.core.validation import (
+    ValidationAvantEnregistrement, exiger_positif, exiger_positif_optionnel,
+    exiger_ordre_dates, exiger_pourcentage, valeur_en_base, verifier_transition,
+    convertir_decimal,
+)
+
+
+class SaisieSurOFMixin:
+    """
+    Règles communes à toute saisie rattachée à un OF (sorties, retours,
+    suivis, étapes, pertes...) : §5.14.4 "une fois clôturé, l'OF ne doit
+    plus être modifiable librement" -> aucune création, modification ni
+    suppression sur un OF clôturé ou annulé, et une saisie ne peut pas
+    être déplacée vers un autre OF.
+    """
+
+    def controler_of(self):
+        if self.pk and valeur_en_base(self, "ordre_fabrication") != self.ordre_fabrication_id:
+            raise ValidationError({"ordre_fabrication": "L'OF d'une saisie existante ne peut pas être changé."})
+        if self.ordre_fabrication_id and self.ordre_fabrication.est_verrouille:
+            of = self.ordre_fabrication
+            raise ValidationError({"ordre_fabrication": (
+                f"L'OF {of.numero} est {of.get_statut_display().lower()} : plus aucune saisie n'est possible."
+            )})
+
+    def verifier_suppression(self):
+        of = self.ordre_fabrication
+        if of.est_verrouille:
+            raise ValidationError(f"L'OF {of.numero} est {of.get_statut_display().lower()} : ses saisies sont figées.")
 
 
 class Priorite(models.TextChoices):
@@ -1088,7 +1118,7 @@ class StatutPlanProduction(models.TextChoices):
     ANNULEE = "ANNULEE", "Annulée"
 
 
-class PlanProduction(models.Model):
+class PlanProduction(ValidationAvantEnregistrement, models.Model):
     """Le programme / prévision de production (§5.3), avant conversion en OF."""
     article = models.ForeignKey(Article, verbose_name="Article à produire", on_delete=models.PROTECT)
     date_prevue = models.DateField("Date prévue")
@@ -1110,6 +1140,28 @@ class PlanProduction(models.Model):
     def __str__(self):
         return f"Plan {self.article.code} - {self.date_prevue} ({self.quantite_prevue})"
 
+    TRANSITIONS = {
+        StatutPlanProduction.PREVISION: {
+            StatutPlanProduction.A_CONVERTIR_EN_OF, StatutPlanProduction.CONVERTIE, StatutPlanProduction.ANNULEE,
+        },
+        StatutPlanProduction.A_CONVERTIR_EN_OF: {
+            StatutPlanProduction.PREVISION, StatutPlanProduction.CONVERTIE, StatutPlanProduction.ANNULEE,
+        },
+    }
+
+    def clean(self):
+        exiger_positif(self.quantite_prevue, "quantite_prevue", "La quantité prévue")
+        ancien_statut = valeur_en_base(self, "statut")
+        if ancien_statut in (StatutPlanProduction.CONVERTIE, StatutPlanProduction.ANNULEE):
+            raise ValidationError(
+                f"Cette prévision est {dict(StatutPlanProduction.choices)[ancien_statut].lower()} : "
+                "elle ne peut plus être modifiée."
+            )
+        verifier_transition(ancien_statut, self.statut, self.TRANSITIONS, "statut de la prévision")
+        if ancien_statut is None and self.statut == StatutPlanProduction.CONVERTIE:
+            raise ValidationError({"statut": "Une prévision passe à « Convertie » uniquement via l'action de conversion en OF."})
+
+    @transaction.atomic
     def convertir_en_of(self, responsable):
         """
         Transforme la prévision en Ordre de Fabrication réel (§5.3 :
@@ -1120,6 +1172,8 @@ class PlanProduction(models.Model):
         """
         if self.statut == StatutPlanProduction.CONVERTIE:
             raise ValueError("Cette prévision a déjà été convertie en OF.")
+        if self.statut == StatutPlanProduction.ANNULEE:
+            raise ValueError("Cette prévision est annulée : elle ne peut pas être convertie en OF.")
         of = OrdreFabrication.objects.create(
             plan_production=self, article=self.article,
             quantite_a_produire=self.quantite_prevue, responsable=responsable,
@@ -1155,7 +1209,7 @@ ORDRE_STATUTS_OF = [
 ]
 
 
-class OrdreFabrication(models.Model):
+class OrdreFabrication(ValidationAvantEnregistrement, models.Model):
     """
     L'Ordre de Fabrication (OF) : le document central de la production.
     Son numéro est unique et automatique (§5.4.1). Son statut ne peut
@@ -1212,11 +1266,62 @@ class OrdreFabrication(models.Model):
         de statut ultérieure).
         """
         creation = self._state.adding
-        if not self.numero:
-            self.numero = generer_numero("OF")
-        super().save(*args, **kwargs)
-        if creation:
-            self._calculer_besoins_matieres()
+        recalcul = creation or (
+            valeur_en_base(self, "quantite_a_produire") != self.quantite_a_produire
+            or valeur_en_base(self, "article") != self.article_id
+        )
+        with transaction.atomic():
+            if not self.numero:
+                self.numero = generer_numero("OF")
+            super().save(*args, **kwargs)
+            if recalcul:
+                # Création, ou quantité/article corrigés tant que l'OF est
+                # en brouillon (voir clean) : les besoins doivent suivre.
+                self.besoins_matieres.all().delete()
+                self._calculer_besoins_matieres()
+
+    def clean(self):
+        """
+        - quantité à produire strictement positive, article fabriqué et actif ;
+        - un OF clôturé ou annulé est figé (§5.14.4) ;
+        - le statut ne progresse que d'une étape à la fois dans le
+          workflow officiel, ou passe à Annulé (voir passer_statut_suivant
+          et annuler) ; un OF est toujours créé en brouillon ;
+        - article et quantité ne changent plus après le brouillon (les
+          besoins matières et les sorties en dépendent).
+        """
+        exiger_positif(self.quantite_a_produire, "quantite_a_produire", "La quantité à produire")
+        if self.article_id:
+            if not self.article.actif:
+                raise ValidationError({"article": f"L'article {self.article.code} est inactif."})
+            if self.article.type_article == "MATIERE_PREMIERE":
+                raise ValidationError({"article": "On ne fabrique pas une matière première : choisissez un produit fini ou intermédiaire."})
+
+        ancien_statut = valeur_en_base(self, "statut")
+        if ancien_statut in (StatutOF.CLOTURE, StatutOF.ANNULE):
+            raise ValidationError(
+                f"L'OF {self.numero} est {dict(StatutOF.choices)[ancien_statut].lower()} : il ne peut plus être modifié."
+            )
+        if ancien_statut is None:
+            if self.statut != StatutOF.BROUILLON:
+                raise ValidationError({"statut": "Un OF est toujours créé en brouillon."})
+            return
+        if self.statut != ancien_statut and self.statut != StatutOF.ANNULE:
+            index_ancien = ORDRE_STATUTS_OF.index(ancien_statut)
+            if index_ancien + 1 >= len(ORDRE_STATUTS_OF) or ORDRE_STATUTS_OF[index_ancien + 1] != self.statut:
+                raise ValidationError({"statut": (
+                    f"Passage de l'OF de « {ancien_statut} » à « {self.statut} » non autorisé : "
+                    "le statut avance d'une étape à la fois (action /avancer_statut/)."
+                )})
+        if ancien_statut != StatutOF.BROUILLON:
+            if valeur_en_base(self, "article") != self.article_id:
+                raise ValidationError({"article": "L'article d'un OF ne peut plus être changé après le brouillon."})
+            if valeur_en_base(self, "quantite_a_produire") != self.quantite_a_produire:
+                raise ValidationError({"quantite_a_produire": "La quantité d'un OF ne peut plus être changée après le brouillon."})
+
+    def verifier_suppression(self):
+        if self.statut != StatutOF.BROUILLON or self.sorties_matieres.exists():
+            raise ValidationError("Seul un OF en brouillon sans aucune sortie matière peut être supprimé ; sinon, annulez-le.")
 
     @property
     def est_verrouille(self):
@@ -1227,6 +1332,7 @@ class OrdreFabrication(models.Model):
         """
         return self.statut in (StatutOF.CLOTURE, StatutOF.ANNULE)
 
+    @transaction.atomic
     def passer_statut_suivant(self):
         """Fait avancer l'OF d'une étape dans le workflow officiel."""
         if self.est_verrouille:
@@ -1383,7 +1489,7 @@ class StatutDemandeMatiere(models.TextChoices):
     ANNULEE = "ANNULEE", "Annulée"
 
 
-class DemandeMatiere(models.Model):
+class DemandeMatiere(ValidationAvantEnregistrement, models.Model):
     """
     §5.6 : la demande du Responsable Production au magasin pour les
     matières nécessaires à un OF. Distincte du besoin théorique
@@ -1397,6 +1503,10 @@ class DemandeMatiere(models.Model):
     )
     matiere = models.ForeignKey(Article, verbose_name="Matière", on_delete=models.PROTECT)
     quantite_demandee = models.DecimalField("Quantité demandée", max_digits=14, decimal_places=3)
+    quantite_livree = models.DecimalField(
+        "Quantité déjà livrée", max_digits=14, decimal_places=3, default=0,
+        help_text="Cumul des livraisons (partielles) du magasin : empêche de livrer plus que demandé.",
+    )
     demandeur = models.ForeignKey(Utilisateur, verbose_name="Demandeur", on_delete=models.PROTECT)
     statut = models.CharField(
         "Statut", max_length=25, choices=StatutDemandeMatiere.choices,
@@ -1412,27 +1522,81 @@ class DemandeMatiere(models.Model):
     def __str__(self):
         return f"{self.numero} - {self.matiere.code} ({self.get_statut_display()})"
 
+    TRANSITIONS = {
+        StatutDemandeMatiere.A_PREPARER: {
+            StatutDemandeMatiere.PREPAREE, StatutDemandeMatiere.PARTIELLEMENT_PREPAREE,
+            StatutDemandeMatiere.LIVREE_A_LA_PRODUCTION, StatutDemandeMatiere.ANNULEE,
+        },
+        StatutDemandeMatiere.PREPAREE: {
+            StatutDemandeMatiere.A_PREPARER, StatutDemandeMatiere.PARTIELLEMENT_PREPAREE,
+            StatutDemandeMatiere.LIVREE_A_LA_PRODUCTION, StatutDemandeMatiere.ANNULEE,
+        },
+        StatutDemandeMatiere.PARTIELLEMENT_PREPAREE: {
+            StatutDemandeMatiere.LIVREE_A_LA_PRODUCTION, StatutDemandeMatiere.ANNULEE,
+        },
+    }
+
     def save(self, *args, **kwargs):
         if not self.numero:
             self.numero = generer_numero("DM")
         super().save(*args, **kwargs)
 
+    def clean(self):
+        exiger_positif(self.quantite_demandee, "quantite_demandee", "La quantité demandée")
+        if self.ordre_fabrication_id and self.ordre_fabrication.est_verrouille:
+            raise ValidationError({"ordre_fabrication": "Cet OF est clôturé ou annulé : aucune demande de matière possible."})
+        ancien_statut = valeur_en_base(self, "statut")
+        if ancien_statut in (StatutDemandeMatiere.LIVREE_A_LA_PRODUCTION, StatutDemandeMatiere.ANNULEE):
+            raise ValidationError(
+                f"Cette demande est {dict(StatutDemandeMatiere.choices)[ancien_statut].lower()} : elle ne peut plus être modifiée."
+            )
+        verifier_transition(
+            ancien_statut, self.statut, self.TRANSITIONS, "statut de la demande",
+            initial=StatutDemandeMatiere.A_PREPARER,
+        )
+        if self.pk and self.quantite_livree > 0:
+            for champ in ("ordre_fabrication", "matiere"):
+                if valeur_en_base(self, champ) != getattr(self, f"{champ}_id"):
+                    raise ValidationError({champ: "Modification impossible : une partie a déjà été livrée."})
+        if self.quantite_demandee is not None and self.quantite_demandee < self.quantite_livree:
+            raise ValidationError({"quantite_demandee": (
+                f"La quantité demandée ne peut pas être inférieure à la quantité déjà livrée ({self.quantite_livree})."
+            )})
+
+    def verifier_suppression(self):
+        if self.quantite_livree > 0:
+            raise ValidationError("Cette demande a déjà été (partiellement) livrée : annulez-la plutôt.")
+
+    @transaction.atomic
     def livrer_a_production(self, quantite_livree=None):
         """
         Le Magasinier livre la matière : génère automatiquement la
         SortieMatiere correspondante (pas de ressaisie, §15 du cahier
         des charges) et met à jour le statut de la demande.
+
+        Sans quantité fournie, livre le reste à livrer. Refuse de livrer
+        une demande déjà livrée/annulée ou plus que le reste à livrer
+        (auparavant, chaque appel créait une nouvelle sortie complète).
+        Le stock est vérifié par la sortie elle-même (MouvementStock).
         """
         if self.ordre_fabrication.est_verrouille:
             raise ValueError("Cet OF est clôturé ou annulé, impossible de livrer une matière.")
-        quantite_livree = quantite_livree if quantite_livree is not None else self.quantite_demandee
+        if self.statut in (StatutDemandeMatiere.LIVREE_A_LA_PRODUCTION, StatutDemandeMatiere.ANNULEE):
+            raise ValueError(f"Cette demande est {self.get_statut_display().lower()} : plus rien à livrer.")
+        reste = self.quantite_demandee - self.quantite_livree
+        quantite = convertir_decimal(quantite_livree, "La quantité livrée", obligatoire=False)
+        if quantite is None:
+            quantite = reste
+        if quantite > reste:
+            raise ValueError(f"Quantité livrée ({quantite}) supérieure au reste à livrer ({reste}).")
         SortieMatiere.objects.create(
             ordre_fabrication=self.ordre_fabrication, matiere=self.matiere,
-            quantite_sortie=quantite_livree, type_sortie=TypeSortie.NORMALE,
+            quantite_sortie=quantite, type_sortie=TypeSortie.NORMALE,
         )
+        self.quantite_livree += quantite
         self.statut = (
             StatutDemandeMatiere.LIVREE_A_LA_PRODUCTION
-            if quantite_livree >= self.quantite_demandee
+            if self.quantite_livree >= self.quantite_demandee
             else StatutDemandeMatiere.PARTIELLEMENT_PREPAREE
         )
         self.save()
@@ -1444,7 +1608,7 @@ class StatutDemandeComplementaire(models.TextChoices):
     REJETEE = "REJETEE", "Rejetée"
 
 
-class DemandeComplementaire(models.Model):
+class DemandeComplementaire(ValidationAvantEnregistrement, models.Model):
     """
     §5.7 : pendant la production, une demande de matière supplémentaire,
     avec motif obligatoire ("bouton Demander un complément"). Distincte
@@ -1479,8 +1643,32 @@ class DemandeComplementaire(models.Model):
             self.numero = generer_numero("DC")
         super().save(*args, **kwargs)
 
+    def clean(self):
+        exiger_positif(self.quantite, "quantite", "La quantité")
+        if not (self.motif or "").strip():
+            raise ValidationError({"motif": "Le motif est obligatoire pour une demande complémentaire."})
+        if self.ordre_fabrication_id and self.ordre_fabrication.est_verrouille:
+            raise ValidationError({"ordre_fabrication": "Cet OF est clôturé ou annulé : aucune demande complémentaire possible."})
+        ancien_statut = valeur_en_base(self, "statut")
+        if ancien_statut not in (None, StatutDemandeComplementaire.EN_ATTENTE):
+            raise ValidationError("Cette demande a déjà été traitée : elle ne peut plus être modifiée.")
+        verifier_transition(
+            ancien_statut, self.statut,
+            {StatutDemandeComplementaire.EN_ATTENTE: {
+                StatutDemandeComplementaire.APPROUVEE_ET_LIVREE, StatutDemandeComplementaire.REJETEE,
+            }},
+            "statut de la demande", initial=StatutDemandeComplementaire.EN_ATTENTE,
+        )
+
+    def verifier_suppression(self):
+        if self.statut != StatutDemandeComplementaire.EN_ATTENTE:
+            raise ValidationError("Une demande déjà traitée ne peut pas être supprimée.")
+
+    @transaction.atomic
     def approuver_et_livrer(self, utilisateur):
         """Le Magasinier (ou Responsable Production) approuve : génère la SortieMatiere COMPLEMENTAIRE automatiquement."""
+        if self.statut != StatutDemandeComplementaire.EN_ATTENTE:
+            raise ValueError(f"Cette demande est déjà {self.get_statut_display().lower()}.")
         if self.ordre_fabrication.est_verrouille:
             raise ValueError("Cet OF est clôturé ou annulé, impossible de livrer un complément.")
         SortieMatiere.objects.create(
@@ -1492,6 +1680,8 @@ class DemandeComplementaire(models.Model):
         self.save()
 
     def rejeter(self):
+        if self.statut != StatutDemandeComplementaire.EN_ATTENTE:
+            raise ValueError(f"Cette demande est déjà {self.get_statut_display().lower()}.")
         self.statut = StatutDemandeComplementaire.REJETEE
         self.save()
 
@@ -1501,7 +1691,7 @@ class TypeSortie(models.TextChoices):
     COMPLEMENTAIRE = "COMPLEMENTAIRE", "Complémentaire (dépassement)"
 
 
-class SortieMatiere(models.Model):
+class SortieMatiere(SaisieSurOFMixin, ValidationAvantEnregistrement, models.Model):
     """
     Une sortie physique de matière pour un OF. Une sortie
     COMPLEMENTAIRE exige un motif obligatoire ET une validation
@@ -1538,15 +1728,22 @@ class SortieMatiere(models.Model):
         return f"Sortie {self.quantite_sortie} {self.matiere.code} pour {self.ordre_fabrication.numero}"
 
     def clean(self):
-        from django.core.exceptions import ValidationError
-        if self.type_sortie == TypeSortie.COMPLEMENTAIRE and not self.motif:
-            raise ValidationError(
-                "Le motif est obligatoire pour une sortie complémentaire."
-            )
-        if self.ordre_fabrication_id and self.ordre_fabrication.est_verrouille:
-            raise ValidationError(
-                "Cet OF est clôturé ou annulé : plus aucune sortie matière n'est possible."
-            )
+        """
+        Vérifié AVANT tout enregistrement (auparavant la vue enregistrait
+        la sortie - donc le mouvement de stock - puis supprimait la sortie
+        si clean() échouait, en laissant le mouvement : stock faux).
+        Le stock disponible est contrôlé par le MouvementStock créé dans
+        la même transaction.
+        """
+        if self.pk is not None:
+            raise ValidationError("Une sortie matière enregistrée ne peut pas être modifiée.")
+        exiger_positif(self.quantite_sortie, "quantite_sortie", "La quantité sortie")
+        if self.type_sortie == TypeSortie.COMPLEMENTAIRE and not (self.motif or "").strip():
+            raise ValidationError({"motif": "Le motif est obligatoire pour une sortie complémentaire."})
+        self.controler_of()
+
+    def verifier_suppression(self):
+        raise ValidationError("Une sortie matière ne peut pas être supprimée (le stock a déjà été mouvementé) : faites un retour matière.")
 
     def save(self, *args, **kwargs):
         """
@@ -1558,21 +1755,25 @@ class SortieMatiere(models.Model):
         SortieMatiere n'est jamais modifiée après coup dans ce projet.
         """
         creation = self._state.adding
-        super().save(*args, **kwargs)
-        if creation:
-            from apps.stocks.models import MouvementStock, TypeMouvement, depot_par_defaut
-            MouvementStock.objects.create(
-                article=self.matiere,
-                depot=depot_par_defaut("Magasin principal"),
-                type_mouvement=TypeMouvement.SORTIE,
-                quantite=self.quantite_sortie,
-                motif=self.motif or f"Sortie matière OF {self.ordre_fabrication.numero}",
-                document_origine=self.ordre_fabrication.numero,
-                utilisateur=self.valide_par or self.ordre_fabrication.responsable,
-            )
+        with transaction.atomic():
+            super().save(*args, **kwargs)
+            if creation:
+                self._creer_mouvement_sortie()
+
+    def _creer_mouvement_sortie(self):
+        from apps.stocks.models import MouvementStock, TypeMouvement, depot_par_defaut
+        MouvementStock.objects.create(
+            article=self.matiere,
+            depot=depot_par_defaut("Magasin principal"),
+            type_mouvement=TypeMouvement.SORTIE,
+            quantite=self.quantite_sortie,
+            motif=self.motif or f"Sortie matière OF {self.ordre_fabrication.numero}",
+            document_origine=self.ordre_fabrication.numero,
+            utilisateur=self.valide_par or self.ordre_fabrication.responsable,
+        )
 
 
-class RetourMatiere(models.Model):
+class RetourMatiere(SaisieSurOFMixin, ValidationAvantEnregistrement, models.Model):
     """Matière non utilisée, retournée en stock. Consommation nette = Sorties - Retours (§5.10)."""
     ordre_fabrication = models.ForeignKey(
         OrdreFabrication, verbose_name="Ordre de fabrication",
@@ -1590,6 +1791,31 @@ class RetourMatiere(models.Model):
     def __str__(self):
         return f"Retour {self.quantite_retournee} {self.matiere.code} de {self.ordre_fabrication.numero}"
 
+    def clean(self):
+        """On ne peut retourner que ce qui a été sorti pour cet OF (sorties - retours déjà faits)."""
+        from django.db.models import Sum
+        if self.pk is not None:
+            raise ValidationError("Un retour matière enregistré ne peut pas être modifié.")
+        exiger_positif(self.quantite_retournee, "quantite_retournee", "La quantité retournée")
+        self.controler_of()
+        if self.ordre_fabrication_id and self.matiere_id:
+            sorti = SortieMatiere.objects.filter(
+                ordre_fabrication_id=self.ordre_fabrication_id, matiere_id=self.matiere_id,
+            ).aggregate(total=Sum("quantite_sortie"))["total"] or 0
+            deja_retourne = RetourMatiere.objects.filter(
+                ordre_fabrication_id=self.ordre_fabrication_id, matiere_id=self.matiere_id,
+            ).aggregate(total=Sum("quantite_retournee"))["total"] or 0
+            retournable = sorti - deja_retourne
+            if self.quantite_retournee > retournable:
+                raise ValidationError({"quantite_retournee": (
+                    f"Retour impossible : seulement {retournable} de {self.matiere.code} "
+                    f"peut être retourné pour l'OF {self.ordre_fabrication.numero} "
+                    f"(sorti {sorti}, déjà retourné {deja_retourne})."
+                )})
+
+    def verifier_suppression(self):
+        raise ValidationError("Un retour matière ne peut pas être supprimé (le stock a déjà été mouvementé).")
+
     def save(self, *args, **kwargs):
         """
         Symétrique de SortieMatiere.save() : un retour magasin
@@ -1598,21 +1824,25 @@ class RetourMatiere(models.Model):
         stock physique, pas seulement le calcul théorique).
         """
         creation = self._state.adding
-        super().save(*args, **kwargs)
-        if creation:
-            from apps.stocks.models import MouvementStock, TypeMouvement, depot_par_defaut
-            MouvementStock.objects.create(
-                article=self.matiere,
-                depot=depot_par_defaut("Magasin principal"),
-                type_mouvement=TypeMouvement.RETOUR,
-                quantite=self.quantite_retournee,
-                motif=self.motif or f"Retour matière OF {self.ordre_fabrication.numero}",
-                document_origine=self.ordre_fabrication.numero,
-                utilisateur=self.ordre_fabrication.responsable,
-            )
+        with transaction.atomic():
+            super().save(*args, **kwargs)
+            if creation:
+                self._creer_mouvement_retour()
+
+    def _creer_mouvement_retour(self):
+        from apps.stocks.models import MouvementStock, TypeMouvement, depot_par_defaut
+        MouvementStock.objects.create(
+            article=self.matiere,
+            depot=depot_par_defaut("Magasin principal"),
+            type_mouvement=TypeMouvement.RETOUR,
+            quantite=self.quantite_retournee,
+            motif=self.motif or f"Retour matière OF {self.ordre_fabrication.numero}",
+            document_origine=self.ordre_fabrication.numero,
+            utilisateur=self.ordre_fabrication.responsable,
+        )
 
 
-class SuiviProduction(models.Model):
+class SuiviProduction(SaisieSurOFMixin, ValidationAvantEnregistrement, models.Model):
     """
     §5.8 : ce qui se passe réellement sur la ligne, saisi par
     session/journée. Distinct du suivi par étape (EtapeProduction,
@@ -1643,8 +1873,23 @@ class SuiviProduction(models.Model):
     def __str__(self):
         return f"{self.ordre_fabrication.numero} - {self.date} {self.heure_debut}"
 
+    def clean(self):
+        self.controler_of()
+        exiger_positif(self.quantite_entree, "quantite_entree", "La quantité entrée", strict=False)
+        exiger_positif_optionnel(self.quantite_produite, "quantite_produite", "La quantité produite")
+        exiger_positif_optionnel(self.quantite_conforme, "quantite_conforme", "La quantité conforme")
+        exiger_positif_optionnel(self.quantite_rejetee, "quantite_rejetee", "La quantité rejetée")
+        if self.heure_debut and self.heure_fin and self.heure_fin <= self.heure_debut:
+            raise ValidationError({"heure_fin": "L'heure de fin doit être postérieure à l'heure de début."})
+        if self.quantite_produite is not None:
+            total_controle = (self.quantite_conforme or 0) + (self.quantite_rejetee or 0)
+            if total_controle > self.quantite_produite:
+                raise ValidationError({"quantite_conforme": (
+                    f"Conforme + rejeté ({total_controle}) dépasse la quantité produite ({self.quantite_produite})."
+                )})
 
-class SuiviEau(models.Model):
+
+class SuiviEau(SaisieSurOFMixin, ValidationAvantEnregistrement, models.Model):
     """
     §5.9 : suivi spécifique de la production d'eau, avec calcul
     automatique des écarts entre chaque étape du flux (captage ->
@@ -1669,6 +1914,26 @@ class SuiviEau(models.Model):
 
     def __str__(self):
         return f"Suivi eau - {self.ordre_fabrication.numero}"
+
+    def clean(self):
+        """Chaque étape du flux ne peut pas recevoir plus d'eau que l'étape précédente n'en a fourni (§5.9)."""
+        self.controler_of()
+        exiger_positif(self.volume_capte_l, "volume_capte_l", "Le volume capté", strict=False)
+        exiger_positif_optionnel(self.volume_envoye_traitement_l, "volume_envoye_traitement_l", "Le volume envoyé au traitement")
+        exiger_positif(self.volume_obtenu_traitement_l, "volume_obtenu_traitement_l", "Le volume obtenu après traitement", strict=False)
+        exiger_positif(self.volume_envoye_embouteillage_l, "volume_envoye_embouteillage_l", "Le volume envoyé à l'embouteillage", strict=False)
+        entree_traitement = self.volume_capte_l
+        if self.volume_envoye_traitement_l is not None:
+            if self.volume_envoye_traitement_l > self.volume_capte_l:
+                raise ValidationError({"volume_envoye_traitement_l": "Le volume envoyé au traitement dépasse le volume capté."})
+            entree_traitement = self.volume_envoye_traitement_l
+        if self.volume_obtenu_traitement_l > entree_traitement:
+            raise ValidationError({"volume_obtenu_traitement_l": "Le volume obtenu après traitement dépasse le volume entré en traitement."})
+        if self.volume_envoye_embouteillage_l > self.volume_obtenu_traitement_l:
+            raise ValidationError({"volume_envoye_embouteillage_l": "Le volume envoyé à l'embouteillage dépasse le volume obtenu après traitement."})
+        if self.bouteilles_conformes is not None and self.bouteilles_produites is not None:
+            if self.bouteilles_conformes + (self.bouteilles_rejetees or 0) > self.bouteilles_produites:
+                raise ValidationError({"bouteilles_conformes": "Bouteilles conformes + rejetées dépasse le nombre de bouteilles produites."})
 
     def _taux(self, perte, entree):
         return round(float(perte) / float(entree) * 100, 2) if entree else None
@@ -1703,7 +1968,7 @@ class Etape(models.TextChoices):
     CONDITIONNEMENT = "CONDITIONNEMENT", "Conditionnement"
 
 
-class EtapeProduction(models.Model):
+class EtapeProduction(SaisieSurOFMixin, ValidationAvantEnregistrement, models.Model):
     """Suivi de la production étape par étape (processus de fabrication de la fiche technique)."""
     ordre_fabrication = models.ForeignKey(
         OrdreFabrication, verbose_name="Ordre de fabrication",
@@ -1727,6 +1992,11 @@ class EtapeProduction(models.Model):
     def __str__(self):
         return f"{self.ordre_fabrication.numero} - {self.get_etape_display()}"
 
+    def clean(self):
+        self.controler_of()
+        exiger_positif_optionnel(self.quantite_produite, "quantite_produite", "La quantité produite")
+        exiger_ordre_dates(self.date_debut, self.date_fin, "date_fin", "le début", "La fin")
+
 
 class MotifPerte(models.TextChoices):
     """Causes paramétrables exactes du §5.11 du cahier des charges."""
@@ -1742,7 +2012,7 @@ class MotifPerte(models.TextChoices):
     AUTRE = "AUTRE", "Autre"
 
 
-class PerteProduction(models.Model):
+class PerteProduction(SaisieSurOFMixin, ValidationAvantEnregistrement, models.Model):
     """Pertes et rebuts constatés en cours de production (§5.11)."""
     ordre_fabrication = models.ForeignKey(
         OrdreFabrication, verbose_name="Ordre de fabrication",
@@ -1767,3 +2037,10 @@ class PerteProduction(models.Model):
 
     def __str__(self):
         return f"Perte {self.quantite_perte} sur {self.ordre_fabrication.numero} ({self.get_motif_display()})"
+
+    def clean(self):
+        self.controler_of()
+        exiger_positif(self.quantite_perte, "quantite_perte", "La quantité perdue")
+        exiger_pourcentage(self.taux_perte, "taux_perte", "Le taux de perte")
+        if self.etape_id and self.ordre_fabrication_id and self.etape.ordre_fabrication_id != self.ordre_fabrication_id:
+            raise ValidationError({"etape": "Cette étape appartient à un autre OF."})

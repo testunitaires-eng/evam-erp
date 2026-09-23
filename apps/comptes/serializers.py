@@ -27,6 +27,21 @@ class UtilisateurSerializer(serializers.ModelSerializer):
             "date_desactivation": {"read_only": True},
         }
 
+    def validate_password(self, mot_de_passe):
+        """Applique les règles de robustesse de AUTH_PASSWORD_VALIDATORS (settings.py)."""
+        from django.contrib.auth.password_validation import validate_password
+        from django.core.exceptions import ValidationError as DjangoValidationError
+        try:
+            validate_password(mot_de_passe, user=self.instance)
+        except DjangoValidationError as erreur:
+            raise serializers.ValidationError(erreur.messages)
+        return mot_de_passe
+
+    def validate(self, attrs):
+        if self.instance is None and not attrs.get("password"):
+            raise serializers.ValidationError({"password": "Le mot de passe est obligatoire à la création du compte."})
+        return attrs
+
     def create(self, validated_data):
         """Hache le mot de passe correctement (create() ne le fait pas par défaut)."""
         mot_de_passe = validated_data.pop("password", None)

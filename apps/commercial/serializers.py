@@ -177,103 +177,82 @@
 
 """
 Sérialiseurs DRF du module commercial.
+
+Toutes les règles métier sont dans les clean() des modèles
+(apps/commercial/models.py) et appliquées ici par
+ValidationModeleMixin AVANT tout enregistrement : une règle non
+respectée donne un 400 avec le message, jamais un enregistrement.
 """
 
 from rest_framework import serializers
+from apps.core.serializers import ValidationModeleMixin
 from . import models
 
-class ClientSerializer(serializers.ModelSerializer):
+
+class ClientSerializer(ValidationModeleMixin, serializers.ModelSerializer):
     class Meta:
         model = models.Client
         fields = "__all__"
 
 
-class ProspectSerializer(serializers.ModelSerializer):
+class ProspectSerializer(ValidationModeleMixin, serializers.ModelSerializer):
     class Meta:
         model = models.Prospect
         fields = "__all__"
 
 
-class ContratClientSerializer(serializers.ModelSerializer):
+class ContratClientSerializer(ValidationModeleMixin, serializers.ModelSerializer):
     class Meta:
         model = models.ContratClient
         fields = "__all__"
 
 
-class TarifSerializer(serializers.ModelSerializer):
+class TarifSerializer(ValidationModeleMixin, serializers.ModelSerializer):
     class Meta:
         model = models.Tarif
         fields = "__all__"
 
 
-class CommandeSerializer(serializers.ModelSerializer):
+class CommandeSerializer(ValidationModeleMixin, serializers.ModelSerializer):
+    """
+    Client bloqué, encours dépassé, workflow de statut, commande sans
+    ligne... : voir Commande.clean().
+    """
     class Meta:
         model = models.Commande
         fields = "__all__"
         extra_kwargs = {"cree_par": {"required": False}}
-
-    def validate(self, data):
-        """
-        Renvoie une erreur 400 propre AVANT d'atteindre Commande.save()
-        (qui, lui, bloquerait quand même via ValidationError, mais en
-        500 non catché s'il n'était pas intercepté ici). Couvre à la
-        fois la création (client bloqué) et la mise à jour de statut
-        (encours, une fois le montant réel connu).
-        """
-        from django.core.exceptions import ValidationError as DjangoValidationError
-
-        client = data.get("client") or getattr(self.instance, "client", None)
-        statut = data.get("statut", getattr(self.instance, "statut", models.StatutCommande.BROUILLON))
-
-        if client and statut != models.StatutCommande.ANNULEE:
-            montant = self.instance.montant_total if self.instance is not None else 0
-            try:
-                client.verifier_peut_commander(montant_commande=montant)
-            except DjangoValidationError as e:
-                raise serializers.ValidationError({"client": e.messages})
-
-        return data
+        read_only_fields = ["cree_par"]
 
 
-class LigneCommandeSerializer(serializers.ModelSerializer):
+class LigneCommandeSerializer(ValidationModeleMixin, serializers.ModelSerializer):
+    """Encours, commande figée, quantité/prix positifs : voir LigneCommande.clean()."""
     class Meta:
         model = models.LigneCommande
         fields = "__all__"
 
-    def validate(self, data):
-        """
-        Une ligne ajoutée/modifiée après que la commande a quitté le
-        brouillon peut faire dépasser l'encours du client : on
-        revérifie ici pour un 400 propre (le save() de LigneCommande
-        revérifie aussi côté modèle, en filet de sécurité).
-        """
-        from django.core.exceptions import ValidationError as DjangoValidationError
 
-        commande = data.get("commande") or getattr(self.instance, "commande", None)
-        if commande and commande.statut not in (
-            models.StatutCommande.BROUILLON, models.StatutCommande.ANNULEE
-        ):
-            quantite = data.get("quantite", getattr(self.instance, "quantite", 0))
-            prix = data.get("prix_unitaire", getattr(self.instance, "prix_unitaire", 0))
-            montant_ligne_estime = quantite * prix
-
-            autres_lignes = commande.lignes.all()
-            if self.instance is not None:
-                autres_lignes = autres_lignes.exclude(pk=self.instance.pk)
-            montant_estime = sum((l.montant_ligne for l in autres_lignes), start=0) + montant_ligne_estime
-
-            try:
-                commande.client.verifier_peut_commander(montant_commande=montant_estime)
-            except DjangoValidationError as e:
-                raise serializers.ValidationError({"commande": e.messages})
-
-        return data
-
-
-class FactureSerializer(serializers.ModelSerializer):
+class FactureSerializer(ValidationModeleMixin, serializers.ModelSerializer):
+    """
+    Les montants sont calculés à partir des lignes (generer_lignes) et
+    le statut de paiement à partir des encaissements/avoirs : ils ne se
+    saisissent pas. Seule l'annulation peut être demandée via `statut`.
+    Le client est repris automatiquement de la commande.
+    """
     class Meta:
         model = models.Facture
         fields = "__all__"
+        extra_kwargs = {"client": {"required": False}}
+        read_only_fields = ["montant_ht_total", "montant_taxes_total", "montant_total"]
+
+    def validate_statut(self, valeur):
+        actuel = self.instance.statut if self.instance is not None else models.StatutFacture.EMISE
+        if valeur != actuel and valeur != models.StatutFacture.ANNULEE:
+            raise serializers.ValidationError(
+                "Le statut de paiement est calculé automatiquement d'après les encaissements ; "
+                "seule l'annulation (ANNULEE) peut être demandée."
+            )
+        return valeur
 
 
 class LigneFactureSerializer(serializers.ModelSerializer):
@@ -282,10 +261,19 @@ class LigneFactureSerializer(serializers.ModelSerializer):
         fields = "__all__"
 
 
-
-
-class AvoirSerializer(serializers.ModelSerializer):
+class AvoirSerializer(ValidationModeleMixin, serializers.ModelSerializer):
+    """Un avoir s'utilise via l'action /utiliser/ ; via `statut`, seule l'annulation est possible."""
     class Meta:
         model = models.Avoir
         fields = "__all__"
         extra_kwargs = {"cree_par": {"required": False}}
+        read_only_fields = ["cree_par", "facture_utilisation", "date_utilisation"]
+
+    def validate_statut(self, valeur):
+        actuel = self.instance.statut if self.instance is not None else models.StatutAvoir.EMIS
+        if valeur != actuel and valeur != models.StatutAvoir.ANNULE:
+            raise serializers.ValidationError(
+                "Un avoir passe à « Utilisé » uniquement via l'action /utiliser/ ; "
+                "seule l'annulation (ANNULE) peut être demandée ici."
+            )
+        return valeur

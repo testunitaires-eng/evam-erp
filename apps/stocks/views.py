@@ -95,6 +95,7 @@ des mouvements (qui mettent StockArticle à jour, voir signals.py).
 
 from rest_framework import viewsets
 from . import models, serializers
+from apps.core.validation import METHODES_CREATION_LECTURE
 from apps.comptes.permissions import role_required, lecture_seule_pour
 from apps.comptes.models import Profil
 
@@ -109,11 +110,12 @@ class DepotViewSet(viewsets.ModelViewSet):
     serializer_class = serializers.DepotSerializer
     permission_classes = [lecture_seule_pour(Profil.ADMIN_SI, Profil.MAGASINIER)]
     
-class StockArticleViewSet(viewsets.ModelViewSet):
+class StockArticleViewSet(viewsets.ReadOnlyModelViewSet):
     """
-    Lecture ouverte à tous les profils authentifiés (Commercial doit
-    pouvoir consulter la disponibilité) ; écriture réservée au
-    Magasinier et à l'Administrateur SI.
+    Lecture seule pour tous les profils authentifiés (Commercial doit
+    pouvoir consulter la disponibilité). Le stock n'est JAMAIS modifié
+    directement : toute variation passe par un MouvementStock
+    (traçabilité, §16.1), qui met StockArticle à jour via signals.py.
     """
     queryset = models.StockArticle.objects.all()
     serializer_class = serializers.StockArticleSerializer
@@ -130,6 +132,9 @@ class MouvementStockViewSet(viewsets.ModelViewSet):
     # filterset_fields = ["article", "depot", "type_mouvement"]
     filterset_fields = ["article", "depot", "type_mouvement", "document_origine"]
     search_fields = ["numero", "document_origine"]
+    # Un mouvement est un fait historique : ni modification ni
+    # suppression (sinon StockArticle ne correspondrait plus).
+    http_method_names = METHODES_CREATION_LECTURE
 
     def perform_create(self, serializer):
         # La répercussion sur StockArticle est désormais gérée par le

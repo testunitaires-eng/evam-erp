@@ -160,12 +160,43 @@ from rest_framework import viewsets
 from rest_framework.decorators import action, api_view, permission_classes as drf_permission_classes
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
-from rest_framework.exceptions import ValidationError as DRFValidationError
-from django.core.exceptions import ValidationError as DjangoValidationError
+from rest_framework.exceptions import PermissionDenied
+from apps.core.validation import METHODES_CREATION_LECTURE
 from . import models, serializers
 from apps.comptes.permissions import role_required
 from apps.comptes.models import Profil
 from apps.comptes.permissions import role_required, lecture_seule_pour
+
+
+class AffectationAgentMixin:
+    """
+    Règle du cahier des charges : un Agent Production n'agit que sur
+    les OF où il est affecté. Le filtrage de get_queryset() ne couvre
+    que la LECTURE ; ce mixin l'applique aussi à la création et à la
+    modification (sinon un agent pouvait saisir sur n'importe quel OF
+    en envoyant son identifiant).
+    """
+
+    def verifier_affectation(self, of):
+        utilisateur = self.request.user
+        if utilisateur.is_superuser or utilisateur.profil != Profil.AGENT_PRODUCTION:
+            return
+        if not of.agents_affectes.filter(pk=utilisateur.pk).exists():
+            raise PermissionDenied(f"Vous n'êtes pas affecté à l'OF {of.numero}.")
+
+    def perform_create(self, serializer):
+        self.verifier_affectation(serializer.validated_data["ordre_fabrication"])
+        super().perform_create(serializer)
+
+    def perform_update(self, serializer):
+        self.verifier_affectation(
+            serializer.validated_data.get("ordre_fabrication", serializer.instance.ordre_fabrication)
+        )
+        super().perform_update(serializer)
+
+    def perform_destroy(self, instance):
+        self.verifier_affectation(instance.ordre_fabrication)
+        super().perform_destroy(instance)
 
 
 class PlanProductionViewSet(viewsets.ModelViewSet):
@@ -328,7 +359,7 @@ class DemandeMatiereViewSet(viewsets.ModelViewSet):
         return Response(self.get_serializer(demande).data)
 
 
-class DemandeComplementaireViewSet(viewsets.ModelViewSet):
+class DemandeComplementaireViewSet(AffectationAgentMixin, viewsets.ModelViewSet):
     queryset = models.DemandeComplementaire.objects.all()
     serializer_class = serializers.DemandeComplementaireSerializer
     permission_classes = [role_required(
@@ -338,6 +369,7 @@ class DemandeComplementaireViewSet(viewsets.ModelViewSet):
     search_fields = ["numero"]
 
     def perform_create(self, serializer):
+        self.verifier_affectation(serializer.validated_data["ordre_fabrication"])
         serializer.save(demandeur=self.request.user)
 
     @action(detail=True, methods=["post"])
@@ -358,7 +390,10 @@ class DemandeComplementaireViewSet(viewsets.ModelViewSet):
         if request.user.profil not in (Profil.MAGASINIER, Profil.ADMIN_SI) and not request.user.is_superuser:
             return Response({"erreur": "Seul le Magasinier peut rejeter une demande complémentaire."}, status=403)
         demande = self.get_object()
-        demande.rejeter()
+        try:
+            demande.rejeter()
+        except ValueError as erreur:
+            return Response({"erreur": str(erreur)}, status=400)
         return Response(self.get_serializer(demande).data)
 
 
@@ -372,13 +407,11 @@ class SortieMatiereViewSet(viewsets.ModelViewSet):
     serializer_class = serializers.SortieMatiereSerializer
     permission_classes = [lecture_seule_pour(Profil.MAGASINIER, Profil.ADMIN_SI)]
     filterset_fields = ["ordre_fabrication", "matiere", "type_sortie"]
-    def perform_create(self, serializer):
-        instance = serializer.save()
-        try:
-            instance.clean()
-        except DjangoValidationError as erreur:
-            instance.delete()
-            raise DRFValidationError(erreur.messages if hasattr(erreur, "messages") else str(erreur))
+    # Toutes les règles (OF verrouillé, motif, quantité, stock disponible)
+    # sont vérifiées AVANT l'enregistrement (SortieMatiere.clean() +
+    # MouvementStock.clean()). Une sortie ne se modifie ni ne se supprime :
+    # le stock a déjà été mouvementé (faire un retour matière).
+    http_method_names = METHODES_CREATION_LECTURE
 
 
 # class RetourMatiereViewSet(viewsets.ModelViewSet):
@@ -391,8 +424,10 @@ class RetourMatiereViewSet(viewsets.ModelViewSet):
     serializer_class = serializers.RetourMatiereSerializer
     permission_classes = [lecture_seule_pour(Profil.MAGASINIER, Profil.ADMIN_SI)]
     filterset_fields = ["ordre_fabrication", "matiere"]
+    # Un retour ne se modifie ni ne se supprime (le stock a déjà été mouvementé).
+    http_method_names = METHODES_CREATION_LECTURE
 
-class SuiviProductionViewSet(viewsets.ModelViewSet):
+class SuiviProductionViewSet(AffectationAgentMixin, viewsets.ModelViewSet):
     queryset = models.SuiviProduction.objects.all()
     serializer_class = serializers.SuiviProductionSerializer
     permission_classes = [role_required(
@@ -410,7 +445,7 @@ class SuiviProductionViewSet(viewsets.ModelViewSet):
         return queryset
 
 
-class SuiviEauViewSet(viewsets.ModelViewSet):
+class SuiviEauViewSet(AffectationAgentMixin, viewsets.ModelViewSet):
     queryset = models.SuiviEau.objects.all()
     serializer_class = serializers.SuiviEauSerializer
     permission_classes = [role_required(
@@ -419,7 +454,7 @@ class SuiviEauViewSet(viewsets.ModelViewSet):
     filterset_fields = ["ordre_fabrication"]
 
 
-class EtapeProductionViewSet(viewsets.ModelViewSet):
+class EtapeProductionViewSet(AffectationAgentMixin, viewsets.ModelViewSet):
     queryset = models.EtapeProduction.objects.all()
     serializer_class = serializers.EtapeProductionSerializer
     permission_classes = [role_required(
@@ -437,10 +472,11 @@ class EtapeProductionViewSet(viewsets.ModelViewSet):
         return queryset
 
     def perform_create(self, serializer):
+        self.verifier_affectation(serializer.validated_data["ordre_fabrication"])
         serializer.save(agent=self.request.user)
 
 
-class PerteProductionViewSet(viewsets.ModelViewSet):
+class PerteProductionViewSet(AffectationAgentMixin, viewsets.ModelViewSet):
     queryset = models.PerteProduction.objects.all()
     serializer_class = serializers.PerteProductionSerializer
     permission_classes = [role_required(

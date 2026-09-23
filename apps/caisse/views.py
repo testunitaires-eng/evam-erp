@@ -9,6 +9,7 @@ enregistrement.
 from rest_framework import viewsets, mixins
 from rest_framework.decorators import action
 from rest_framework.response import Response
+from apps.core.validation import METHODES_CREATION_LECTURE
 from . import models, serializers
 from apps.comptes.permissions import role_required
 from apps.comptes.models import Profil
@@ -33,15 +34,16 @@ class SessionCaisseViewSet(viewsets.ModelViewSet):
     def cloturer(self, request, pk=None):
         """
         POST /api/caisse/sessions/{id}/cloturer/
-        Corps attendu : {"solde_theorique": ..., "solde_compte": ...}
+        Corps attendu : {"solde_compte": ...} (le solde théorique est
+        toujours calculé par le système).
         Si un écart existe, il doit être justifié séparément via
         /api/caisse/ecarts/ (le caissier ne peut jamais le supprimer).
         """
         session = self.get_object()
-        session.cloturer(
-            solde_theorique=request.data.get("solde_theorique"),
-            solde_compte=request.data.get("solde_compte"),
-        )
+        try:
+            session.cloturer(solde_compte=request.data.get("solde_compte"))
+        except ValueError as erreur:
+            return Response({"erreur": str(erreur)}, status=400)
         reponse = {"session": self.get_serializer(session).data}
         if session.ecart and session.ecart != 0:
             reponse["avertissement"] = (
@@ -57,6 +59,8 @@ class EncaissementViewSet(viewsets.ModelViewSet):
     permission_classes = [role_required(Profil.CAISSIER, Profil.ADMIN_SI, Profil.COMPTABILITE_DAF)]
     filterset_fields = ["session_caisse", "facture", "mode_paiement"]
     search_fields = ["numero"]
+    # Un encaissement ne se modifie ni ne se supprime (traçabilité caisse).
+    http_method_names = METHODES_CREATION_LECTURE
 
 
 class EcartCaisseViewSet(
@@ -84,6 +88,8 @@ class DecaissementViewSet(viewsets.ModelViewSet):
     permission_classes = [role_required(Profil.CAISSIER, Profil.ADMIN_SI, Profil.COMPTABILITE_DAF)]
     filterset_fields = ["session_caisse"]
     search_fields = ["numero"]
+    # Un décaissement ne se modifie ni ne se supprime (traçabilité caisse).
+    http_method_names = METHODES_CREATION_LECTURE
 
     def perform_create(self, serializer):
         serializer.save(effectue_par=self.request.user)

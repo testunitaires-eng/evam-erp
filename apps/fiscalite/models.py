@@ -137,6 +137,7 @@ Règle d'historisation (tout aussi importante) :
 """
 
 from django.db import models
+from apps.core.validation import ValidationAvantEnregistrement, exiger_pourcentage
 
 
 class FamilleFiscale(models.Model):
@@ -159,7 +160,7 @@ class FamilleFiscale(models.Model):
         return self.nom
 
 
-class CodeFiscal(models.Model):
+class CodeFiscal(ValidationAvantEnregistrement, models.Model):
     """
     Une ligne de la matrice fiscale maître EVAM (§2 du document
     Matrice fiscale). Exemples réels du document :
@@ -211,6 +212,11 @@ class CodeFiscal(models.Model):
 
     def __str__(self):
         return f"{self.code} - {self.famille_fiscale}"
+
+    def clean(self):
+        exiger_pourcentage(self.taux_tva, "taux_tva", "Le taux de TVA")
+        exiger_pourcentage(self.taux_centimes_additionnels, "taux_centimes_additionnels", "Le taux de centimes additionnels")
+        exiger_pourcentage(self.taux_accise, "taux_accise", "Le taux d'accise")
 
     def calculer_taxes(self, montant_ht):
         """

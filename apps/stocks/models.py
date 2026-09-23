@@ -177,10 +177,14 @@ Règle centrale du cahier des charges (§7.2) :
     quantité disponible = quantité physique - quantité bloquée - quantité réservée
 """
 
-from django.db import models
+from django.core.exceptions import ValidationError
+from django.db import models, transaction
 from apps.comptes.models import Utilisateur
 from apps.referentiel.models import Article
 from apps.core.models import generer_numero
+from apps.core.validation import (
+    ValidationAvantEnregistrement, exiger_positif, valeur_en_base, verifier_transition,
+)
 
 
 class Depot(models.Model):
@@ -299,10 +303,66 @@ class MouvementStock(models.Model):
     def __str__(self):
         return f"{self.numero} - {self.get_type_mouvement_display()} {self.quantite} {self.article.code}"
 
+    def clean(self):
+        """
+        Un mouvement est un fait historique : seules les créations sont
+        contrôlées ici (les modifications sont interdites par l'API).
+        Règles :
+        - quantité strictement positive (sauf AJUSTEMENT : non nulle,
+          négative pour constater un manque d'inventaire) ;
+        - une SORTIE ne peut pas dépasser la quantité DISPONIBLE du
+          dépôt (physique - bloquée - réservée) : pas de stock négatif ;
+        - un AJUSTEMENT négatif ne peut pas rendre le stock physique négatif ;
+        - TRANSFERT refusé : ce type n'a aucun effet sur le stock (pas
+          de dépôt destination), il se saisit en SORTIE + ENTREE.
+        """
+        if not self._state.adding:
+            return
+        if self.type_mouvement == TypeMouvement.TRANSFERT:
+            raise ValidationError({"type_mouvement": (
+                "Un transfert se saisit en deux mouvements : une SORTIE du dépôt "
+                "source puis une ENTREE dans le dépôt destination."
+            )})
+        if self.type_mouvement == TypeMouvement.AJUSTEMENT:
+            if self.quantite is None or self.quantite == 0:
+                raise ValidationError({"quantite": "La quantité d'un ajustement ne peut pas être nulle."})
+        else:
+            exiger_positif(self.quantite, "quantite", "La quantité")
+
+        if not (self.article_id and self.depot_id):
+            return
+        if not self.depot.actif:
+            raise ValidationError({"depot": f"Le dépôt « {self.depot.nom} » est inactif."})
+
+        stock = StockArticle.objects.filter(article_id=self.article_id, depot_id=self.depot_id).first()
+        if self.type_mouvement == TypeMouvement.SORTIE:
+            disponible = stock.quantite_disponible if stock else 0
+            if self.quantite > disponible:
+                raise ValidationError({"quantite": (
+                    f"Stock insuffisant pour {self.article.code} au dépôt « {self.depot.nom} » : "
+                    f"sortie demandée {self.quantite}, disponible {disponible}."
+                )})
+        if self.type_mouvement == TypeMouvement.AJUSTEMENT and self.quantite < 0:
+            physique = stock.quantite_physique if stock else 0
+            if physique + self.quantite < 0:
+                raise ValidationError({"quantite": (
+                    f"Ajustement impossible : le stock physique de {self.article.code} "
+                    f"({physique}) deviendrait négatif."
+                )})
+
     def save(self, *args, **kwargs):
-        if not self.numero:
-            self.numero = generer_numero("MVT")
-        super().save(*args, **kwargs)
+        with transaction.atomic():
+            if self._state.adding and self.article_id and self.depot_id:
+                # Verrouille la ligne de stock pendant le contrôle de
+                # disponibilité (deux sorties simultanées ne peuvent pas
+                # consommer deux fois le même stock).
+                list(StockArticle.objects.select_for_update().filter(
+                    article_id=self.article_id, depot_id=self.depot_id,
+                ))
+            self.clean()
+            if not self.numero:
+                self.numero = generer_numero("MVT")
+            super().save(*args, **kwargs)
 
 
 class StatutInventaire(models.TextChoices):
@@ -310,7 +370,7 @@ class StatutInventaire(models.TextChoices):
     CLOTURE = "CLOTURE", "Clôturé"
 
 
-class Inventaire(models.Model):
+class Inventaire(ValidationAvantEnregistrement, models.Model):
     """Une campagne d'inventaire physique sur un dépôt donné."""
     depot = models.ForeignKey(Depot, verbose_name="Dépôt", on_delete=models.PROTECT)
     date_inventaire = models.DateField("Date de l'inventaire")
@@ -327,8 +387,18 @@ class Inventaire(models.Model):
     def __str__(self):
         return f"Inventaire {self.depot.nom} du {self.date_inventaire}"
 
+    def clean(self):
+        ancien_statut = valeur_en_base(self, "statut")
+        if ancien_statut == StatutInventaire.CLOTURE:
+            raise ValidationError("Cet inventaire est clôturé : il ne peut plus être modifié.")
+        verifier_transition(
+            ancien_statut, self.statut,
+            {StatutInventaire.EN_COURS: {StatutInventaire.CLOTURE}}, "statut d'inventaire",
+            initial=StatutInventaire.EN_COURS,
+        )
 
-class LigneInventaire(models.Model):
+
+class LigneInventaire(ValidationAvantEnregistrement, models.Model):
     """
     Compare la quantité théorique (celle du système) à la quantité
     réellement comptée. L'écart déclenche un mouvement d'AJUSTEMENT.
@@ -347,6 +417,21 @@ class LigneInventaire(models.Model):
 
     def __str__(self):
         return f"{self.inventaire} - {self.article.code}"
+
+    def clean(self):
+        exiger_positif(self.quantite_theorique, "quantite_theorique", "La quantité théorique", strict=False)
+        exiger_positif(self.quantite_comptee, "quantite_comptee", "La quantité comptée", strict=False)
+        if self.pk:
+            ancien_inventaire = valeur_en_base(self, "inventaire")
+            if Inventaire.objects.filter(pk=ancien_inventaire, statut=StatutInventaire.CLOTURE).exists():
+                raise ValidationError("Cette ligne appartient à un inventaire clôturé : elle ne peut plus être modifiée.")
+        if self.inventaire_id:
+            if self.inventaire.statut == StatutInventaire.CLOTURE:
+                raise ValidationError({"inventaire": "Cet inventaire est clôturé : on ne peut plus y ajouter de ligne."})
+            if self.article_id and LigneInventaire.objects.filter(
+                inventaire_id=self.inventaire_id, article_id=self.article_id,
+            ).exclude(pk=self.pk).exists():
+                raise ValidationError({"article": "Cet article a déjà une ligne dans cet inventaire."})
 
     @property
     def ecart(self):

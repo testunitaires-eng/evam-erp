@@ -26,13 +26,19 @@ dans apps.caisse. SolutionClient.montant_rembourse est donc enregistré
 ici avec une référence texte, pas une vraie écriture de caisse.
 """
 
-from django.db import models
+from django.core.exceptions import ValidationError
+from django.db import models, transaction
+from django.db.models import Sum
 from apps.comptes.models import Utilisateur
 from apps.referentiel.models import Article
 from apps.commercial.models import Client, Facture, Commande
 from apps.distribution.models import BonLivraison
 from apps.qualite.models import Lot
 from apps.core.models import generer_numero
+from apps.core.validation import (
+    ValidationAvantEnregistrement, exiger_positif, exiger_positif_optionnel,
+    valeur_en_base, verifier_transition, convertir_decimal,
+)
 
 
 class TypeProbleme(models.TextChoices):
@@ -50,7 +56,7 @@ class StatutReclamation(models.TextChoices):
     CLOTUREE = "CLOTUREE", "Clôturée"
 
 
-class ReclamationClient(models.Model):
+class ReclamationClient(ValidationAvantEnregistrement, models.Model):
     """
     Point d'entrée du circuit (bloc 6 du croquis). Rattachée à un BL
     déjà validé - "Recherche du BL" - avec les infos client/facture
@@ -93,10 +99,80 @@ class ReclamationClient(models.Model):
     def __str__(self):
         return f"{self.numero} - {self.client.nom} ({self.get_statut_display()})"
 
+    TRANSITIONS = {
+        StatutReclamation.OUVERTE: {StatutReclamation.EN_COURS, StatutReclamation.CLOTUREE},
+        StatutReclamation.EN_COURS: {StatutReclamation.CLOTUREE},
+    }
+
     def save(self, *args, **kwargs):
         if not self.numero:
             self.numero = generer_numero("RCL")
         super().save(*args, **kwargs)
+
+    def clean(self):
+        """
+        Règle clé n°4 du circuit : chaque opération est liée à
+        BL -> Facture -> Client -> Produit. Les informations saisies
+        doivent donc être COHÉRENTES entre elles :
+        - le BL doit être livré (le circuit démarre après un BL validé) ;
+        - client, facture et produit doivent correspondre au BL/à la commande ;
+        - la quantité réclamée ne dépasse pas la quantité livrée.
+        Une réclamation clôturée est figée.
+        """
+        exiger_positif(self.quantite, "quantite", "La quantité concernée")
+        exiger_positif_optionnel(self.prix_unitaire, "prix_unitaire", "Le prix unitaire")
+        ancien_statut = valeur_en_base(self, "statut")
+        if ancien_statut == StatutReclamation.CLOTUREE:
+            raise ValidationError(f"La réclamation {self.numero} est clôturée : elle ne peut plus être modifiée.")
+        verifier_transition(
+            ancien_statut, self.statut, self.TRANSITIONS, "statut de la réclamation",
+            initial=StatutReclamation.OUVERTE,
+        )
+        if self.pk and (
+            RetourPhysique.objects.filter(reclamation_id=self.pk).exists()
+            or SolutionClient.objects.filter(reclamation_id=self.pk).exists()
+        ):
+            for champ in ("bon_livraison", "client", "facture", "article"):
+                if valeur_en_base(self, champ) != getattr(self, f"{champ}_id"):
+                    raise ValidationError({champ: "Un retour ou une solution existe déjà : ce champ ne peut plus être modifié."})
+            if valeur_en_base(self, "quantite") != self.quantite:
+                raise ValidationError({"quantite": "Un retour ou une solution existe déjà : la quantité ne peut plus être modifiée."})
+
+        commande = None
+        if self.bon_livraison_id:
+            bl = self.bon_livraison
+            if bl.statut not in ("LIVREE", "PARTIELLEMENT_LIVREE"):
+                raise ValidationError({"bon_livraison": (
+                    f"Le bon de livraison {bl.numero} n'est pas encore livré : "
+                    "une réclamation ne peut porter que sur une livraison validée."
+                )})
+            commande = bl.commande
+        if self.facture_id:
+            if commande is not None and self.facture.commande_id != commande.id:
+                raise ValidationError({"facture": "Cette facture ne correspond pas à la commande du bon de livraison."})
+            commande = commande or self.facture.commande
+            if self.client_id and self.facture.client_id != self.client_id:
+                raise ValidationError({"facture": "Cette facture appartient à un autre client."})
+        if commande is not None:
+            if self.client_id and commande.client_id != self.client_id:
+                raise ValidationError({"client": f"Le client ne correspond pas à celui de la commande {commande.numero}."})
+            if self.article_id:
+                lignes = commande.lignes.filter(article_id=self.article_id)
+                quantite_livree = lignes.aggregate(total=Sum("quantite"))["total"] or 0
+                if quantite_livree == 0:
+                    raise ValidationError({"article": f"Ce produit ne figure pas dans la commande {commande.numero}."})
+                if self.quantite is not None and self.quantite > quantite_livree:
+                    raise ValidationError({"quantite": (
+                        f"Quantité réclamée ({self.quantite}) supérieure à la quantité livrée ({quantite_livree})."
+                    )})
+                if self.prix_unitaire is None:
+                    # Règle §15 : pas de ressaisie, le prix est repris de la commande.
+                    premiere_ligne = lignes.first()
+                    self.prix_unitaire = premiere_ligne.prix_unitaire if premiere_ligne else None
+
+    def verifier_suppression(self):
+        if self.statut != StatutReclamation.OUVERTE or hasattr(self, "retour_physique") or hasattr(self, "solution"):
+            raise ValidationError("Une réclamation déjà traitée ne peut pas être supprimée.")
 
     def cloturer(self):
         """Clôture la réclamation (impact automatique §12 : suivi statut côté Livraison)."""
@@ -111,7 +187,7 @@ class StatutRetourPhysique(models.TextChoices):
     CONTROLE_EFFECTUE = "CONTROLE_EFFECTUE", "Contrôle effectué"
 
 
-class RetourPhysique(models.Model):
+class RetourPhysique(ValidationAvantEnregistrement, models.Model):
     """
     Bloc 7 du croquis : le produit revient physiquement. Il est mis en
     quarantaine (jamais réintégré directement au stock disponible,
@@ -141,12 +217,49 @@ class RetourPhysique(models.Model):
     def __str__(self):
         return f"Retour {self.reclamation.numero} ({self.get_statut_display()})"
 
+    def clean(self):
+        """
+        - quantité retournée strictement positive, au plus la quantité réclamée ;
+        - pas de retour sur une réclamation clôturée ;
+        - le lot indiqué doit être un lot du produit réclamé ;
+        - une fois enregistré (stock en quarantaine), seul le statut
+          évolue (par le contrôle).
+        """
+        exiger_positif(self.quantite_retournee, "quantite_retournee", "La quantité retournée")
+        if self.pk:
+            for champ in ("reclamation", "lot"):
+                if valeur_en_base(self, champ) != getattr(self, f"{champ}_id"):
+                    raise ValidationError({champ: "Un retour enregistré ne peut plus être modifié."})
+            if valeur_en_base(self, "quantite_retournee") != self.quantite_retournee:
+                raise ValidationError({"quantite_retournee": "Un retour enregistré ne peut plus être modifié (stock déjà en quarantaine)."})
+            return
+        if self.statut != StatutRetourPhysique.EN_QUARANTAINE:
+            raise ValidationError({"statut": "Un retour physique est toujours créé « En quarantaine »."})
+        if self.reclamation_id:
+            reclamation = self.reclamation
+            if reclamation.statut == StatutReclamation.CLOTUREE:
+                raise ValidationError({"reclamation": f"La réclamation {reclamation.numero} est clôturée."})
+            if self.quantite_retournee > reclamation.quantite:
+                raise ValidationError({"quantite_retournee": (
+                    f"Quantité retournée ({self.quantite_retournee}) supérieure à la quantité "
+                    f"réclamée ({reclamation.quantite})."
+                )})
+            if self.lot_id and self.lot.article_id != reclamation.article_id:
+                raise ValidationError({"lot": "Ce lot ne correspond pas au produit réclamé."})
+
+    def verifier_suppression(self):
+        raise ValidationError("Un retour physique ne peut pas être supprimé (le stock a déjà été mouvementé).")
+
     def save(self, *args, **kwargs):
         """À la création, enregistre l'entrée en quarantaine comme un mouvement de stock (impact automatique §12 : Stock)."""
         creation = self._state.adding
-        super().save(*args, **kwargs)
-        if creation:
-            self._entree_en_quarantaine()
+        with transaction.atomic():
+            super().save(*args, **kwargs)
+            if creation:
+                self._entree_en_quarantaine()
+                if not self.reclamation.produit_retourne:
+                    self.reclamation.produit_retourne = True
+                    self.reclamation.save(update_fields=["produit_retourne"])
 
     def _entree_en_quarantaine(self):
         from apps.stocks.models import Depot, MouvementStock
@@ -168,7 +281,7 @@ class ResultatControle(models.TextChoices):
     NON_RECUPERABLE = "NON_RECUPERABLE", "Non récupérable"
 
 
-class ControleRetour(models.Model):
+class ControleRetour(ValidationAvantEnregistrement, models.Model):
     """
     Bloc 8 du croquis : vérification état produit / lot / DLC / qualité,
     puis décision. La décision orchestre automatiquement la suite du
@@ -190,13 +303,32 @@ class ControleRetour(models.Model):
     def __str__(self):
         return f"Contrôle {self.retour_physique.reclamation.numero} - {self.get_resultat_display()}"
 
+    def clean(self):
+        """
+        Un contrôle ne se fait qu'une fois, sur un retour encore en
+        quarantaine, et ne se modifie plus : sa décision a déjà mouvementé
+        le stock (réintégration / rebut) ou lancé un reconditionnement.
+        """
+        if self.pk is not None:
+            raise ValidationError("Un contrôle de retour enregistré ne peut pas être modifié (sa décision a déjà été appliquée).")
+        if self.retour_physique_id:
+            retour = self.retour_physique
+            if retour.statut != StatutRetourPhysique.EN_QUARANTAINE:
+                raise ValidationError({"retour_physique": "Ce retour a déjà été contrôlé."})
+            if retour.reclamation.statut == StatutReclamation.CLOTUREE:
+                raise ValidationError({"retour_physique": "La réclamation de ce retour est clôturée."})
+
+    def verifier_suppression(self):
+        raise ValidationError("Un contrôle de retour ne peut pas être supprimé (sa décision a déjà été appliquée).")
+
     def save(self, *args, **kwargs):
         creation = self._state.adding
-        super().save(*args, **kwargs)
-        self.retour_physique.statut = StatutRetourPhysique.CONTROLE_EFFECTUE
-        self.retour_physique.save()
-        if creation:
-            self.decider()
+        with transaction.atomic():
+            super().save(*args, **kwargs)
+            self.retour_physique.statut = StatutRetourPhysique.CONTROLE_EFFECTUE
+            self.retour_physique.save()
+            if creation:
+                self.decider()
 
     def decider(self):
         """
@@ -253,7 +385,7 @@ class StatutReconditionnement(models.TextChoices):
     TERMINE = "TERMINE", "Terminé"
 
 
-class Reconditionnement(models.Model):
+class Reconditionnement(ValidationAvantEnregistrement, models.Model):
     """§8B du croquis : intervention nécessaire avant réintégration (Module Production/Stock)."""
     controle_retour = models.OneToOneField(
         ControleRetour, verbose_name="Contrôle de retour", on_delete=models.CASCADE,
@@ -282,15 +414,40 @@ class Reconditionnement(models.Model):
     def __str__(self):
         return f"Reconditionnement {self.controle_retour.retour_physique.reclamation.numero} ({self.get_statut_display()})"
 
+    def clean(self):
+        if self.controle_retour_id and self.controle_retour.resultat != ResultatControle.RECUPERABLE_AVEC_INTERVENTION:
+            raise ValidationError({"controle_retour": (
+                "Un reconditionnement n'existe que pour un contrôle « Récupérable avec intervention »."
+            )})
+        if self.pk and valeur_en_base(self, "controle_retour") != self.controle_retour_id:
+            raise ValidationError({"controle_retour": "Le contrôle d'un reconditionnement ne peut pas être changé."})
+        if valeur_en_base(self, "statut") == StatutReconditionnement.TERMINE:
+            raise ValidationError("Ce reconditionnement est terminé : il ne peut plus être modifié.")
+        if self.quantite_reconditionnee is not None and self.controle_retour_id:
+            maximum = self.controle_retour.retour_physique.quantite_retournee
+            exiger_positif(self.quantite_reconditionnee, "quantite_reconditionnee", "La quantité reconditionnée")
+            if self.quantite_reconditionnee > maximum:
+                raise ValidationError({"quantite_reconditionnee": (
+                    f"Quantité reconditionnée ({self.quantite_reconditionnee}) supérieure à la quantité retournée ({maximum})."
+                )})
+
+    def verifier_suppression(self):
+        raise ValidationError("Un reconditionnement ne peut pas être supprimé (circuit de retour en cours ou terminé).")
+
+    @transaction.atomic
     def terminer(self, utilisateur, quantite_reconditionnee, cout=None):
         """
         Termine le reconditionnement : réintègre la quantité traitée en
         stock disponible (impact automatique Stock) et enregistre le
         coût de l'intervention (impact automatique Coûts).
+        Tout ou rien : une quantité absente/invalide ne laisse plus le
+        reconditionnement « Terminé » sans réintégration.
         """
         from django.utils import timezone
         if self.statut == StatutReconditionnement.TERMINE:
             raise ValueError("Ce reconditionnement est déjà terminé.")
+        quantite_reconditionnee = convertir_decimal(quantite_reconditionnee, "La quantité reconditionnée")
+        cout = convertir_decimal(cout, "Le coût du reconditionnement", obligatoire=False, strict=False)
         self.quantite_reconditionnee = quantite_reconditionnee
         self.traite_par = utilisateur
         self.date_traitement = timezone.now()
@@ -306,7 +463,7 @@ class Reconditionnement(models.Model):
         cout_retour.save()
 
 
-class CoutRetourPerte(models.Model):
+class CoutRetourPerte(ValidationAvantEnregistrement, models.Model):
     """
     §10 du croquis : coût des retours/pertes (Module Coûts). Créé
     automatiquement lors d'une sortie définitive (produit détruit) ou
@@ -335,6 +492,11 @@ class CoutRetourPerte(models.Model):
     def __str__(self):
         return f"Coût retour {self.reclamation.numero}"
 
+    def clean(self):
+        exiger_positif_optionnel(self.quantite_detruite, "quantite_detruite", "La quantité détruite")
+        exiger_positif_optionnel(self.cout_produit_detruit, "cout_produit_detruit", "Le coût du produit détruit")
+        exiger_positif_optionnel(self.cout_reconditionnement, "cout_reconditionnement", "Le coût du reconditionnement")
+
 
 class TypeSolution(models.TextChoices):
     REMPLACEMENT = "REMPLACEMENT", "Remplacement"
@@ -342,7 +504,7 @@ class TypeSolution(models.TextChoices):
     REMBOURSEMENT = "REMBOURSEMENT", "Remboursement"
 
 
-class SolutionClient(models.Model):
+class SolutionClient(ValidationAvantEnregistrement, models.Model):
     """
     §9 du croquis (Module Commercial) : la solution apportée au client,
     une fois le produit contrôlé (ou même sans retour physique, ex :
@@ -397,36 +559,97 @@ class SolutionClient(models.Model):
           reste à renseigner manuellement.
         """
         creation = self._state.adding
-        super().save(*args, **kwargs)
-        if creation:
-            if self.type_solution == TypeSolution.AVOIR and self.montant_avoir:
-                self._creer_avoir()
-            elif self.type_solution == TypeSolution.REMBOURSEMENT and self.montant_rembourse:
-                self._creer_decaissement()
-        self.reclamation.cloturer()
+        with transaction.atomic():
+            super().save(*args, **kwargs)
+            if creation:
+                if self.type_solution == TypeSolution.AVOIR:
+                    self._creer_avoir()
+                elif self.type_solution == TypeSolution.REMBOURSEMENT:
+                    self._creer_decaissement()
+                self.reclamation.cloturer()
+
+    def clean(self):
+        """
+        - une solution se décide une seule fois, sur une réclamation non
+          clôturée, et ne se modifie plus (avoir/décaissement déjà créés) ;
+        - si le produit est revenu physiquement, il doit d'abord être contrôlé ;
+        - chaque type exige son montant (et seulement le sien), au plus
+          la valeur de la marchandise réclamée ;
+        - la commande de remplacement doit être celle du même client.
+        """
+        if self.pk is not None:
+            raise ValidationError("Une solution client enregistrée ne peut pas être modifiée.")
+        if not self.reclamation_id:
+            return
+        reclamation = self.reclamation
+        if reclamation.statut == StatutReclamation.CLOTUREE:
+            raise ValidationError({"reclamation": f"La réclamation {reclamation.numero} est déjà clôturée."})
+        retour = RetourPhysique.objects.filter(reclamation=reclamation).first()
+        if retour is not None and retour.statut == StatutRetourPhysique.EN_QUARANTAINE:
+            raise ValidationError({"reclamation": "Le produit retourné doit d'abord être contrôlé avant de décider de la solution."})
+
+        valeur_reclamee = (
+            reclamation.quantite * reclamation.prix_unitaire if reclamation.prix_unitaire is not None else None
+        )
+        montants = {
+            TypeSolution.AVOIR: ("montant_avoir", "Le montant de l'avoir"),
+            TypeSolution.REMBOURSEMENT: ("montant_rembourse", "Le montant remboursé"),
+        }
+        for type_solution, (champ, libelle) in montants.items():
+            valeur = getattr(self, champ)
+            if self.type_solution == type_solution:
+                exiger_positif(valeur, champ, libelle)
+                if valeur_reclamee is not None and valeur > valeur_reclamee:
+                    raise ValidationError({champ: (
+                        f"{libelle} ({valeur}) dépasse la valeur de la marchandise réclamée ({valeur_reclamee})."
+                    )})
+            elif valeur:
+                raise ValidationError({champ: f"{libelle} ne concerne pas une solution de type « {self.get_type_solution_display()} »."})
+        if self.nouvelle_commande_id:
+            if self.type_solution != TypeSolution.REMPLACEMENT:
+                raise ValidationError({"nouvelle_commande": "Une commande de remplacement ne concerne que le type « Remplacement »."})
+            if self.nouvelle_commande.client_id != reclamation.client_id:
+                raise ValidationError({"nouvelle_commande": "La commande de remplacement doit être au nom du même client."})
+
+    def verifier_suppression(self):
+        raise ValidationError("Une solution client ne peut pas être supprimée (réclamation clôturée, impacts déjà appliqués).")
 
     def _creer_avoir(self):
         from apps.commercial.models import Avoir
-        Avoir.objects.get_or_create(
+        # Toujours un NOUVEL avoir : auparavant un get_or_create par
+        # (facture, client) réutilisait l'avoir d'une autre réclamation
+        # (ex : deux réclamations sans facture pour le même client).
+        Avoir.objects.create(
             facture_origine=self.reclamation.facture,
             client=self.reclamation.client,
-            defaults={
-                "montant": self.montant_avoir,
-                "motif": f"Réclamation {self.reclamation.numero}",
-                "cree_par": self.autorise_par,
-            },
+            montant=self.montant_avoir,
+            motif=f"Réclamation {self.reclamation.numero}",
+            cree_par=self.autorise_par,
         )
 
     def _creer_decaissement(self):
+        """
+        Crée le décaissement sur une session ouverte disposant d'assez
+        d'argent, effectué par le caissier de cette session et autorisé
+        par la personne qui décide la solution. Sans session adaptée, la
+        référence reste à renseigner manuellement (comme auparavant).
+        """
         from apps.caisse.models import SessionCaisse, Decaissement
-        session_ouverte = SessionCaisse.objects.filter(statut="OUVERTE").first()
+        session_ouverte = next(
+            (
+                session for session in SessionCaisse.objects.filter(statut="OUVERTE").order_by("date_ouverture")
+                if session.calculer_solde_theorique() >= self.montant_rembourse
+                and session.caissier_id != self.autorise_par_id
+            ),
+            None,
+        )
         if not session_ouverte:
             return
         decaissement = Decaissement.objects.create(
             session_caisse=session_ouverte, montant=self.montant_rembourse,
             motif=f"Remboursement réclamation {self.reclamation.numero}",
             beneficiaire=self.reclamation.client.nom,
-            autorise_par=self.autorise_par, effectue_par=self.autorise_par,
+            autorise_par=self.autorise_par, effectue_par=session_ouverte.caissier,
         )
         self.reference_sortie_caisse = decaissement.numero
         super().save(update_fields=["reference_sortie_caisse"])

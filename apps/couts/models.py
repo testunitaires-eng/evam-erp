@@ -13,12 +13,16 @@ modèles ci-dessous posent la structure de données ; le calcul détaillé
 (CoutReel.calculer()) est un point à finaliser avec le client.
 """
 
+import re
+
+from django.core.exceptions import ValidationError
 from django.db import models
 from apps.referentiel.models import Article
 from apps.production.models import OrdreFabrication
+from apps.core.validation import ValidationAvantEnregistrement, exiger_positif
 
 
-class CoutMatiere(models.Model):
+class CoutMatiere(ValidationAvantEnregistrement, models.Model):
     """Valorisation d'une sortie matière (quantité x coût unitaire de la matière)."""
     article = models.ForeignKey(Article, verbose_name="Matière", on_delete=models.PROTECT)
     cout_unitaire = models.DecimalField("Coût unitaire", max_digits=14, decimal_places=4)
@@ -31,13 +35,16 @@ class CoutMatiere(models.Model):
     def __str__(self):
         return f"{self.article.code} : {self.cout_unitaire}"
 
+    def clean(self):
+        exiger_positif(self.cout_unitaire, "cout_unitaire", "Le coût unitaire", strict=False)
+
 
 class TypeEnergie(models.TextChoices):
     ELECTRICITE = "ELECTRICITE", "Électricité"
     EAU_CAPTAGE = "EAU_CAPTAGE", "Eau / captage-forage"
 
 
-class CoutEnergie(models.Model):
+class CoutEnergie(ValidationAvantEnregistrement, models.Model):
     """Charge d'énergie sur une période, à répartir sur les OF de la période (clé de répartition à définir avec le client)."""
     type_energie = models.CharField("Type d'énergie", max_length=20, choices=TypeEnergie.choices)
     periode = models.CharField("Période", max_length=20, help_text="Format AAAA-MM")
@@ -54,8 +61,15 @@ class CoutEnergie(models.Model):
     def __str__(self):
         return f"{self.get_type_energie_display()} {self.periode} : {self.montant}"
 
+    def clean(self):
+        exiger_positif(self.montant, "montant", "Le montant de la charge", strict=False)
+        # La période sert de clé de rapprochement avec les OF (CoutReel.calculer) :
+        # un format différent rendrait la charge invisible dans les calculs.
+        if not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", self.periode or ""):
+            raise ValidationError({"periode": "La période doit être au format AAAA-MM (ex : 2026-09)."})
 
-class CoutMainOeuvre(models.Model):
+
+class CoutMainOeuvre(ValidationAvantEnregistrement, models.Model):
     ordre_fabrication = models.ForeignKey(
         OrdreFabrication, verbose_name="Ordre de fabrication",
         on_delete=models.CASCADE, related_name="couts_main_oeuvre",
@@ -70,12 +84,16 @@ class CoutMainOeuvre(models.Model):
     def __str__(self):
         return f"{self.ordre_fabrication.numero} : {self.heures}h x {self.cout_horaire}"
 
+    def clean(self):
+        exiger_positif(self.heures, "heures", "Le nombre d'heures")
+        exiger_positif(self.cout_horaire, "cout_horaire", "Le coût horaire", strict=False)
+
     @property
     def cout_total(self):
         return self.heures * self.cout_horaire
 
 
-class Amortissement(models.Model):
+class Amortissement(ValidationAvantEnregistrement, models.Model):
     immobilisation = models.CharField("Immobilisation", max_length=200)
     valeur = models.DecimalField("Valeur d'origine", max_digits=14, decimal_places=2)
     duree_amortissement_mois = models.PositiveIntegerField("Durée d'amortissement (mois)")
@@ -88,6 +106,10 @@ class Amortissement(models.Model):
     def __str__(self):
         return self.immobilisation
 
+    def clean(self):
+        exiger_positif(self.valeur, "valeur", "La valeur d'origine")
+        exiger_positif(self.duree_amortissement_mois, "duree_amortissement_mois", "La durée d'amortissement")
+
     @property
     def amortissement_mensuel(self):
         if self.duree_amortissement_mois:
@@ -95,7 +117,7 @@ class Amortissement(models.Model):
         return 0
 
 
-class CoutStandard(models.Model):
+class CoutStandard(ValidationAvantEnregistrement, models.Model):
     """Coût standard de référence d'un article, comparé au coût réel constaté (§13.9)."""
     article = models.ForeignKey(Article, verbose_name="Article", on_delete=models.CASCADE, related_name="couts_standards")
     cout_standard_unitaire = models.DecimalField("Coût standard unitaire", max_digits=14, decimal_places=4)
@@ -107,6 +129,9 @@ class CoutStandard(models.Model):
 
     def __str__(self):
         return f"Standard {self.article.code} : {self.cout_standard_unitaire}"
+
+    def clean(self):
+        exiger_positif(self.cout_standard_unitaire, "cout_standard_unitaire", "Le coût standard unitaire", strict=False)
 
 
 class CoutReel(models.Model):

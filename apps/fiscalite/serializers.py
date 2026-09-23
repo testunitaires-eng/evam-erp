@@ -15,15 +15,16 @@ Sérialiseurs DRF du module fiscalité.
 """
 
 from rest_framework import serializers
+from apps.core.serializers import ValidationModeleMixin
 from . import models
 
-class FamilleFiscaleSerializer(serializers.ModelSerializer):
+class FamilleFiscaleSerializer(ValidationModeleMixin, serializers.ModelSerializer):
     class Meta:
         model = models.FamilleFiscale
         fields = "__all__"
 
 
-class CodeFiscalSerializer(serializers.ModelSerializer):
+class CodeFiscalSerializer(ValidationModeleMixin, serializers.ModelSerializer):
     class Meta:
         model = models.CodeFiscal
         fields = "__all__"

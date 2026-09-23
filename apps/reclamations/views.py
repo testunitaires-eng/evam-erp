@@ -18,6 +18,7 @@ Répartition des droits fidèle au croquis :
 from rest_framework import viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
+from apps.core.validation import METHODES_CREATION_LECTURE
 from . import models, serializers
 from apps.comptes.permissions import role_required, lecture_seule_pour
 from apps.comptes.models import Profil
@@ -43,6 +44,9 @@ class RetourPhysiqueViewSet(viewsets.ModelViewSet):
     serializer_class = serializers.RetourPhysiqueSerializer
     permission_classes = [role_required(*PROFILS_STOCK_QUALITE)]
     filterset_fields = ["reclamation", "statut"]
+    # Le retour a déjà fait entrer la marchandise en quarantaine : il ne
+    # se modifie ni ne se supprime.
+    http_method_names = METHODES_CREATION_LECTURE
 
     def perform_create(self, serializer):
         serializer.save(receptionne_par=self.request.user)
@@ -53,6 +57,8 @@ class ControleRetourViewSet(viewsets.ModelViewSet):
     serializer_class = serializers.ControleRetourSerializer
     permission_classes = [role_required(*PROFILS_STOCK_QUALITE)]
     filterset_fields = ["retour_physique", "resultat"]
+    # La décision a déjà été appliquée au stock : pas de modification.
+    http_method_names = METHODES_CREATION_LECTURE
 
     def perform_create(self, serializer):
         """
@@ -104,6 +110,8 @@ class SolutionClientViewSet(viewsets.ModelViewSet):
     serializer_class = serializers.SolutionClientSerializer
     permission_classes = [role_required(Profil.COMMERCIAL, Profil.ADMIN_SI)]
     filterset_fields = ["reclamation", "type_solution"]
+    # Avoir / décaissement déjà créés, réclamation clôturée : pas de modification.
+    http_method_names = METHODES_CREATION_LECTURE
 
     def perform_create(self, serializer):
         serializer.save(autorise_par=self.request.user)

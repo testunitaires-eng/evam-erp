@@ -215,7 +215,11 @@ class PreparationLivraisonViewSet(viewsets.ModelViewSet):
         if request.user.profil != Profil.MAGASINIER and not request.user.is_superuser:
             return Response({"erreur": "Seul le Magasinier peut confirmer la préparation."}, status=403)
         preparation = self.get_object()
-        preparation.statut = "EN_PREPARATION"
+        if preparation.statut != models.StatutPreparation.A_PREPARER:
+            return Response(
+                {"erreur": f"Cette préparation est déjà « {preparation.get_statut_display()} »."}, status=400,
+            )
+        preparation.statut = models.StatutPreparation.EN_PREPARATION
         preparation.preparee_par = request.user
         preparation.save()
         return Response(self.get_serializer(preparation).data)
@@ -225,28 +229,14 @@ class PreparationLivraisonViewSet(viewsets.ModelViewSet):
         """POST .../confirmer_sortie/ - Magasinier confirme la sortie magasin (§12.3 point 9)."""
         if request.user.profil != Profil.MAGASINIER and not request.user.is_superuser:
             return Response({"erreur": "Seul le Magasinier peut confirmer la sortie magasin."}, status=403)
-        from django.utils import timezone
         preparation = self.get_object()
-        preparation.statut = "SORTIE_MAGASIN"
-        preparation.date_confirmation_sortie = timezone.now()
-        preparation.save()
-
-        # La sortie magasin doit diminuer réellement le stock produits
-        # finis pour chaque ligne de la commande livrée (sinon le
-        # produit resterait indéfiniment "en stock" alors qu'il est
-        # physiquement parti chez le client).
-        from apps.stocks.models import MouvementStock, TypeMouvement, depot_par_defaut
-        depot_pf = depot_par_defaut("Dépôt produits finis")
-        for ligne in preparation.commande.lignes.all():
-            MouvementStock.objects.create(
-                article=ligne.article,
-                depot=depot_pf,
-                type_mouvement=TypeMouvement.SORTIE,
-                quantite=ligne.quantite,
-                motif=f"Sortie magasin pour livraison - commande {preparation.commande.numero}",
-                document_origine=preparation.commande.numero,
-                utilisateur=request.user,
-            )
+        # Contrôles (statut, commande annulée) et sorties de stock (stock
+        # disponible vérifié) faits en tout-ou-rien : voir
+        # PreparationLivraison.confirmer_sortie().
+        try:
+            preparation.confirmer_sortie(request.user)
+        except ValueError as erreur:
+            return Response({"erreur": str(erreur)}, status=400)
         return Response(self.get_serializer(preparation).data)
 
 
@@ -279,6 +269,10 @@ class BonLivraisonViewSet(viewsets.ModelViewSet):
             return Response({"erreur": "Seul le Responsable Distribution peut confirmer la livraison."}, status=403)
         from django.utils import timezone
         bon = self.get_object()
+        if bon.statut == models.StatutLivraison.LIVREE:
+            return Response({"erreur": "Cette livraison est déjà confirmée."}, status=400)
+        if bon.statut == models.StatutLivraison.RETOURNEE:
+            return Response({"erreur": "Ce bon de livraison a été retourné : la livraison ne peut pas être confirmée."}, status=400)
         bon.statut = "LIVREE"
         bon.signature_client = True
         bon.confirme_par = request.user

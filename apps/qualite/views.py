@@ -43,7 +43,10 @@ class LotViewSet(viewsets.ModelViewSet):
         if request.user.profil != Profil.RESPONSABLE_QUALITE and not request.user.is_superuser:
             return Response({"erreur": "Seul le Responsable Qualité peut bloquer un lot."}, status=403)
         lot = self.get_object()
-        lot.bloquer(motif=request.data.get("motif", ""))
+        try:
+            lot.bloquer(motif=request.data.get("motif", ""))
+        except ValueError as erreur:
+            return Response({"erreur": str(erreur)}, status=400)
         return Response(self.get_serializer(lot).data)
 
 

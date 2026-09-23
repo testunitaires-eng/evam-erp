@@ -107,6 +107,10 @@ DATABASES = {
         conn_max_age=600,
     )
 }
+# Chaque requête HTTP s'exécute dans une transaction : si une erreur
+# survient au milieu d'un traitement, AUCUNE des écritures déjà faites
+# n'est conservée (pas d'enregistrement partiel).
+DATABASES["default"]["ATOMIC_REQUESTS"] = True
 # --- Utilisateur personnalisé -----------------------------------------
 AUTH_USER_MODEL = "comptes.Utilisateur"
 
@@ -159,6 +163,9 @@ REST_FRAMEWORK = {
         "rest_framework.filters.OrderingFilter",
     ),
     "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
+    # Transforme les erreurs de validation métier des modèles en 400
+    # avec message (au lieu d'un 500), voir apps/core/exceptions.py.
+    "EXCEPTION_HANDLER": "apps.core.exceptions.gestionnaire_exceptions",
 }
 
 SPECTACULAR_SETTINGS = {

@@ -174,6 +174,7 @@ fournisseur, contrat ou commande.
 from rest_framework import viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
+from apps.core.validation import METHODES_CREATION_LECTURE
 from . import models, serializers
 from apps.comptes.permissions import role_required, lecture_seule_pour
 from apps.comptes.models import Profil
@@ -237,7 +238,10 @@ class DemandeAchatViewSet(viewsets.ModelViewSet):
         if request.user.profil != Profil.RESPONSABLE_ACHATS and not request.user.is_superuser:
             return Response({"erreur": "Seul le Responsable Achat peut approuver une demande."}, status=403)
         demande = self.get_object()
-        demande.approuver(request.user)
+        try:
+            demande.approuver(request.user)
+        except ValueError as erreur:
+            return Response({"erreur": str(erreur)}, status=400)
         return Response(self.get_serializer(demande).data)
 
     @action(detail=True, methods=["post"])
@@ -246,7 +250,10 @@ class DemandeAchatViewSet(viewsets.ModelViewSet):
         if request.user.profil != Profil.RESPONSABLE_ACHATS and not request.user.is_superuser:
             return Response({"erreur": "Seul le Responsable Achat peut rejeter une demande."}, status=403)
         demande = self.get_object()
-        demande.rejeter(request.user)
+        try:
+            demande.rejeter(request.user)
+        except ValueError as erreur:
+            return Response({"erreur": str(erreur)}, status=400)
         return Response(self.get_serializer(demande).data)
 
 
@@ -299,32 +306,13 @@ class LigneReceptionAchatViewSet(viewsets.ModelViewSet):
     permission_classes = [role_required(Profil.MAGASINIER, *PROFILS_ACHATS)]
     filterset_fields = ["reception", "ligne_commande"]
 
-    def perform_create(self, serializer):
-        """Met à jour automatiquement la quantité reçue de la ligne de commande et le stock."""
-        ligne = serializer.save()
-        ligne_commande = ligne.ligne_commande
-        ligne_commande.quantite_recue += ligne.quantite_recue
-        ligne_commande.save()
-
-        commande = ligne_commande.commande
-        total_commande = sum(l.quantite_commandee for l in commande.lignes.all())
-        total_recu = sum(l.quantite_recue for l in commande.lignes.all())
-        commande.statut = "RECUE" if total_recu >= total_commande else "PARTIELLEMENT_RECUE"
-        commande.save()
-
-        # La réception physique doit faire ENTRER la quantité en stock
-        # (docstring de ReceptionAchat le promettait déjà, mais rien ne
-        # le faisait réellement - voir apps/stocks/signals.py).
-        from apps.stocks.models import MouvementStock, TypeMouvement, depot_par_defaut
-        MouvementStock.objects.create(
-            article=ligne_commande.article,
-            depot=depot_par_defaut("Magasin principal"),
-            type_mouvement=TypeMouvement.ENTREE,
-            quantite=ligne.quantite_recue,
-            motif=f"Réception achat {ligne.reception_id} - commande {commande.numero}",
-            document_origine=commande.numero,
-            utilisateur=self.request.user,
-        )
+    # La mise à jour de la ligne de commande, du statut de la commande et
+    # l'entrée en stock sont faites par LigneReceptionAchat.save(), dans
+    # une seule transaction et APRÈS contrôle (quantité <= reste à
+    # recevoir, ligne appartenant bien à la commande réceptionnée...).
+    # Une ligne de réception ne se modifie ni ne se supprime : le stock
+    # est déjà entré.
+    http_method_names = METHODES_CREATION_LECTURE
 
 
 class RetourFournisseurViewSet(viewsets.ModelViewSet):
@@ -332,6 +320,8 @@ class RetourFournisseurViewSet(viewsets.ModelViewSet):
     serializer_class = serializers.RetourFournisseurSerializer
     permission_classes = [role_required(Profil.MAGASINIER, *PROFILS_ACHATS)]
     filterset_fields = ["reception", "article", "motif"]
+    # Un retour ne se modifie ni ne se supprime (le stock a déjà été sorti).
+    http_method_names = METHODES_CREATION_LECTURE
 
     def perform_create(self, serializer):
         serializer.save(traite_par=self.request.user)

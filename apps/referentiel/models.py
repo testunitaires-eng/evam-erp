@@ -323,9 +323,14 @@ créer ou modifier une fiche technique (voir apps/comptes/permissions.py
 et referentiel/views.py).
 """
 
-from django.db import models
+from django.core.exceptions import ValidationError
+from django.db import models, transaction
 from apps.comptes.models import Utilisateur
 from apps.fiscalite.models import CodeFiscal
+from apps.core.validation import (
+    ValidationAvantEnregistrement, exiger_positif, exiger_positif_optionnel,
+    valeur_en_base, verifier_transition,
+)
 
 
 class TypeArticle(models.TextChoices):
@@ -405,7 +410,7 @@ class UniteVenteArticle(models.Model):
         return self.nom
 
 
-class Article(models.Model):
+class Article(ValidationAvantEnregistrement, models.Model):
     """
     Toute chose qui peut être achetée, stockée, produite ou vendue :
     matière première (ex: préforme, arôme), produit intermédiaire
@@ -532,6 +537,12 @@ class Article(models.Model):
             self.designation = designation or self.code
         super().save(*args, **kwargs)
 
+    def clean(self):
+        exiger_positif(self.stock_minimum, "stock_minimum", "Le stock minimum", strict=False)
+        exiger_positif(self.stock_alerte, "stock_alerte", "Le stock d'alerte", strict=False)
+        if self.code_fiscal_id and not self.code_fiscal.actif and valeur_en_base(self, "code_fiscal") != self.code_fiscal_id:
+            raise ValidationError({"code_fiscal": f"Le code fiscal {self.code_fiscal.code} est inactif."})
+
     @property
     def peut_etre_facture(self):
         """
@@ -550,7 +561,7 @@ class StatutFicheTechnique(models.TextChoices):
     ARCHIVEE = "ARCHIVEE", "Archivée"
 
 
-class FicheTechnique(models.Model):
+class FicheTechnique(ValidationAvantEnregistrement, models.Model):
     """
     La "recette" d'un article fabriqué : quels intrants, en quelle
     quantité, pour produire une unité de l'article.
@@ -590,14 +601,56 @@ class FicheTechnique(models.Model):
     def __str__(self):
         return f"Fiche {self.article.code} v{self.version} ({self.get_statut_display()})"
 
+    TRANSITIONS = {
+        StatutFicheTechnique.BROUILLON: {StatutFicheTechnique.VALIDEE},
+        StatutFicheTechnique.VALIDEE: {StatutFicheTechnique.ARCHIVEE},
+    }
+
+    def clean(self):
+        """
+        - fiche d'un article fabriqué (pas d'une matière première) ;
+        - toujours créée en brouillon ; Brouillon -> Validée -> Archivée ;
+        - une fiche validée ou archivée ne se modifie plus (versionnement :
+          on crée une nouvelle version), seul l'archivage est possible.
+        """
+        if self.article_id and self.article.type_article == TypeArticle.MATIERE_PREMIERE:
+            raise ValidationError({"article": "Une matière première n'a pas de fiche technique."})
+        ancien_statut = valeur_en_base(self, "statut")
+        if ancien_statut == StatutFicheTechnique.ARCHIVEE:
+            raise ValidationError("Cette fiche technique est archivée : elle ne peut plus être modifiée.")
+        verifier_transition(
+            ancien_statut, self.statut, self.TRANSITIONS, "statut de la fiche technique",
+            initial=StatutFicheTechnique.BROUILLON,
+        )
+        if ancien_statut == StatutFicheTechnique.VALIDEE:
+            for champ in ("article", "version"):
+                attribut = f"{champ}_id" if champ == "article" else champ
+                if valeur_en_base(self, champ) != getattr(self, attribut):
+                    raise ValidationError({champ: "Une fiche validée ne peut plus être modifiée : créez une nouvelle version."})
+
+    def verifier_suppression(self):
+        if self.statut != StatutFicheTechnique.BROUILLON:
+            raise ValidationError("Une fiche validée ou archivée ne se supprime pas (historique des versions).")
+
+    @transaction.atomic
     def valider(self, utilisateur):
         """
         Fait passer la fiche de BROUILLON à VALIDEE.
         Seule une fiche validée peut être utilisée pour calculer les
         besoins matières d'un ordre de fabrication (voir apps/production).
+        Une fiche sans composition ne peut pas être validée, et la
+        précédente version validée du même article est archivée (une
+        seule version active à la fois).
         """
         if self.statut != StatutFicheTechnique.BROUILLON:
             raise ValueError("Seule une fiche en brouillon peut être validée.")
+        if not self.composition.exists():
+            raise ValueError("Impossible de valider une fiche technique sans aucune ligne de composition.")
+        for ancienne in FicheTechnique.objects.filter(
+            article_id=self.article_id, statut=StatutFicheTechnique.VALIDEE,
+        ).exclude(pk=self.pk):
+            ancienne.statut = StatutFicheTechnique.ARCHIVEE
+            ancienne.save()
         self.statut = StatutFicheTechnique.VALIDEE
         self.valide_par = utilisateur
         from django.utils import timezone
@@ -605,7 +658,7 @@ class FicheTechnique(models.Model):
         self.save()
 
 
-class CompositionFicheTechnique(models.Model):
+class CompositionFicheTechnique(ValidationAvantEnregistrement, models.Model):
     """
     Une ligne de recette : "il faut X kg/L/unités de telle matière
     pour produire une unité de l'article de la fiche technique".
@@ -631,8 +684,31 @@ class CompositionFicheTechnique(models.Model):
     def __str__(self):
         return f"{self.fiche_technique} : {self.quantite_necessaire} {self.matiere.unite_mesure} de {self.matiere.designation}"
 
+    def clean(self):
+        """La composition ne se modifie que tant que la fiche est en brouillon."""
+        exiger_positif(self.quantite_necessaire, "quantite_necessaire", "La quantité nécessaire")
+        if self.pk:
+            ancienne_fiche = FicheTechnique.objects.filter(pk=valeur_en_base(self, "fiche_technique")).first()
+            if ancienne_fiche and ancienne_fiche.statut != StatutFicheTechnique.BROUILLON:
+                raise ValidationError("Cette fiche technique n'est plus en brouillon : sa composition est figée.")
+        if self.fiche_technique_id:
+            fiche = self.fiche_technique
+            if fiche.statut != StatutFicheTechnique.BROUILLON:
+                raise ValidationError({"fiche_technique": (
+                    "Cette fiche technique n'est plus en brouillon : sa composition est figée "
+                    "(créez une nouvelle version)."
+                )})
+            if self.matiere_id and self.matiere_id == fiche.article_id:
+                raise ValidationError({"matiere": "Un article ne peut pas entrer dans sa propre composition."})
+        if self.matiere_id and not self.matiere.actif:
+            raise ValidationError({"matiere": f"La matière {self.matiere.code} est inactive."})
 
-class FicheConditionnement(models.Model):
+    def verifier_suppression(self):
+        if self.fiche_technique.statut != StatutFicheTechnique.BROUILLON:
+            raise ValidationError("Cette fiche technique n'est plus en brouillon : sa composition est figée.")
+
+
+class FicheConditionnement(ValidationAvantEnregistrement, models.Model):
     """
     Comment un produit fini est emballé pour l'expédition :
     nombre d'unités par carton, type d'emballage, poids, palettisation.
@@ -657,6 +733,11 @@ class FicheConditionnement(models.Model):
 
     def __str__(self):
         return f"Conditionnement {self.article.code}"
+
+    def clean(self):
+        exiger_positif(self.nombre_unites_par_carton, "nombre_unites_par_carton", "Le nombre d'unités par carton")
+        exiger_positif_optionnel(self.poids_carton_kg, "poids_carton_kg", "Le poids du carton", strict=True)
+        exiger_positif_optionnel(self.nombre_cartons_par_palette, "nombre_cartons_par_palette", "Le nombre de cartons par palette", strict=True)
 
 
 class MomentControle(models.TextChoices):

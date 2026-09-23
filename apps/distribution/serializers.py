@@ -8,46 +8,59 @@ verbose_name dans models.py, donc déjà en français.
 """
 
 from rest_framework import serializers
+from apps.core.serializers import ValidationModeleMixin
 from . import models
 
-class VehiculeSerializer(serializers.ModelSerializer):
+class VehiculeSerializer(ValidationModeleMixin, serializers.ModelSerializer):
     class Meta:
         model = models.Vehicule
         fields = "__all__"
 
 
-class ChauffeurSerializer(serializers.ModelSerializer):
+class ChauffeurSerializer(ValidationModeleMixin, serializers.ModelSerializer):
     class Meta:
         model = models.Chauffeur
         fields = "__all__"
 
 
-class DepotSerializer(serializers.ModelSerializer):
+class DepotSerializer(ValidationModeleMixin, serializers.ModelSerializer):
     class Meta:
         model = models.Depot
         fields = "__all__"
 
 
-class TourneeSerializer(serializers.ModelSerializer):
+class TourneeSerializer(ValidationModeleMixin, serializers.ModelSerializer):
     class Meta:
         model = models.Tournee
         fields = "__all__"
 
 
-class PreparationLivraisonSerializer(serializers.ModelSerializer):
+class PreparationLivraisonSerializer(ValidationModeleMixin, serializers.ModelSerializer):
     class Meta:
         model = models.PreparationLivraison
         fields = "__all__"
         extra_kwargs = {"lancee_par": {"required": False}}
+        # Évolution uniquement via /confirmer_preparation/ et /confirmer_sortie/
+        # (la sortie magasin mouvemente le stock).
+        read_only_fields = ["lancee_par", "statut", "preparee_par", "date_confirmation_sortie"]
 
 
-class BonLivraisonSerializer(serializers.ModelSerializer):
+class BonLivraisonSerializer(ValidationModeleMixin, serializers.ModelSerializer):
     class Meta:
         model = models.BonLivraison
         fields = "__all__"
+        read_only_fields = ["confirme_par", "date_livraison"]
+
+    def validate_statut(self, valeur):
+        actuel = self.instance.statut if self.instance is not None else models.StatutLivraison.EN_LIVRAISON
+        if valeur != actuel and valeur == models.StatutLivraison.LIVREE:
+            raise serializers.ValidationError(
+                "La livraison est confirmée uniquement par le Responsable Distribution (action /confirmer_livraison/)."
+            )
+        return valeur
 
 
-class TransfertDepotSerializer(serializers.ModelSerializer):
+class TransfertDepotSerializer(ValidationModeleMixin, serializers.ModelSerializer):
     class Meta:
         model = models.TransfertDepot
         fields = "__all__"

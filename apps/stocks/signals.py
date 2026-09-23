@@ -35,7 +35,7 @@ def appliquer_mouvement_au_stock(sender, instance, created, **kwargs):
     if not created:
         return
 
-    stock, _ = StockArticle.objects.get_or_create(
+    stock, _ = StockArticle.objects.select_for_update().get_or_create(
         article=instance.article, depot=instance.depot,
     )
     if instance.type_mouvement in ("ENTREE", "RETOUR", "AJUSTEMENT"):

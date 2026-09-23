@@ -9,8 +9,12 @@ Utilisé par la Comptabilité/DAF (accès transversal en lecture/contrôle
 - Cloture : clôtures mensuelles/annuelles
 """
 
+import re
+
+from django.core.exceptions import ValidationError
 from django.db import models
 from apps.comptes.models import Utilisateur
+from apps.core.validation import ValidationAvantEnregistrement, exiger_ordre_dates
 
 
 class TypeAnomalie(models.TextChoices):
@@ -63,7 +67,7 @@ class TypeExport(models.TextChoices):
     JOURNAL = "JOURNAL", "Journal comptable"
 
 
-class ExportComptable(models.Model):
+class ExportComptable(ValidationAvantEnregistrement, models.Model):
     """
     Export comptable vers Sage 100. Dans cette version, l'export est
     généré comme un fichier téléchargeable (CSV/Excel) — voir
@@ -85,13 +89,16 @@ class ExportComptable(models.Model):
     def __str__(self):
         return f"Export {self.get_type_export_display()} {self.periode_debut} - {self.periode_fin}"
 
+    def clean(self):
+        exiger_ordre_dates(self.periode_debut, self.periode_fin, "periode_fin", "le début de période", "La fin de période")
+
 
 class TypeCloture(models.TextChoices):
     MENSUELLE = "MENSUELLE", "Mensuelle"
     ANNUELLE = "ANNUELLE", "Annuelle"
 
 
-class Cloture(models.Model):
+class Cloture(ValidationAvantEnregistrement, models.Model):
     """
     Une clôture verrouille une période : plus aucune modification des
     documents de cette période n'est possible après clôture (règle
@@ -108,3 +115,11 @@ class Cloture(models.Model):
 
     def __str__(self):
         return f"Clôture {self.get_type_cloture_display()} {self.periode}"
+
+    def clean(self):
+        formats = {TypeCloture.MENSUELLE: (r"\d{4}-(0[1-9]|1[0-2])", "AAAA-MM"), TypeCloture.ANNUELLE: (r"\d{4}", "AAAA")}
+        motif, libelle = formats.get(self.type_cloture, (None, None))
+        if motif and not re.fullmatch(motif, self.periode or ""):
+            raise ValidationError({"periode": f"Pour une clôture {self.get_type_cloture_display().lower()}, la période doit être au format {libelle}."})
+        if Cloture.objects.filter(type_cloture=self.type_cloture, periode=self.periode).exclude(pk=self.pk).exists():
+            raise ValidationError({"periode": "Cette période est déjà clôturée."})

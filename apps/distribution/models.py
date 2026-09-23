@@ -11,7 +11,7 @@ Distribution confirme la livraison.
 from django.core.exceptions import ValidationError
 from django.db import models, transaction
 from apps.comptes.models import Utilisateur
-from apps.commercial.models import Commande, StatutCommande
+from apps.commercial.models import Commande, StatutCommande, TypeCommande, StatutFacture
 from apps.core.models import generer_numero
 from apps.core.validation import ValidationAvantEnregistrement, valeur_en_base, verifier_transition
 
@@ -243,6 +243,11 @@ class BonLivraison(ValidationAvantEnregistrement, models.Model):
             raise ValidationError(f"Le bon de livraison {self.numero} est déjà livré : il ne peut plus être modifié.")
         if ancien_statut is None and self.statut != StatutLivraison.EN_LIVRAISON:
             raise ValidationError({"statut": "Un bon de livraison est toujours créé « En livraison »."})
+        if self.statut == StatutLivraison.LIVREE and ancien_statut != StatutLivraison.LIVREE:
+            try:
+                self.verifier_paiement_avant_livraison()
+            except ValueError as erreur:
+                raise ValidationError({"statut": str(erreur)})
         if self.pk and valeur_en_base(self, "commande") != self.commande_id:
             raise ValidationError({"commande": "La commande d'un bon de livraison ne peut pas être changée."})
         if ancien_statut is None and self.commande_id:
@@ -252,6 +257,43 @@ class BonLivraison(ValidationAvantEnregistrement, models.Model):
                     f"La commande {self.commande.numero} n'est pas encore sortie du magasin : "
                     "le bon de livraison ne peut pas être généré."
                 )})
+
+    def verifier_paiement_avant_livraison(self):
+        """
+        Chaîne commerciale §10 : encaissement/facturation AVANT livraison.
+        - toute commande doit être facturée (facture non annulée) ;
+        - une vente au COMPTANT doit être intégralement payée ;
+        - un client sous CONTRAT est livré sur facture émise : il paie à
+          l'échéance (délai de paiement de sa fiche, suivi des impayés).
+        Lève ValueError avec le motif sinon.
+        """
+        commande = self.commande
+        facture = getattr(commande, "facture", None)
+        if facture is None or facture.statut == StatutFacture.ANNULEE:
+            raise ValueError(
+                f"La commande {commande.numero} n'a pas de facture active : "
+                "la livraison ne peut pas être confirmée avant la facturation."
+            )
+        if commande.type_commande == TypeCommande.COMPTANT and facture.statut != StatutFacture.PAYEE:
+            raise ValueError(
+                f"Vente au comptant : la facture {facture.numero} n'est pas soldée "
+                f"(reste à payer {facture.solde_restant} FCFA). Encaissez-la avant de confirmer la livraison."
+            )
+
+    @transaction.atomic
+    def confirmer_livraison(self, utilisateur):
+        """Le Responsable Distribution confirme la livraison (§12.3 point 13), après contrôle du paiement."""
+        from django.utils import timezone
+        if self.statut == StatutLivraison.LIVREE:
+            raise ValueError("Cette livraison est déjà confirmée.")
+        if self.statut == StatutLivraison.RETOURNEE:
+            raise ValueError("Ce bon de livraison a été retourné : la livraison ne peut pas être confirmée.")
+        self.verifier_paiement_avant_livraison()
+        self.statut = StatutLivraison.LIVREE
+        self.signature_client = True
+        self.confirme_par = utilisateur
+        self.date_livraison = timezone.now()
+        self.save()
 
     def verifier_suppression(self):
         if self.statut == StatutLivraison.LIVREE or self.reclamations.exists():

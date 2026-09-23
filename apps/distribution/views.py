@@ -267,17 +267,13 @@ class BonLivraisonViewSet(viewsets.ModelViewSet):
         """
         if request.user.profil != Profil.RESPONSABLE_DISTRIBUTION and not request.user.is_superuser:
             return Response({"erreur": "Seul le Responsable Distribution peut confirmer la livraison."}, status=403)
-        from django.utils import timezone
         bon = self.get_object()
-        if bon.statut == models.StatutLivraison.LIVREE:
-            return Response({"erreur": "Cette livraison est déjà confirmée."}, status=400)
-        if bon.statut == models.StatutLivraison.RETOURNEE:
-            return Response({"erreur": "Ce bon de livraison a été retourné : la livraison ne peut pas être confirmée."}, status=400)
-        bon.statut = "LIVREE"
-        bon.signature_client = True
-        bon.confirme_par = request.user
-        bon.date_livraison = timezone.now()
-        bon.save()
+        # Statut, facture active et paiement (vente au comptant) : voir
+        # BonLivraison.confirmer_livraison().
+        try:
+            bon.confirmer_livraison(request.user)
+        except ValueError as erreur:
+            return Response({"erreur": str(erreur)}, status=400)
         return Response(self.get_serializer(bon).data)
 
 

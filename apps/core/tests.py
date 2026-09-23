@@ -342,3 +342,50 @@ class ParametrageTests(BaseValidation):
     def test_nom_de_depot_en_double_refuse(self):
         self.assert_refus(self.api.post("/api/stocks/depots/", {"nom": "dépôt produits finis"}, format="json"))
         self.assertEqual(self.api.post("/api/stocks/depots/", {"nom": "Dépôt Pointe-Noire"}, format="json").status_code, 201)
+
+
+class LivraisonEtClientBloqueTests(BaseValidation):
+    def test_commande_client_bloque_refusee_par_api(self):
+        self.client_evam.bloque = True
+        self.client_evam.save()
+        r = self.assert_refus(self.api.post("/api/commercial/commandes/", {
+            "client": self.client_evam.id, "type_commande": "COMPTANT",
+        }, format="json"))
+        self.assertIn("bloqué", str(r.data))
+        self.assertEqual(Commande.objects.count(), 0)
+
+    def _bon_livraison(self, type_commande="COMPTANT"):
+        from apps.distribution.models import BonLivraison
+        self.entree_stock(self.produit, 100, depot="Dépôt produits finis")
+        commande = self.commande(statut="VALIDEE")
+        Commande.objects.filter(pk=commande.pk).update(type_commande=type_commande)
+        commande.refresh_from_db()
+        preparation = PreparationLivraison.objects.create(commande=commande, lancee_par=self.admin)
+        self.api.post(f"/api/distribution/preparations/{preparation.id}/confirmer_preparation/")
+        self.api.post(f"/api/distribution/preparations/{preparation.id}/confirmer_sortie/")
+        return commande, BonLivraison.objects.create(commande=commande)
+
+    def test_livraison_comptant_refusee_avant_paiement(self):
+        commande, bon = self._bon_livraison()
+        url = f"/api/distribution/bons-livraison/{bon.id}/confirmer_livraison/"
+        self.assertIn("facture", str(self.assert_refus(self.api.post(url)).data))
+        facture = Facture.objects.create(commande=commande)
+        facture.generer_lignes_depuis_commande()
+        self.assertIn("soldée", str(self.assert_refus(self.api.post(url)).data))
+        bon.refresh_from_db()
+        self.assertEqual(bon.statut, "EN_LIVRAISON")
+
+        session = SessionCaisse.objects.create(
+            caisse=Caisse.objects.create(nom="Caisse test"), caissier=self.admin, solde_ouverture=0,
+        )
+        Encaissement.objects.create(session_caisse=session, facture=facture, montant=facture.montant_total, mode_paiement="ESPECES")
+        self.assertEqual(self.api.post(url).status_code, 200)
+        bon.refresh_from_db()
+        self.assertEqual(bon.statut, "LIVREE")
+
+    def test_livraison_contrat_sur_facture_emise(self):
+        commande, bon = self._bon_livraison(type_commande="CONTRAT")
+        url = f"/api/distribution/bons-livraison/{bon.id}/confirmer_livraison/"
+        self.assert_refus(self.api.post(url))
+        Facture.objects.create(commande=commande).generer_lignes_depuis_commande()
+        self.assertEqual(self.api.post(url).status_code, 200)

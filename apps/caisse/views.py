@@ -11,7 +11,7 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from apps.core.validation import METHODES_CREATION_LECTURE
 from . import models, serializers
-from apps.comptes.permissions import role_required
+from apps.comptes.permissions import role_required , lecture_seule_pour
 from apps.comptes.models import Profil
 
 

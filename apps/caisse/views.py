@@ -15,11 +15,15 @@ from apps.comptes.permissions import role_required
 from apps.comptes.models import Profil
 
 
+# class CaisseViewSet(viewsets.ModelViewSet):
+#     queryset = models.Caisse.objects.all()
+#     serializer_class = serializers.CaisseSerializer
+#     permission_classes = [role_required(Profil.ADMIN_SI)]
+
 class CaisseViewSet(viewsets.ModelViewSet):
     queryset = models.Caisse.objects.all()
     serializer_class = serializers.CaisseSerializer
-    permission_classes = [role_required(Profil.ADMIN_SI)]
-
+    permission_classes = [lecture_seule_pour(Profil.ADMIN_SI)]
 
 class SessionCaisseViewSet(viewsets.ModelViewSet):
     queryset = models.SessionCaisse.objects.all()

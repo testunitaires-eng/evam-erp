@@ -634,7 +634,12 @@ class SolutionClient(ValidationAvantEnregistrement, models.Model):
         par la personne qui décide la solution. Sans session adaptée, la
         référence reste à renseigner manuellement (comme auparavant).
         """
-        from apps.caisse.models import SessionCaisse, Decaissement
+        from apps.caisse.models import SessionCaisse, Decaissement, PROFILS_AUTORISANT_DECAISSEMENT
+        if self.autorise_par.profil not in PROFILS_AUTORISANT_DECAISSEMENT:
+            # Seules la Direction et la Comptabilité/DAF autorisent une sortie
+            # d'argent : le remboursement sera décaissé par la caisse avec
+            # leur autorisation (référence à reporter ensuite).
+            return
         session_ouverte = next(
             (
                 session for session in SessionCaisse.objects.filter(statut="OUVERTE").order_by("date_ouverture")

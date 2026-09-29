@@ -13,7 +13,7 @@ from rest_framework.response import Response
 from apps.core.validation import METHODES_CREATION_LECTURE
 from . import models, serializers
 from apps.comptes.permissions import role_required , lecture_seule_pour
-from apps.comptes.models import Profil
+from apps.comptes.models import Profil, Utilisateur
 
 
 # class CaisseViewSet(viewsets.ModelViewSet):
@@ -189,3 +189,15 @@ class DecaissementViewSet(FiltreCaissierMixin, viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         serializer.save(effectue_par=self.request.user)
+
+    @action(detail=False, methods=["get"])
+    def autorisateurs(self, request):
+        """
+        GET /api/caisse/decaissements/autorisateurs/
+        Liste de choix du champ « Autorisé par » : comptes actifs de la
+        Direction et de la Comptabilité/DAF (id, nom d'utilisateur, nom, profil).
+        """
+        personnes = Utilisateur.objects.filter(
+            profil__in=models.PROFILS_AUTORISANT_DECAISSEMENT, is_active=True,
+        ).order_by("profil", "username")
+        return Response(serializers.AutorisateurSerializer(personnes, many=True).data)

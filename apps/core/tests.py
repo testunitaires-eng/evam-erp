@@ -16,7 +16,9 @@ from django.test import TestCase
 from rest_framework.test import APIClient
 
 from apps.comptes.models import Utilisateur, Profil
-from apps.referentiel.models import Article, FicheTechnique, CompositionFicheTechnique
+from apps.referentiel.models import (
+    Article, FicheTechnique, CompositionFicheTechnique, FamilleArticle, FormatArticle, Parfum, UniteVenteArticle,
+)
 from apps.fiscalite.models import CodeFiscal, FamilleFiscale
 from apps.stocks.models import MouvementStock, StockArticle, depot_par_defaut
 from apps.commercial.models import Client, Commande, LigneCommande, Facture, LigneFacture, Avoir
@@ -36,9 +38,7 @@ class BaseValidation(TestCase):
         self.api.force_authenticate(self.admin)
         famille = FamilleFiscale.objects.create(nom="Test")
         self.code_fiscal = CodeFiscal.objects.create(code="FISC", famille_fiscale=famille, taux_tva=18)
-        self.produit = Article.objects.create(
-            code="PF1", type_article="PRODUIT_FINI", unite_mesure="UNITE", code_fiscal=self.code_fiscal,
-        )
+        self.produit = self.nouveau_pf(code_fiscal=self.code_fiscal)   # EAU70P8
         self.matiere = Article.objects.create(code="MP1", type_article="MATIERE_PREMIERE", unite_mesure="KG")
         # Fiche de composition validée du produit : 2 kg de MP1 par unité.
         fiche = FicheTechnique.objects.create(article=self.produit, version=1, cree_par=self.admin)
@@ -66,6 +66,17 @@ class BaseValidation(TestCase):
             commande.statut = "EN_PREPARATION"
             commande.save()
         return commande
+
+    def nouveau_pf(self, famille="Eau", format="70 cl", unite="Pack de 8", parfum=None, **autres):
+        """Produit fini complet (famille, format, unité de vente, parfum éventuel), code calculé automatiquement."""
+        return Article.objects.create(
+            type_article="PRODUIT_FINI", unite_mesure="UNITE",
+            famille=FamilleArticle.objects.get_or_create(nom=famille)[0],
+            format=FormatArticle.objects.get_or_create(valeur=format)[0],
+            unite_vente=UniteVenteArticle.objects.get_or_create(nom=unite)[0],
+            parfum=Parfum.objects.get_or_create(nom=parfum)[0] if parfum else None,
+            **autres,
+        )
 
     def ouvrir_caisse(self, nom="Caisse 1"):
         """Crée un caissier, sa caisse, et ouvre sa session. Retourne (session, client API du caissier)."""
@@ -138,14 +149,14 @@ class CommercialTests(BaseValidation):
         self.assertEqual(Facture.objects.count(), 0)
 
     def test_generer_lignes_tout_ou_rien(self):
-        sans_fiscal = Article.objects.create(code="PF2", type_article="PRODUIT_FINI", unite_mesure="UNITE")
+        sans_fiscal = self.nouveau_pf(format="100 cl")
         commande = self.commande()
         LigneCommande.objects.create(commande=commande, article=sans_fiscal, quantite=1, prix_unitaire=10)
         commande.statut = "VALIDEE"
         commande.save()
         facture = Facture.objects.create(commande=commande)
         r = self.assert_refus(self.api.post(f"/api/commercial/factures/{facture.id}/generer_lignes/"))
-        self.assertIn("PF2", str(r.data))
+        self.assertIn(sans_fiscal.code, str(r.data))
         self.assertEqual(LigneFacture.objects.count(), 0)
 
     def test_generer_lignes_deux_fois_refuse(self):
@@ -403,7 +414,10 @@ class LivraisonEtClientBloqueTests(BaseValidation):
 class CompositionEtDemandeMatieresTests(BaseValidation):
     def test_produit_fini_recoit_sa_fiche_brouillon(self):
         r = self.api.post("/api/referentiel/articles/", {
-            "code": "PF9", "type_article": "PRODUIT_FINI", "unite_mesure": "UNITE",
+            "type_article": "PRODUIT_FINI", "unite_mesure": "UNITE",
+            "famille": FamilleArticle.objects.get(nom="Eau").id,
+            "format": FormatArticle.objects.create(valeur="150 cl").id,
+            "unite_vente": UniteVenteArticle.objects.get(nom="Pack de 8").id,
         }, format="json")
         self.assertEqual(r.status_code, 201, r.content)
         fiche = FicheTechnique.objects.get(article_id=r.data["id"])
@@ -431,13 +445,13 @@ class CompositionEtDemandeMatieresTests(BaseValidation):
 
     def test_produit_fini_refuse_dans_une_composition(self):
         fiche = FicheTechnique.objects.create(article=self.produit, version=2, cree_par=self.admin)
-        autre_pf = Article.objects.create(code="PF3", type_article="PRODUIT_FINI", unite_mesure="UNITE")
+        autre_pf = self.nouveau_pf(format="150 cl")
         self.assert_refus(self.api.post("/api/referentiel/compositions/", {
             "fiche_technique": fiche.id, "matiere": autre_pf.id, "quantite_necessaire": "1",
         }, format="json"))
 
     def test_of_refuse_sans_fiche_validee(self):
-        sans_fiche = Article.objects.create(code="PF4", type_article="PRODUIT_FINI", unite_mesure="UNITE")
+        sans_fiche = self.nouveau_pf(unite="Carton de 12")
         r = self.assert_refus(self.api.post("/api/production/ordres-fabrication/", {
             "article": sans_fiche.id, "quantite_a_produire": "10",
         }, format="json"))
@@ -483,7 +497,7 @@ class CodificationAutomatiqueTests(BaseValidation):
         self.assertRegex(r.data["code"], r"^FRS-\d{6}$")
 
     def test_code_article_selon_le_type(self):
-        for type_article, prefixe in (("MATIERE_PREMIERE", "MP"), ("PRODUIT_INTERMEDIAIRE", "PI"), ("PRODUIT_FINI", "PF")):
+        for type_article, prefixe in (("MATIERE_PREMIERE", "MP"), ("PRODUIT_INTERMEDIAIRE", "PI")):
             r = self.api.post("/api/referentiel/articles/", {"type_article": type_article, "unite_mesure": "UNITE"}, format="json")
             self.assertEqual(r.status_code, 201, r.content)
             self.assertRegex(r.data["code"], rf"^{prefixe}-\d{{6}}$")
@@ -497,8 +511,8 @@ class CodificationAutomatiqueTests(BaseValidation):
         jus = FamilleFiscale.objects.create(nom="Jus EVAM sucré/aromatisé")
         eau = FamilleFiscale.objects.create(nom="Eau minérale produite au Congo")
         cas = [
-            ({"famille_fiscale": jus.id, "taux_tva": "18", "taux_accise": "10"}, "EV-FISC-JUS-10"),
-            ({"famille_fiscale": eau.id, "exonere": True}, "EV-FISC-EAU-EXO"),
+            ({"famille_fiscale": jus.id, "taux_tva": "18", "taux_accise": "10"}, "EV-FISC-JUS-18"),
+            ({"famille_fiscale": eau.id, "exonere": True}, "EV-FISC-EAU-0"),
             ({"famille_fiscale": eau.id, "taux_tva": "18"}, "EV-FISC-EAU-18"),
             ({"famille_fiscale": eau.id, "taux_tva": "18"}, "EV-FISC-EAU-18-2"),
         ]
@@ -511,7 +525,7 @@ class CodificationAutomatiqueTests(BaseValidation):
 class ChoixCompositionTests(BaseValidation):
     def setUp(self):
         super().setUp()
-        self.pf = Article.objects.create(code="PF5", type_article="PRODUIT_FINI", unite_mesure="UNITE")
+        self.pf = self.nouveau_pf(famille="Jus", parfum="Orange")
         self.fiche = FicheTechnique.objects.create(article=self.pf, version=1, cree_par=self.admin)
         self.bouteille = Article.objects.create(code="PI5", type_article="PRODUIT_INTERMEDIAIRE", unite_mesure="UNITE")
         Article.objects.create(code="MP5", type_article="MATIERE_PREMIERE", unite_mesure="KG", actif=False)
@@ -637,3 +651,69 @@ class CaissePrincipaleTests(BaseValidation):
         self.assertEqual(api_a.get("/api/caisse/caisses/principale/").status_code, 403)
         self.assertEqual(api_a.get(f"/api/caisse/caisses/{session_b.caisse_id}/journal/").status_code, 403)
         self.assertEqual(len(api_a.get(f"/api/caisse/caisses/{session_a.caisse_id}/journal/").data["operations"]), 1)
+
+
+class CodificationProduitsFinisTests(BaseValidation):
+    def creer(self, **champs):
+        donnees = {"type_article": "PRODUIT_FINI", "unite_mesure": "UNITE"}
+        for champ, (modele, attribut) in {
+            "famille": (FamilleArticle, "nom"), "format": (FormatArticle, "valeur"),
+            "unite_vente": (UniteVenteArticle, "nom"), "parfum": (Parfum, "nom"),
+        }.items():
+            if champ in champs:
+                donnees[champ] = modele.objects.get_or_create(**{attribut: champs[champ]})[0].id
+        return self.api.post("/api/referentiel/articles/", donnees, format="json")
+
+    def test_formats_de_code(self):
+        cas = [
+            ({"famille": "Eau", "format": "100 cl", "unite_vente": "Carton de 12"}, "EAU100C12"),
+            ({"famille": "Jus", "parfum": "Grenadine", "format": "70 cl", "unite_vente": "Pack de 8"}, "JUSGRE70P8"),
+            ({"famille": "Yaourt", "parfum": "Fraise", "format": "125 g", "unite_vente": "Pot"}, "YAOFRA125POT"),
+            ({"famille": "Yaourt", "parfum": "Nature", "format": "125 g", "unite_vente": "Unité"}, "YAO125U"),
+        ]
+        for champs, attendu in cas:
+            r = self.creer(**champs)
+            self.assertEqual(r.status_code, 201, r.content)
+            self.assertEqual(r.data["code"], attendu)
+        self.assertEqual(self.produit.code, "EAU70P8")
+
+    def test_champs_obligatoires_et_parfum(self):
+        self.assertIn("unite_vente", self.assert_refus(self.creer(famille="Eau", format="70 cl")).data)
+        self.assertIn("parfum", self.assert_refus(self.creer(famille="Jus", format="70 cl", unite_vente="Pack de 8")).data)
+
+    def test_produit_en_double_refuse(self):
+        r = self.assert_refus(self.creer(famille="Eau", format="70 cl", unite_vente="Pack de 8"))
+        self.assertIn("EAU70P8", str(r.data))
+
+    def test_code_recalcule_tant_que_non_utilise_puis_fige(self):
+        url = f"/api/referentiel/articles/{self.produit.id}/"
+        format_100 = FormatArticle.objects.create(valeur="100 cl")
+        r = self.api.patch(url, {"format": format_100.id}, format="json")
+        self.assertEqual((r.status_code, r.data["code"]), (200, "EAU100P8"))
+        self.entree_stock(self.produit, 5, depot="Dépôt produits finis")   # article désormais utilisé
+        format_150 = FormatArticle.objects.create(valeur="150 cl")
+        self.assert_refus(self.api.patch(url, {"format": format_150.id}, format="json"))
+        self.assertEqual(self.api.patch(url, {"stock_minimum": "3"}, format="json").data["code"], "EAU100P8")
+
+
+class AutorisationDecaissementTests(BaseValidation):
+    def test_autorise_par_direction_ou_daf_uniquement(self):
+        session, api = self.ouvrir_caisse()
+        commande = self.commande(statut="VALIDEE")
+        facture = Facture.objects.create(commande=commande)
+        facture.generer_lignes_depuis_commande()
+        Encaissement.objects.create(session_caisse=session, facture=facture, montant=500, mode_paiement="ESPECES")
+        daf = Utilisateur.objects.create_user("daf", password="x", profil=Profil.COMPTABILITE_DAF, first_name="Awa", last_name="Kodia")
+        Utilisateur.objects.create_user("dg", password="x", profil=Profil.DIRECTION)
+        Utilisateur.objects.create_user("dg_parti", password="x", profil=Profil.DIRECTION, is_active=False)
+        commercial = Utilisateur.objects.create_user("com", password="x", profil=Profil.COMMERCIAL)
+
+        liste = api.get("/api/caisse/decaissements/autorisateurs/").data
+        self.assertEqual({p["username"] for p in liste}, {"daf", "dg"})
+        self.assertIn("Awa Kodia", {p["nom"] for p in liste})
+
+        donnees = {"session_caisse": session.id, "montant": "100", "motif": "Achat fournitures"}
+        self.assert_refus(api.post("/api/caisse/decaissements/", {**donnees, "autorise_par": commercial.id}, format="json"))
+        r = api.post("/api/caisse/decaissements/", {**donnees, "autorise_par": daf.id}, format="json")
+        self.assertEqual(r.status_code, 201, r.content)
+        self.assertEqual(r.data["autorise_par_nom"], "Awa Kodia")

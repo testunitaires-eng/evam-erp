@@ -164,15 +164,15 @@ class CodeFiscal(ValidationAvantEnregistrement, models.Model):
     """
     Une ligne de la matrice fiscale maître EVAM (§2 du document
     Matrice fiscale). Exemples réels du document :
-        EV-FISC-EAU-EXO : eau minérale produite au Congo, exonérée
+        EV-FISC-EAU-0   : eau minérale produite au Congo, exonérée
         EV-FISC-EAU-18  : eau ne bénéficiant pas de l'exonération
-        EV-FISC-JUS-10  : jus sucré/aromatisé, TVA + centimes + accise
+        EV-FISC-JUS-18  : jus sucré/aromatisé, TVA + centimes + accise
         EV-FISC-YAO-18  : yaourt, TVA + centimes, pas d'accise
     """
     code = models.CharField(
         "Code fiscal", max_length=30, unique=True, editable=False,
-        help_text="Généré automatiquement : EV-FISC-{famille}-{EXO | taux d'accise | taux de TVA}, "
-                  "ex : EV-FISC-JUS-10. Jamais saisi.",
+        help_text="Généré automatiquement : EV-FISC-{produit}-{taux de TVA}, ex : EV-FISC-YAO-18, "
+                  "EV-FISC-EAU-0 (exonéré). Jamais saisi.",
     )
     famille_fiscale = models.ForeignKey(
         FamilleFiscale, verbose_name="Famille fiscale", on_delete=models.PROTECT,
@@ -221,28 +221,16 @@ class CodeFiscal(ValidationAvantEnregistrement, models.Model):
 
     def generer_code(self):
         """
-        Reproduit la codification de la matrice fiscale EVAM :
-            EV-FISC-EAU-EXO  (eau exonérée)
-            EV-FISC-EAU-18   (TVA 18 %)
-            EV-FISC-JUS-10   (accise 10 % : c'est l'accise qui distingue le code)
-            EV-FISC-YAO-18
-        Sigle = 3 premières lettres du premier mot de la famille fiscale
-        (sans accents). Le code est figé à la création : il ne change pas
-        si les taux évoluent ensuite. En cas de doublon : suffixe -2, -3...
+        Codification de la matrice fiscale EVAM : EV-FISC-{PRODUIT}-{TVA}
+            EV-FISC-YAO-18, EV-FISC-JUS-18, EV-FISC-EAU-0 (exonéré : TVA 0)
+        PRODUIT = 3 premières lettres de la famille fiscale (sans accents).
+        Voir apps/core/codification.py. Le code est figé à la création
+        (historique fiscal) ; en cas de doublon : suffixe -2, -3...
         """
-        import unicodedata
-        from decimal import Decimal
-        nom = unicodedata.normalize("NFKD", self.famille_fiscale.nom).encode("ascii", "ignore").decode()
-        mots = [mot for mot in nom.upper().replace("/", " ").split() if mot.isalpha()]
-        sigle = (mots[0] if mots else "GEN")[:3]
-        if self.exonere:
-            suffixe = "EXO"
-        else:
-            taux = self.taux_accise if self.taux_accise else self.taux_tva
-            suffixe = f"{Decimal(str(taux or 0)).normalize():f}".replace(".", "_")
-        base = f"EV-FISC-{sigle}-{suffixe}"
+        from apps.core.codification import code_fiscal_base
+        base = code_fiscal_base(self.famille_fiscale.nom, self.taux_tva, self.exonere)
         code, indice = base, 2
-        while CodeFiscal.objects.filter(code=code).exists():
+        while CodeFiscal.objects.filter(code=code).exclude(pk=self.pk).exists():
             code, indice = f"{base}-{indice}", indice + 1
         return code
 

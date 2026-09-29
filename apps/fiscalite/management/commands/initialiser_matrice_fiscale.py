@@ -5,7 +5,7 @@
 # À lancer UNE FOIS après la migration :
 #     python manage.py initialiser_matrice_fiscale
 
-# Le code EV-FISC-EAU-EXO est créé avec sa réserve documentée
+# Le code EV-FISC-EAU-0 est créé avec sa réserve documentée
 # ("qualification à confirmer") : à ADAPTER manuellement (ou via l'admin)
 # le jour où la qualification "eau minérale produite au Congo" est
 # officiellement validée ou refusée.
@@ -17,7 +17,7 @@
 
 # CODES_FISCAUX = [
 #     dict(
-#         code="EV-FISC-EAU-EXO",
+#         code="EV-FISC-EAU-0",
 #         famille_fiscale="Eau minérale produite au Congo",
 #         exonere=True, taux_tva=0, taux_centimes_additionnels=0, taux_accise=0,
 #         sfec_actif=True,
@@ -30,10 +30,10 @@
 #         famille_fiscale="Eau ne bénéficiant pas de l'exonération",
 #         exonere=False, taux_tva=18, taux_centimes_additionnels=5, taux_accise=0,
 #         sfec_actif=True,
-#         situation="Code de secours, à utiliser si EV-FISC-EAU-EXO n'est pas confirmé.",
+#         situation="Code de secours, à utiliser si EV-FISC-EAU-0 n'est pas confirmé.",
 #     ),
 #     dict(
-#         code="EV-FISC-JUS-10",
+#         code="EV-FISC-JUS-18",
 #         famille_fiscale="Jus EVAM sucré/aromatisé",
 #         exonere=False, taux_tva=18, taux_centimes_additionnels=5, taux_accise=10,
 #         sfec_actif=True,
@@ -76,7 +76,7 @@ document "Matrice_fiscale_par_produit_EVAM" (§2 et §9), ainsi que les
 À lancer UNE FOIS après la migration :
     python manage.py initialiser_matrice_fiscale
 
-Le code EV-FISC-EAU-EXO est créé avec sa réserve documentée
+Le code EV-FISC-EAU-0 est créé avec sa réserve documentée
 ("qualification à confirmer") : à ADAPTER manuellement (ou via l'admin)
 le jour où la qualification "eau minérale produite au Congo" est
 officiellement validée ou refusée.
@@ -88,7 +88,7 @@ from apps.fiscalite.models import CodeFiscal, FamilleFiscale
 
 CODES_FISCAUX = [
     dict(
-        code="EV-FISC-EAU-EXO",
+        code="EV-FISC-EAU-0",
         famille_fiscale="Eau minérale produite au Congo",
         exonere=True, taux_tva=0, taux_centimes_additionnels=0, taux_accise=0,
         sfec_actif=True,
@@ -101,10 +101,10 @@ CODES_FISCAUX = [
         famille_fiscale="Eau ne bénéficiant pas de l'exonération",
         exonere=False, taux_tva=18, taux_centimes_additionnels=5, taux_accise=0,
         sfec_actif=True,
-        situation="Code de secours, à utiliser si EV-FISC-EAU-EXO n'est pas confirmé.",
+        situation="Code de secours, à utiliser si EV-FISC-EAU-0 n'est pas confirmé.",
     ),
     dict(
-        code="EV-FISC-JUS-10",
+        code="EV-FISC-JUS-18",
         famille_fiscale="Jus EVAM sucré/aromatisé",
         exonere=False, taux_tva=18, taux_centimes_additionnels=5, taux_accise=10,
         sfec_actif=True,

@@ -19,6 +19,10 @@ from apps.core.validation import (
 )
 
 
+# Seules ces fonctions peuvent autoriser une sortie d'argent (décaissement).
+PROFILS_AUTORISANT_DECAISSEMENT = (Profil.DIRECTION, Profil.COMPTABILITE_DAF)
+
+
 def nom_utilisateur(utilisateur):
     """Nom lisible pour les journaux (nom complet, sinon identifiant)."""
     if utilisateur is None:
@@ -484,6 +488,8 @@ class Decaissement(ValidationAvantEnregistrement, models.Model):
     autorise_par = models.ForeignKey(
         Utilisateur, verbose_name="Autorisé par", on_delete=models.PROTECT,
         related_name="decaissements_autorises",
+        limit_choices_to={"profil__in": PROFILS_AUTORISANT_DECAISSEMENT, "is_active": True},
+        help_text="Direction ou Comptabilité/DAF uniquement.",
     )
     effectue_par = models.ForeignKey(
         Utilisateur, verbose_name="Effectué par (caissier)", on_delete=models.PROTECT,
@@ -505,9 +511,9 @@ class Decaissement(ValidationAvantEnregistrement, models.Model):
         - montant strictement positif, motif obligatoire ;
         - uniquement sur une session OUVERTE et dans la limite de
           l'argent présent en caisse (solde théorique) ;
-        - autorisé par une autre personne que celle qui décaisse, et
-          jamais par un caissier (le caissier seul ne peut pas sortir
-          d'argent sans validation, §9.1).
+        - autorisé uniquement par la Direction ou la Comptabilité/DAF, et
+          par une autre personne que celle qui décaisse (le caissier seul
+          ne peut pas sortir d'argent sans validation, §9.1).
         """
         if self.pk is not None:
             raise ValidationError("Un décaissement enregistré ne peut pas être modifié.")
@@ -528,8 +534,10 @@ class Decaissement(ValidationAvantEnregistrement, models.Model):
         if self.autorise_par_id:
             if not self.autorise_par.is_active:
                 raise ValidationError({"autorise_par": "Le compte de la personne qui autorise est désactivé."})
-            if self.autorise_par.profil == Profil.CAISSIER and not self.autorise_par.is_superuser:
-                raise ValidationError({"autorise_par": "Un caissier ne peut pas autoriser un décaissement."})
+            if self.autorise_par.profil not in PROFILS_AUTORISANT_DECAISSEMENT:
+                raise ValidationError({"autorise_par": (
+                    "Un décaissement ne peut être autorisé que par la Direction ou la Comptabilité/DAF."
+                )})
             if self.effectue_par_id and self.autorise_par_id == self.effectue_par_id:
                 raise ValidationError({"autorise_par": "Le décaissement doit être autorisé par une autre personne que celle qui l'effectue."})
 

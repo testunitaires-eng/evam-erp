@@ -328,6 +328,7 @@ from django.db import models, transaction
 from apps.comptes.models import Utilisateur
 from apps.fiscalite.models import CodeFiscal
 from apps.core.models import generer_code_unique
+from apps.core import codification
 from apps.core.validation import (
     ValidationAvantEnregistrement, exiger_positif, exiger_positif_optionnel,
     valeur_en_base, verifier_transition,
@@ -434,8 +435,9 @@ class Article(ValidationAvantEnregistrement, models.Model):
     # --- Bloc 1 : Identité du produit ---
     code = models.CharField(
         "Code article", max_length=30, unique=True, editable=False,
-        help_text="Généré automatiquement selon le type : MP-000001 (matière première), "
-                  "PI-000001 (produit intermédiaire), PF-000001 (produit fini). Jamais saisi.",
+        help_text="Généré automatiquement, jamais saisi. Produit fini : famille + parfum + "
+                  "format + unité de vente (ex : EAU70P8, JUSGRE70P8). Matière première / "
+                  "produit intermédiaire : MP-000001 / PI-000001.",
     )
     designation = models.CharField(
         "Désignation", max_length=200, blank=True,
@@ -528,16 +530,61 @@ class Article(ValidationAvantEnregistrement, models.Model):
     def __str__(self):
         return f"{self.code} - {self.designation}"
 
+    # Champs qui composent le code d'un produit fini : ils ne changent plus
+    # une fois l'article utilisé (commande, stock, OF, lot, facture...).
+    CHAMPS_CODE = ("type_article", "famille", "parfum", "format", "unite_vente")
+
+    def code_produit_fini_attendu(self):
+        return codification.code_produit_fini(
+            famille=self.famille.nom, format_valeur=self.format.valeur,
+            unite_vente=self.unite_vente.nom, parfum=self.parfum.nom if self.parfum_id else None,
+        )
+
+    def est_utilise(self):
+        """L'article figure-t-il déjà dans un document (le code est alors figé) ?"""
+        if self.pk is None:
+            return False
+        from apps.commercial.models import LigneCommande, LigneFacture
+        from apps.stocks.models import MouvementStock
+        from apps.production.models import OrdreFabrication, PlanProduction
+        from apps.qualite.models import Lot
+        return any(
+            modele.objects.filter(article_id=self.pk).exists()
+            for modele in (LigneCommande, LigneFacture, MouvementStock, OrdreFabrication, PlanProduction, Lot)
+        )
+
+    def champs_code_modifies(self):
+        """Champs de codification changés par rapport à la base (un champ vide qu'on complète ne compte pas)."""
+        if self.pk is None:
+            return []
+        modifies = []
+        for champ in self.CHAMPS_CODE:
+            attribut = champ if champ == "type_article" else f"{champ}_id"
+            ancien = valeur_en_base(self, champ)
+            if ancien is not None and ancien != getattr(self, attribut):
+                modifies.append(champ)
+        return modifies
+
     def save(self, *args, **kwargs):
         """
-        Génère automatiquement la désignation si elle n'est pas fournie,
-        à partir des listes déroulantes choisies : "Famille Parfum Format
-        - Unité de vente" (ex : "Jus Grenadine 70 cl - Pack de 8"). Évite
-        toute saisie libre du nom du produit, conformément au principe
+        Code automatique (voir apps/core/codification.py) :
+        - produit fini : recalculé depuis famille/parfum/format/unité tant
+          que l'article n'est utilisé dans aucun document, figé ensuite ;
+        - autres : numéro MP-/PI- attribué à la création.
+        Génère aussi la désignation si elle n'est pas fournie, à partir
+        des listes déroulantes choisies : "Famille Parfum Format - Unité
+        de vente" (ex : "Jus Grenadine 70 cl - Pack de 8"). Évite toute
+        saisie libre du nom du produit, conformément au principe
         "valeurs déjà connues, choisies dans des listes".
         """
-        if not self.code:
+        modifie = bool(self.champs_code_modifies())
+        if self.type_article == TypeArticle.PRODUIT_FINI:
+            if not self.code or not self.est_utilise():
+                self.code = self.code_produit_fini_attendu()
+        elif not self.code or (modifie and not self.est_utilise()):
             self.code = generer_code_unique(Article, PREFIXES_CODE_ARTICLE.get(self.type_article, "ART"))
+        if modifie and not self.est_utilise():
+            self.designation = ""
         if not self.designation:
             morceaux = []
             if self.famille_id:
@@ -553,6 +600,37 @@ class Article(ValidationAvantEnregistrement, models.Model):
         super().save(*args, **kwargs)
 
     def clean(self):
+        """
+        Produit fini : famille, format et unité de vente obligatoires (ils
+        forment le code) ; parfum obligatoire sauf pour l'eau. Deux produits
+        finis identiques ne peuvent pas coexister. Une fois l'article
+        utilisé, les champs qui forment le code ne changent plus.
+        """
+        if self.type_article == TypeArticle.PRODUIT_FINI:
+            manquants = {
+                champ: "Obligatoire pour un produit fini (sert à former son code)."
+                for champ in ("famille", "format", "unite_vente")
+                if getattr(self, f"{champ}_id") is None
+            }
+            if manquants:
+                raise ValidationError(manquants)
+            if self.parfum_id is None and codification.sigle(self.famille.nom) != "EAU":
+                raise ValidationError({"parfum": f"Le parfum est obligatoire pour un produit de la famille « {self.famille.nom} »."})
+            try:
+                code = self.code_produit_fini_attendu()
+            except ValueError as erreur:
+                raise ValidationError({"format": str(erreur)})
+            doublon = Article.objects.filter(code=code).exclude(pk=self.pk).first()
+            if doublon and (self.pk is None or not self.est_utilise()):
+                raise ValidationError({"famille": (
+                    f"Ce produit existe déjà : {doublon.code} - {doublon.designation}."
+                )})
+        modifies = self.champs_code_modifies()
+        if modifies and self.est_utilise():
+            raise ValidationError({modifies[0]: (
+                f"L'article {self.code} est déjà utilisé (commande, stock, OF...) : "
+                "son type, sa famille, son parfum, son format et son unité de vente ne peuvent plus changer."
+            )})
         if self.pk and self.type_article == TypeArticle.MATIERE_PREMIERE \
                 and valeur_en_base(self, "type_article") != TypeArticle.MATIERE_PREMIERE \
                 and self.fiches_techniques.exists():

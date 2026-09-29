@@ -8,7 +8,7 @@ verbose_name dans models.py, donc déjà en français.
 """
 
 from rest_framework import serializers
-from apps.comptes.models import Profil
+from apps.comptes.models import Profil, Utilisateur
 from apps.core.serializers import ValidationModeleMixin
 from . import models
 
@@ -95,7 +95,39 @@ class EcartCaisseSerializer(ValidationModeleMixin, serializers.ModelSerializer):
 
 
 
+class AutorisateurSerializer(serializers.ModelSerializer):
+    """Personne pouvant autoriser un décaissement (liste de choix)."""
+    nom = serializers.SerializerMethodField()
+    profil_libelle = serializers.CharField(source="get_profil_display", read_only=True)
+
+    class Meta:
+        model = Utilisateur
+        fields = ["id", "username", "nom", "profil", "profil_libelle"]
+
+    def get_nom(self, utilisateur):
+        return models.nom_utilisateur(utilisateur)
+
+
 class DecaissementSerializer(ValidationModeleMixin, serializers.ModelSerializer):
+    # Liste de choix limitée à la Direction et à la Comptabilité/DAF (comptes actifs).
+    autorise_par = serializers.PrimaryKeyRelatedField(
+        queryset=Utilisateur.objects.filter(
+            profil__in=models.PROFILS_AUTORISANT_DECAISSEMENT, is_active=True,
+        ),
+        error_messages={"does_not_exist": (
+            "Choisissez une personne de la Direction ou de la Comptabilité/DAF "
+            "(liste : /api/caisse/decaissements/autorisateurs/)."
+        )},
+    )
+    autorise_par_nom = serializers.SerializerMethodField()
+    effectue_par_nom = serializers.SerializerMethodField()
+
+    def get_autorise_par_nom(self, decaissement):
+        return models.nom_utilisateur(decaissement.autorise_par)
+
+    def get_effectue_par_nom(self, decaissement):
+        return models.nom_utilisateur(decaissement.effectue_par)
+
     class Meta:
         model = models.Decaissement
         fields = "__all__"

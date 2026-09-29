@@ -100,7 +100,10 @@ class DemandeMatiereSerializer(ValidationModeleMixin, serializers.ModelSerialize
         model = models.DemandeMatiere
         fields = "__all__"
         extra_kwargs = {"demandeur": {"required": False}}
-        read_only_fields = ["demandeur", "quantite_livree"]
+        # Les demandes sont générées depuis la composition de l'OF
+        # (/ordres-fabrication/{id}/demander_matieres/) : OF, matière et
+        # quantité ne se saisissent pas.
+        read_only_fields = ["demandeur", "quantite_livree", "ordre_fabrication", "matiere", "quantite_demandee"]
 
     def validate_statut(self, valeur):
         actuel = self.instance.statut if self.instance is not None else models.StatutDemandeMatiere.A_PREPARER

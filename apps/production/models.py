@@ -1296,6 +1296,13 @@ class OrdreFabrication(ValidationAvantEnregistrement, models.Model):
                 raise ValidationError({"article": f"L'article {self.article.code} est inactif."})
             if self.article.type_article == "MATIERE_PREMIERE":
                 raise ValidationError({"article": "On ne fabrique pas une matière première : choisissez un produit fini ou intermédiaire."})
+            if self._state.adding:
+                fiche = self.article.fiche_technique_validee
+                if fiche is None or not fiche.composition.exists():
+                    raise ValidationError({"article": (
+                        f"Aucune fiche de composition validée pour {self.article.code} : "
+                        "l'ADMIN_SI doit paramétrer et valider sa composition avant de lancer un OF."
+                    )})
 
         ancien_statut = valeur_en_base(self, "statut")
         if ancien_statut in (StatutOF.CLOTURE, StatutOF.ANNULE):
@@ -1373,10 +1380,9 @@ class OrdreFabrication(ValidationAvantEnregistrement, models.Model):
         la quantité à produire par la composition de la fiche
         technique validée la plus récente de l'article (§5.5).
 
-        Si aucune fiche technique validée n'existe, ne bloque PAS la
-        création de l'OF (un OF peut exister brièvement le temps de
-        régulariser la fiche technique) mais ne crée aucun besoin :
-        le tableau de bord (voir vues) le signalera comme anomalie.
+        Un OF ne peut être créé que si l'article a une fiche validée
+        avec composition (voir clean) : les besoins sont donc toujours
+        calculés.
         """
         fiche = (
             self.article.fiches_techniques
@@ -1394,6 +1400,36 @@ class OrdreFabrication(ValidationAvantEnregistrement, models.Model):
                     "quantite_theorique": ligne.quantite_necessaire * self.quantite_a_produire
                 },
             )
+
+    @transaction.atomic
+    def demander_matieres(self, demandeur):
+        """
+        Le Responsable Production demande au magasin TOUTE la composition
+        de l'OF en une seule fois : une DemandeMatiere par matière de la
+        fiche, pour la quantité théorique (composition x quantité à
+        produire). Un besoin supplémentaire en cours de production passe
+        ensuite par une DemandeComplementaire (§5.7).
+        """
+        from decimal import Decimal, ROUND_UP
+        if self.est_verrouille:
+            raise ValueError(f"L'OF {self.numero} est {self.get_statut_display().lower()} : aucune demande possible.")
+        if self.demandes_matieres.exclude(statut=StatutDemandeMatiere.ANNULEE).exists():
+            raise ValueError(
+                f"Les matières de l'OF {self.numero} ont déjà été demandées au magasin. "
+                "Pour un besoin supplémentaire, faites une demande complémentaire."
+            )
+        besoins = list(self.besoins_matieres.select_related("matiere"))
+        if not besoins:
+            raise ValueError(f"L'OF {self.numero} n'a aucun besoin matière (fiche de composition vide ?).")
+        return [
+            DemandeMatiere.objects.create(
+                ordre_fabrication=self, matiere=besoin.matiere, demandeur=demandeur,
+                # quantite_theorique a 4 décimales, la demande 3 : on arrondit
+                # au-dessus pour ne jamais demander moins que nécessaire.
+                quantite_demandee=besoin.quantite_theorique.quantize(Decimal("0.001"), rounding=ROUND_UP),
+            )
+            for besoin in besoins
+        ]
 
     def calculer_consommation_reelle(self):
         """
@@ -1545,6 +1581,13 @@ class DemandeMatiere(ValidationAvantEnregistrement, models.Model):
         exiger_positif(self.quantite_demandee, "quantite_demandee", "La quantité demandée")
         if self.ordre_fabrication_id and self.ordre_fabrication.est_verrouille:
             raise ValidationError({"ordre_fabrication": "Cet OF est clôturé ou annulé : aucune demande de matière possible."})
+        if self.ordre_fabrication_id and self.matiere_id and not self.ordre_fabrication.besoins_matieres.filter(
+            matiere_id=self.matiere_id,
+        ).exists():
+            raise ValidationError({"matiere": (
+                f"{self.matiere.code} ne fait pas partie de la composition de l'OF "
+                f"{self.ordre_fabrication.numero} : utilisez une demande complémentaire."
+            )})
         ancien_statut = valeur_en_base(self, "statut")
         if ancien_statut in (StatutDemandeMatiere.LIVREE_A_LA_PRODUCTION, StatutDemandeMatiere.ANNULEE):
             raise ValidationError(

@@ -46,3 +46,16 @@ def generer_numero(prefixe: str, largeur: int = 6) -> str:
         sequence.dernier_numero += 1
         sequence.save()
         return f"{prefixe}-{str(sequence.dernier_numero).zfill(largeur)}"
+
+
+def generer_code_unique(modele, prefixe, champ="code", largeur=6):
+    """
+    Codification automatique des fiches de référence (articles, clients,
+    fournisseurs...) : aucun code n'est saisi par l'utilisateur.
+    Comme generer_numero, mais saute les codes déjà pris (ex : un code
+    saisi à la main avant l'automatisation, qui aurait le même format).
+    """
+    while True:
+        code = generer_numero(prefixe, largeur)
+        if not modele._default_manager.filter(**{champ: code}).exists():
+            return code

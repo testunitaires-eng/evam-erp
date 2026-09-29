@@ -440,7 +440,7 @@ from django.core.exceptions import ValidationError
 from django.db import models, transaction
 from apps.comptes.models import Utilisateur
 from apps.referentiel.models import Article
-from apps.core.models import generer_numero
+from apps.core.models import generer_numero, generer_code_unique
 from apps.core.validation import (
     ValidationAvantEnregistrement, exiger_positif, exiger_ordre_dates,
     valeur_en_base, verifier_transition,
@@ -454,7 +454,10 @@ class TypeClient(models.TextChoices):
 
 
 class Client(ValidationAvantEnregistrement, models.Model):
-    code = models.CharField("Code client", max_length=30, unique=True)
+    code = models.CharField(
+        "Code client", max_length=30, unique=True, editable=False,
+        help_text="Généré automatiquement (CLI-000001...), jamais saisi.",
+    )
     nom = models.CharField("Nom / Raison sociale", max_length=200)
     type_client = models.CharField("Type de client", max_length=20, choices=TypeClient.choices)
     adresse = models.CharField("Adresse", max_length=255, blank=True)
@@ -475,6 +478,11 @@ class Client(ValidationAvantEnregistrement, models.Model):
 
     def __str__(self):
         return f"{self.code} - {self.nom}"
+
+    def save(self, *args, **kwargs):
+        if not self.code:
+            self.code = generer_code_unique(Client, "CLI")
+        super().save(*args, **kwargs)
 
     def clean(self):
         exiger_positif(self.encours_autorise, "encours_autorise", "L'encours autorisé", strict=False)

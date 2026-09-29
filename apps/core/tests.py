@@ -16,12 +16,12 @@ from django.test import TestCase
 from rest_framework.test import APIClient
 
 from apps.comptes.models import Utilisateur, Profil
-from apps.referentiel.models import Article
+from apps.referentiel.models import Article, FicheTechnique, CompositionFicheTechnique
 from apps.fiscalite.models import CodeFiscal, FamilleFiscale
 from apps.stocks.models import MouvementStock, StockArticle, depot_par_defaut
 from apps.commercial.models import Client, Commande, LigneCommande, Facture, LigneFacture, Avoir
 from apps.production.models import OrdreFabrication, SortieMatiere, DemandeMatiere
-from apps.caisse.models import Caisse, SessionCaisse, Encaissement
+from apps.caisse.models import Caisse, SessionCaisse, Encaissement, EcartCaisse as models_ecart
 from apps.achats.models import (
     Fournisseur, CommandeFournisseur, LigneCommandeFournisseur, ReceptionAchat, LigneReceptionAchat,
 )
@@ -40,6 +40,10 @@ class BaseValidation(TestCase):
             code="PF1", type_article="PRODUIT_FINI", unite_mesure="UNITE", code_fiscal=self.code_fiscal,
         )
         self.matiere = Article.objects.create(code="MP1", type_article="MATIERE_PREMIERE", unite_mesure="KG")
+        # Fiche de composition validée du produit : 2 kg de MP1 par unité.
+        fiche = FicheTechnique.objects.create(article=self.produit, version=1, cree_par=self.admin)
+        CompositionFicheTechnique.objects.create(fiche_technique=fiche, matiere=self.matiere, quantite_necessaire=2)
+        fiche.valider(self.admin)
         self.client_evam = Client.objects.create(
             code="C1", nom="Client test", type_client="SOCIETE", encours_autorise=100000,
         )
@@ -62,6 +66,15 @@ class BaseValidation(TestCase):
             commande.statut = "EN_PREPARATION"
             commande.save()
         return commande
+
+    def ouvrir_caisse(self, nom="Caisse 1"):
+        """Crée un caissier, sa caisse, et ouvre sa session. Retourne (session, client API du caissier)."""
+        caissier = Utilisateur.objects.create_user(f"caissier_{nom}", password="x", profil=Profil.CAISSIER)
+        caisse = Caisse.objects.create(nom=nom, caissier=caissier)
+        session = SessionCaisse.objects.create(caisse=caisse, caissier=caissier, solde_ouverture=0)
+        api = APIClient()
+        api.force_authenticate(caissier)
+        return session, api
 
     def assert_refus(self, reponse):
         self.assertIn(reponse.status_code, (400, 405, 409), reponse.content)
@@ -240,9 +253,7 @@ class QualiteTests(BaseValidation):
 class CaisseTests(BaseValidation):
     def setUp(self):
         super().setUp()
-        self.session = SessionCaisse.objects.create(
-            caisse=Caisse.objects.create(nom="Caisse 1"), caissier=self.admin, solde_ouverture=0,
-        )
+        self.session, self.api = self.ouvrir_caisse()
         commande = self.commande(statut="VALIDEE")
         self.facture = Facture.objects.create(commande=commande)
         self.facture.generer_lignes_depuis_commande()
@@ -375,9 +386,7 @@ class LivraisonEtClientBloqueTests(BaseValidation):
         bon.refresh_from_db()
         self.assertEqual(bon.statut, "EN_LIVRAISON")
 
-        session = SessionCaisse.objects.create(
-            caisse=Caisse.objects.create(nom="Caisse test"), caissier=self.admin, solde_ouverture=0,
-        )
+        session, _ = self.ouvrir_caisse("Caisse test")
         Encaissement.objects.create(session_caisse=session, facture=facture, montant=facture.montant_total, mode_paiement="ESPECES")
         self.assertEqual(self.api.post(url).status_code, 200)
         bon.refresh_from_db()
@@ -389,3 +398,242 @@ class LivraisonEtClientBloqueTests(BaseValidation):
         self.assert_refus(self.api.post(url))
         Facture.objects.create(commande=commande).generer_lignes_depuis_commande()
         self.assertEqual(self.api.post(url).status_code, 200)
+
+
+class CompositionEtDemandeMatieresTests(BaseValidation):
+    def test_produit_fini_recoit_sa_fiche_brouillon(self):
+        r = self.api.post("/api/referentiel/articles/", {
+            "code": "PF9", "type_article": "PRODUIT_FINI", "unite_mesure": "UNITE",
+        }, format="json")
+        self.assertEqual(r.status_code, 201, r.content)
+        fiche = FicheTechnique.objects.get(article_id=r.data["id"])
+        self.assertEqual((fiche.version, fiche.statut), (1, "BROUILLON"))
+        self.assertEqual(r.data["fiche_technique_brouillon"], fiche.id)
+
+    def test_matiere_premiere_sans_fiche(self):
+        r = self.api.post("/api/referentiel/articles/", {
+            "code": "MP9", "type_article": "MATIERE_PREMIERE", "unite_mesure": "KG",
+        }, format="json")
+        self.assertEqual(r.status_code, 201, r.content)
+        self.assertFalse(FicheTechnique.objects.filter(article_id=r.data["id"]).exists())
+
+    def test_composition_reservee_admin_si(self):
+        fiche = self.produit.creer_fiche_technique_brouillon(self.admin) or FicheTechnique.objects.create(
+            article=self.produit, version=2, cree_par=self.admin,
+        )
+        responsable = Utilisateur.objects.create_user("resp", password="x", profil=Profil.RESPONSABLE_PRODUCTION)
+        api = APIClient()
+        api.force_authenticate(responsable)
+        donnees = {"fiche_technique": fiche.id, "matiere": self.matiere.id, "quantite_necessaire": "1"}
+        self.assertEqual(api.post("/api/referentiel/compositions/", donnees, format="json").status_code, 403)
+        self.assertEqual(api.get("/api/referentiel/compositions/").status_code, 200)
+        self.assertEqual(self.api.post("/api/referentiel/compositions/", donnees, format="json").status_code, 201)
+
+    def test_produit_fini_refuse_dans_une_composition(self):
+        fiche = FicheTechnique.objects.create(article=self.produit, version=2, cree_par=self.admin)
+        autre_pf = Article.objects.create(code="PF3", type_article="PRODUIT_FINI", unite_mesure="UNITE")
+        self.assert_refus(self.api.post("/api/referentiel/compositions/", {
+            "fiche_technique": fiche.id, "matiere": autre_pf.id, "quantite_necessaire": "1",
+        }, format="json"))
+
+    def test_of_refuse_sans_fiche_validee(self):
+        sans_fiche = Article.objects.create(code="PF4", type_article="PRODUIT_FINI", unite_mesure="UNITE")
+        r = self.assert_refus(self.api.post("/api/production/ordres-fabrication/", {
+            "article": sans_fiche.id, "quantite_a_produire": "10",
+        }, format="json"))
+        self.assertIn("composition", str(r.data))
+        self.assertEqual(OrdreFabrication.objects.count(), 0)
+
+    def test_demande_de_toute_la_composition(self):
+        emballage = Article.objects.create(code="EMB1", type_article="MATIERE_PREMIERE", unite_mesure="UNITE")
+        fiche = FicheTechnique.objects.create(article=self.produit, version=2, cree_par=self.admin)
+        CompositionFicheTechnique.objects.create(fiche_technique=fiche, matiere=self.matiere, quantite_necessaire=Decimal("0.5"))
+        CompositionFicheTechnique.objects.create(fiche_technique=fiche, matiere=emballage, quantite_necessaire=1)
+        fiche.valider(self.admin)
+        of = OrdreFabrication.objects.create(article=self.produit, quantite_a_produire=100, responsable=self.admin)
+
+        url = f"/api/production/ordres-fabrication/{of.id}/demander_matieres/"
+        r = self.api.post(url)
+        self.assertEqual(r.status_code, 201, r.content)
+        demandes = {d.matiere.code: d.quantite_demandee for d in DemandeMatiere.objects.filter(ordre_fabrication=of)}
+        self.assertEqual(demandes, {"MP1": Decimal("50"), "EMB1": Decimal("100")})
+        self.assert_refus(self.api.post(url))
+        self.assertEqual(DemandeMatiere.objects.count(), 2)
+
+    def test_demande_matiere_manuelle_refusee(self):
+        of = OrdreFabrication.objects.create(article=self.produit, quantite_a_produire=1, responsable=self.admin)
+        self.assert_refus(self.api.post("/api/production/demandes-matieres/", {
+            "ordre_fabrication": of.id, "matiere": self.matiere.id, "quantite_demandee": "5",
+        }, format="json"))
+        self.assertEqual(DemandeMatiere.objects.count(), 0)
+
+
+class CodificationAutomatiqueTests(BaseValidation):
+    def test_codes_generes_et_code_saisi_ignore(self):
+        r = self.api.post("/api/commercial/clients/", {
+            "code": "MON-CODE", "nom": "Boutique", "type_client": "PARTICULIER",
+        }, format="json")
+        self.assertEqual(r.status_code, 201, r.content)
+        self.assertRegex(r.data["code"], r"^CLI-\d{6}$")
+        r2 = self.api.patch(f"/api/commercial/clients/{r.data['id']}/", {"code": "AUTRE"}, format="json")
+        self.assertEqual(r2.data["code"], r.data["code"])
+
+        r = self.api.post("/api/achats/fournisseurs/", {"nom": "Emballages SA"}, format="json")
+        self.assertEqual(r.status_code, 201, r.content)
+        self.assertRegex(r.data["code"], r"^FRS-\d{6}$")
+
+    def test_code_article_selon_le_type(self):
+        for type_article, prefixe in (("MATIERE_PREMIERE", "MP"), ("PRODUIT_INTERMEDIAIRE", "PI"), ("PRODUIT_FINI", "PF")):
+            r = self.api.post("/api/referentiel/articles/", {"type_article": type_article, "unite_mesure": "UNITE"}, format="json")
+            self.assertEqual(r.status_code, 201, r.content)
+            self.assertRegex(r.data["code"], rf"^{prefixe}-\d{{6}}$")
+
+    def test_code_article_saute_un_code_deja_pris(self):
+        Article.objects.create(code="MP-000001", type_article="MATIERE_PREMIERE", unite_mesure="KG")
+        r = self.api.post("/api/referentiel/articles/", {"type_article": "MATIERE_PREMIERE", "unite_mesure": "KG"}, format="json")
+        self.assertEqual(r.data["code"], "MP-000002")
+
+    def test_code_fiscal_selon_la_matrice(self):
+        jus = FamilleFiscale.objects.create(nom="Jus EVAM sucré/aromatisé")
+        eau = FamilleFiscale.objects.create(nom="Eau minérale produite au Congo")
+        cas = [
+            ({"famille_fiscale": jus.id, "taux_tva": "18", "taux_accise": "10"}, "EV-FISC-JUS-10"),
+            ({"famille_fiscale": eau.id, "exonere": True}, "EV-FISC-EAU-EXO"),
+            ({"famille_fiscale": eau.id, "taux_tva": "18"}, "EV-FISC-EAU-18"),
+            ({"famille_fiscale": eau.id, "taux_tva": "18"}, "EV-FISC-EAU-18-2"),
+        ]
+        for donnees, attendu in cas:
+            r = self.api.post("/api/fiscalite/codes-fiscaux/", donnees, format="json")
+            self.assertEqual(r.status_code, 201, r.content)
+            self.assertEqual(r.data["code"], attendu)
+
+
+class ChoixCompositionTests(BaseValidation):
+    def setUp(self):
+        super().setUp()
+        self.pf = Article.objects.create(code="PF5", type_article="PRODUIT_FINI", unite_mesure="UNITE")
+        self.fiche = FicheTechnique.objects.create(article=self.pf, version=1, cree_par=self.admin)
+        self.bouteille = Article.objects.create(code="PI5", type_article="PRODUIT_INTERMEDIAIRE", unite_mesure="UNITE")
+        Article.objects.create(code="MP5", type_article="MATIERE_PREMIERE", unite_mesure="KG", actif=False)
+        self.base = f"/api/referentiel/fiches-techniques/{self.fiche.id}/"
+
+    def test_elements_disponibles_lus_en_base(self):
+        codes = {e["code"] for e in self.api.get(self.base + "elements_disponibles/").data}
+        self.assertEqual(codes, {"MP1", "PI5"})  # ni produit fini, ni inactif
+        CompositionFicheTechnique.objects.create(fiche_technique=self.fiche, matiere=self.matiere, quantite_necessaire=1)
+        codes = {e["code"] for e in self.api.get(self.base + "elements_disponibles/").data}
+        self.assertEqual(codes, {"PI5"})  # déjà dans la composition : retiré de la liste
+
+    def test_ajout_groupe_et_infos_reprises_de_la_base(self):
+        r = self.api.post(self.base + "ajouter_elements/", {"elements": [
+            {"matiere": self.matiere.id, "quantite_necessaire": "0.5"},
+            {"matiere": self.bouteille.id, "quantite_necessaire": "1"},
+        ]}, format="json")
+        self.assertEqual(r.status_code, 201, r.content)
+        lignes = {l["matiere_code"]: (l["matiere_designation"], l["unite_mesure"]) for l in r.data["composition"]}
+        self.assertEqual(lignes["MP1"], (self.matiere.designation, "KG"))
+
+    def test_ajout_groupe_tout_ou_rien(self):
+        r = self.assert_refus(self.api.post(self.base + "ajouter_elements/", {"elements": [
+            {"matiere": self.matiere.id, "quantite_necessaire": "0.5"},
+            {"matiere": self.produit.id, "quantite_necessaire": "1"},
+            {"matiere": 99999, "quantite_necessaire": "1"},
+        ]}, format="json"))
+        self.assertIn("element_2", r.data)
+        self.assertIn("element_3", r.data)
+        self.assertEqual(self.fiche.composition.count(), 0)
+
+
+class CaissePrincipaleTests(BaseValidation):
+    def setUp(self):
+        super().setUp()
+        self.principale = Caisse.principale()
+        commande = self.commande(statut="VALIDEE")
+        self.facture = Facture.objects.create(commande=commande)
+        self.facture.generer_lignes_depuis_commande()   # 1 000 HT -> 1 180 TTC
+
+    def encaisser(self, api, session, montant):
+        return api.post("/api/caisse/encaissements/", {
+            "session_caisse": session.id, "facture": self.facture.id,
+            "montant": str(montant), "mode_paiement": "ESPECES",
+        }, format="json")
+
+    def test_caisse_principale_protegee(self):
+        self.assertIsNotNone(self.principale)
+        url = f"/api/caisse/caisses/{self.principale.id}/"
+        self.assert_refus(self.api.delete(url))
+        self.assert_refus(self.api.patch(url, {"actif": False}, format="json"))
+        caissier = Utilisateur.objects.create_user("c1", password="x", profil=Profil.CAISSIER)
+        self.assert_refus(self.api.patch(url, {"caissier": caissier.id}, format="json"))
+        api = APIClient()
+        api.force_authenticate(caissier)
+        self.assert_refus(api.post("/api/caisse/sessions/", {"caisse": self.principale.id}, format="json"))
+
+    def test_ouverture_sur_sa_propre_caisse_uniquement(self):
+        caissier = Utilisateur.objects.create_user("c1", password="x", profil=Profil.CAISSIER)
+        api = APIClient()
+        api.force_authenticate(caissier)
+        self.assertIn("Aucune caisse", str(self.assert_refus(api.post("/api/caisse/sessions/", {}, format="json")).data))
+
+        r = self.api.post("/api/caisse/caisses/", {"nom": "Caisse Nord", "caissier": caissier.id}, format="json")
+        self.assertEqual(r.status_code, 201, r.content)
+        autre_session, _ = self.ouvrir_caisse("Caisse Sud")
+        self.assert_refus(api.post("/api/caisse/sessions/", {"caisse": autre_session.caisse_id}, format="json"))
+
+        r = api.post("/api/caisse/sessions/", {}, format="json")
+        self.assertEqual(r.status_code, 201, r.content)
+        self.assertEqual((r.data["caisse"], r.data["solde_ouverture"]), (Caisse.objects.get(nom="Caisse Nord").id, "0.00"))
+
+    def test_encaissement_par_un_autre_caissier_refuse(self):
+        session, _ = self.ouvrir_caisse("Caisse A")
+        _, api_autre = self.ouvrir_caisse("Caisse B")
+        self.assert_refus(self.encaisser(api_autre, session, 100))
+        self.assertEqual(Encaissement.objects.count(), 0)
+
+    def test_ecart_justifie_a_la_cloture_et_report_du_solde(self):
+        session, api = self.ouvrir_caisse()
+        self.assertEqual(self.encaisser(api, session, 1000).status_code, 201)
+        url = f"/api/caisse/sessions/{session.id}/cloturer/"
+
+        r = self.assert_refus(api.post(url, {"solde_compte": "950"}, format="json"))
+        self.assertIn("justification est obligatoire", str(r.data))
+        session.refresh_from_db()
+        self.assertEqual(session.statut, "OUVERTE")
+        self.assert_refus(api.post("/api/caisse/ecarts/", {"session_caisse": session.id, "justification": "x"}, format="json"))
+
+        r = api.post(url, {"solde_compte": "950", "justification": "Erreur de rendu monnaie"}, format="json")
+        self.assertEqual(r.status_code, 200, r.content)
+        session.refresh_from_db()
+        self.assertEqual((session.statut, session.solde_theorique_cloture), ("CLOTUREE", Decimal("1000")))
+        self.assertEqual(session.justification_ecart.montant_ecart, Decimal("-50"))
+
+        # Lendemain : le solde d'ouverture reprend le COMPTÉ de la veille (950),
+        # l'écart justifié ne se reporte pas.
+        self.assertEqual(Caisse.principale().solde_actuel, Decimal("950"))
+        r = api.post("/api/caisse/sessions/", {}, format="json")
+        self.assertEqual(r.status_code, 201, r.content)
+        self.assertEqual(Decimal(r.data["solde_ouverture"]), Decimal("950"))
+        nouvelle = SessionCaisse.objects.get(pk=r.data["id"])
+        self.assertEqual(self.encaisser(api, nouvelle, 180).status_code, 201)
+        r = api.post(f"/api/caisse/sessions/{nouvelle.id}/cloturer/", {"solde_compte": "1130"}, format="json")
+        self.assertEqual(r.status_code, 200, r.content)   # 950 + 180 = 1130 : aucun écart
+        self.assertFalse(models_ecart.objects.filter(session_caisse=nouvelle).exists())
+
+    def test_montant_global_et_journal_sur_la_caisse_principale(self):
+        session_a, api_a = self.ouvrir_caisse("Caisse A")
+        session_b, api_b = self.ouvrir_caisse("Caisse B")
+        self.assertEqual(self.encaisser(api_a, session_a, 700).status_code, 201)
+        self.assertEqual(self.encaisser(api_b, session_b, 300).status_code, 201)
+
+        r = self.api.get("/api/caisse/caisses/principale/")
+        self.assertEqual(Decimal(r.data["montant_global"]), Decimal("1000"))
+        self.assertEqual({c["nom"]: Decimal(c["solde"]) for c in r.data["caisses"]},
+                         {"Caisse A": Decimal("700"), "Caisse B": Decimal("300")})
+
+        journal = self.api.get(f"/api/caisse/caisses/{self.principale.id}/journal/").data
+        self.assertEqual(len(journal["operations"]), 2)
+        self.assertEqual({(o["caisse"], o["caissier"]) for o in journal["operations"]},
+                         {("Caisse A", "caissier_Caisse A"), ("Caisse B", "caissier_Caisse B")})
+        self.assertEqual(api_a.get("/api/caisse/caisses/principale/").status_code, 403)
+        self.assertEqual(api_a.get(f"/api/caisse/caisses/{session_b.caisse_id}/journal/").status_code, 403)
+        self.assertEqual(len(api_a.get(f"/api/caisse/caisses/{session_a.caisse_id}/journal/").data["operations"]), 1)

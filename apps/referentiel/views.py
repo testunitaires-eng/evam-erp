@@ -29,6 +29,16 @@ class ArticleViewSet(viewsets.ModelViewSet):
     filterset_fields = ["type_article", "famille", "actif"]
     search_fields = ["code", "designation"]
 
+    def perform_create(self, serializer):
+        """Un produit fini reçoit automatiquement sa fiche de composition (brouillon)."""
+        article = serializer.save()
+        article.creer_fiche_technique_brouillon(self.request.user)
+
+    def perform_update(self, serializer):
+        """Idem si un article devient produit fini après coup."""
+        article = serializer.save()
+        article.creer_fiche_technique_brouillon(self.request.user)
+
 # class FicheTechniqueViewSet(viewsets.ModelViewSet):
 #     queryset = models.FicheTechnique.objects.all()
 #     serializer_class = serializers.FicheTechniqueSerializer
@@ -58,9 +68,14 @@ class ArticleViewSet(viewsets.ModelViewSet):
 
 
 class FicheTechniqueViewSet(viewsets.ModelViewSet):
+    """
+    Paramétrage des fiches de composition : réservé à l'ADMIN_SI
+    (création de version, validation, archivage). Lecture pour tous
+    (le Responsable Production et le Magasinier la consultent).
+    """
     queryset = models.FicheTechnique.objects.all()
     serializer_class = serializers.FicheTechniqueSerializer
-    permission_classes = [lecture_seule_pour(Profil.RESPONSABLE_PRODUCTION, Profil.ADMIN_SI)]
+    permission_classes = [lecture_seule_pour(Profil.ADMIN_SI)]
     filterset_fields = ["article", "statut"]
     def perform_create(self, serializer):
         serializer.save(cree_par=self.request.user)
@@ -78,11 +93,39 @@ class FicheTechniqueViewSet(viewsets.ModelViewSet):
             return Response({"erreur": str(erreur)}, status=400)
         return Response(self.get_serializer(fiche).data)
 
+    @action(detail=True, methods=["get"])
+    def elements_disponibles(self, request, pk=None):
+        """
+        GET /api/referentiel/fiches-techniques/{id}/elements_disponibles/
+        Liste de choix de la composition, lue en base : matières
+        premières et produits intermédiaires actifs, pas encore présents
+        dans la fiche. Filtre optionnel : ?type_article=MATIERE_PREMIERE
+        """
+        elements = self.get_object().elements_disponibles()
+        type_article = request.query_params.get("type_article")
+        if type_article:
+            elements = elements.filter(type_article=type_article)
+        return Response(serializers.ElementCompositionSerializer(elements, many=True).data)
+
+    @action(detail=True, methods=["post"])
+    def ajouter_elements(self, request, pk=None):
+        """
+        POST /api/referentiel/fiches-techniques/{id}/ajouter_elements/
+        Corps : {"elements": [{"matiere": <id>, "quantite_necessaire": "0.5"}, ...]}
+        Ajoute en une fois les éléments choisis dans la liste
+        elements_disponibles (tout ou rien). Réservé à l'ADMIN_SI.
+        """
+        fiche = self.get_object()
+        fiche.ajouter_elements(request.data.get("elements"))
+        fiche.refresh_from_db()
+        return Response(self.get_serializer(fiche).data, status=201)
+
 
 class CompositionFicheTechniqueViewSet(viewsets.ModelViewSet):
+    """Lignes de composition (matières et quantités par unité produite) : écriture ADMIN_SI uniquement."""
     queryset = models.CompositionFicheTechnique.objects.all()
     serializer_class = serializers.CompositionFicheTechniqueSerializer
-    permission_classes = [role_required(Profil.RESPONSABLE_PRODUCTION, Profil.ADMIN_SI)]
+    permission_classes = [lecture_seule_pour(Profil.ADMIN_SI)]
     filterset_fields = ["fiche_technique", "matiere"]
 
 

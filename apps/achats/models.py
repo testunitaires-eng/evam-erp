@@ -20,7 +20,7 @@ from django.db import models, transaction
 from django.db.models import Sum
 from apps.comptes.models import Utilisateur
 from apps.referentiel.models import Article
-from apps.core.models import generer_numero
+from apps.core.models import generer_numero, generer_code_unique
 from apps.core.validation import (
     ValidationAvantEnregistrement, exiger_positif, exiger_ordre_dates,
     valeur_en_base, verifier_transition,
@@ -29,7 +29,10 @@ from apps.core.validation import (
 
 class Fournisseur(models.Model):
     """Un fournisseur de matières premières, emballages ou services."""
-    code = models.CharField("Code fournisseur", max_length=30, unique=True)
+    code = models.CharField(
+        "Code fournisseur", max_length=30, unique=True, editable=False,
+        help_text="Généré automatiquement (FRS-000001...), jamais saisi.",
+    )
     nom = models.CharField("Nom", max_length=150)
     contact = models.CharField("Contact", max_length=150, blank=True)
     telephone = models.CharField("Téléphone", max_length=30, blank=True)
@@ -50,6 +53,11 @@ class Fournisseur(models.Model):
 
     def __str__(self):
         return f"{self.code} - {self.nom}"
+
+    def save(self, *args, **kwargs):
+        if not self.code:
+            self.code = generer_code_unique(Fournisseur, "FRS")
+        super().save(*args, **kwargs)
 
 
 class StatutContratFournisseur(models.TextChoices):

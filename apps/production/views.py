@@ -280,6 +280,22 @@ class OrdreFabricationViewSet(viewsets.ModelViewSet):
             return Response({"erreur": str(erreur)}, status=400)
         return Response(self.get_serializer(of).data)
 
+    @action(detail=True, methods=["post"])
+    def demander_matieres(self, request, pk=None):
+        """
+        POST /api/production/ordres-fabrication/{id}/demander_matieres/
+        Réservé au Responsable Production. Demande au magasin toute la
+        composition de l'OF (une demande par matière de la fiche).
+        """
+        if request.user.profil not in (Profil.RESPONSABLE_PRODUCTION, Profil.ADMIN_SI) and not request.user.is_superuser:
+            return Response({"erreur": "Seul le Responsable Production peut demander les matières d'un OF."}, status=403)
+        of = self.get_object()
+        try:
+            demandes = of.demander_matieres(demandeur=request.user)
+        except ValueError as erreur:
+            return Response({"erreur": str(erreur)}, status=400)
+        return Response(serializers.DemandeMatiereSerializer(demandes, many=True).data, status=201)
+
     @action(detail=True, methods=["get"])
     def consommation_reelle(self, request, pk=None):
         """
@@ -340,8 +356,16 @@ class DemandeMatiereViewSet(viewsets.ModelViewSet):
     filterset_fields = ["ordre_fabrication", "matiere", "statut"]
     search_fields = ["numero"]
 
-    def perform_create(self, serializer):
-        serializer.save(demandeur=self.request.user)
+    def create(self, request, *args, **kwargs):
+        """
+        Pas de saisie matière par matière : toute la composition de l'OF
+        est demandée d'un coup via l'action demander_matieres de l'OF.
+        """
+        return Response({"erreur": (
+            "Les matières d'un OF se demandent toutes ensemble, à partir de sa fiche de composition : "
+            "POST /api/production/ordres-fabrication/{id}/demander_matieres/. "
+            "Pour un besoin supplémentaire, utilisez une demande complémentaire."
+        )}, status=400)
 
     @action(detail=True, methods=["post"])
     def livrer(self, request, pk=None):

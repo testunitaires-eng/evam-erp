@@ -13,34 +13,67 @@ from apps.core.serializers import ValidationModeleMixin
 from . import models
 
 class CaisseSerializer(ValidationModeleMixin, serializers.ModelSerializer):
+    """
+    est_principale : caisse de consolidation (créée par le système).
+    solde_actuel : pour la principale, le total de toutes les caisses ;
+    sinon l'argent de cette caisse. session_ouverte : id ou null.
+    """
+    est_principale = serializers.BooleanField(read_only=True)
+    caissier_nom = serializers.CharField(source="caissier", read_only=True, default=None)
+    solde_actuel = serializers.DecimalField(max_digits=16, decimal_places=2, read_only=True)
+    session_ouverte = serializers.SerializerMethodField()
+
     class Meta:
         model = models.Caisse
         fields = "__all__"
 
+    def get_session_ouverte(self, caisse):
+        session = caisse.session_ouverte()
+        return session.pk if session else None
+
 
 class SessionCaisseSerializer(ValidationModeleMixin, serializers.ModelSerializer):
-    """Statut et soldes de clôture : uniquement via l'action /cloturer/."""
+    """
+    Ouverture : le caissier n'envoie rien d'obligatoire, sa caisse et le
+    solde d'ouverture sont déterminés automatiquement. Statut et soldes
+    de clôture : uniquement via l'action /cloturer/.
+    """
+    solde_theorique_actuel = serializers.DecimalField(max_digits=16, decimal_places=2, read_only=True)
+    ecart = serializers.DecimalField(max_digits=16, decimal_places=2, read_only=True)
+
     class Meta:
         model = models.SessionCaisse
         fields = "__all__"
-        extra_kwargs = {"caissier": {"required": False}}
+        extra_kwargs = {"caissier": {"required": False}, "caisse": {"required": False}}
         read_only_fields = [
-            "caissier", "statut", "solde_theorique_cloture", "solde_compte_cloture", "date_cloture",
+            "caissier", "statut", "solde_ouverture", "solde_theorique_cloture",
+            "solde_compte_cloture", "date_cloture",
         ]
+
+    def validate(self, attrs):
+        if self.instance is None:
+            utilisateur = self.context["request"].user
+            attrs["caissier"] = utilisateur
+            if not attrs.get("caisse"):
+                caisse = models.Caisse.objects.filter(caissier=utilisateur).first()
+                if caisse is None:
+                    raise serializers.ValidationError({"caisse": (
+                        "Aucune caisse ne vous est affectée : demandez à l'Administrateur SI de vous en attribuer une."
+                    )})
+                attrs["caisse"] = caisse
+        return super().validate(attrs)
 
 
 class EncaissementSerializer(ValidationModeleMixin, serializers.ModelSerializer):
     class Meta:
         model = models.Encaissement
         fields = "__all__"
+        read_only_fields = ["encaisse_par"]
 
-    def validate_session_caisse(self, session):
-        """Un caissier n'encaisse que sur SA propre session."""
-        utilisateur = self.context["request"].user
-        if utilisateur.profil == Profil.CAISSIER and not utilisateur.is_superuser \
-                and session.caissier_id != utilisateur.id:
-            raise serializers.ValidationError("Vous ne pouvez encaisser que sur votre propre session de caisse.")
-        return session
+    def validate(self, attrs):
+        """Traçabilité : l'encaissement est au nom de l'utilisateur connecté, qui doit être le caissier de la session."""
+        attrs["encaisse_par"] = self.context["request"].user
+        return super().validate(attrs)
 
 
 class EcartCaisseSerializer(ValidationModeleMixin, serializers.ModelSerializer):
@@ -70,8 +103,9 @@ class DecaissementSerializer(ValidationModeleMixin, serializers.ModelSerializer)
         read_only_fields = ["effectue_par"]
 
     def validate(self, attrs):
-        attrs = super().validate(attrs)
         utilisateur = self.context["request"].user
+        attrs["effectue_par"] = utilisateur
+        attrs = super().validate(attrs)
         if attrs.get("autorise_par") and attrs["autorise_par"].id == utilisateur.id:
             raise serializers.ValidationError({"autorise_par": (
                 "Le décaissement doit être autorisé par une autre personne que celle qui l'effectue."

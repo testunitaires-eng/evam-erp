@@ -327,6 +327,7 @@ from django.core.exceptions import ValidationError
 from django.db import models, transaction
 from apps.comptes.models import Utilisateur
 from apps.fiscalite.models import CodeFiscal
+from apps.core.models import generer_code_unique
 from apps.core.validation import (
     ValidationAvantEnregistrement, exiger_positif, exiger_positif_optionnel,
     valeur_en_base, verifier_transition,
@@ -410,6 +411,14 @@ class UniteVenteArticle(models.Model):
         return self.nom
 
 
+# Préfixe du code article automatique, selon le type.
+PREFIXES_CODE_ARTICLE = {
+    TypeArticle.MATIERE_PREMIERE: "MP",
+    TypeArticle.PRODUIT_INTERMEDIAIRE: "PI",
+    TypeArticle.PRODUIT_FINI: "PF",
+}
+
+
 class Article(ValidationAvantEnregistrement, models.Model):
     """
     Toute chose qui peut être achetée, stockée, produite ou vendue :
@@ -423,7 +432,11 @@ class Article(ValidationAvantEnregistrement, models.Model):
     §15 : "une information saisie ne doit pas être ressaisie ailleurs").
     """
     # --- Bloc 1 : Identité du produit ---
-    code = models.CharField("Code article", max_length=30, unique=True)
+    code = models.CharField(
+        "Code article", max_length=30, unique=True, editable=False,
+        help_text="Généré automatiquement selon le type : MP-000001 (matière première), "
+                  "PI-000001 (produit intermédiaire), PF-000001 (produit fini). Jamais saisi.",
+    )
     designation = models.CharField(
         "Désignation", max_length=200, blank=True,
         help_text="Laisser vide pour la générer automatiquement à partir de la famille, "
@@ -523,6 +536,8 @@ class Article(ValidationAvantEnregistrement, models.Model):
         toute saisie libre du nom du produit, conformément au principe
         "valeurs déjà connues, choisies dans des listes".
         """
+        if not self.code:
+            self.code = generer_code_unique(Article, PREFIXES_CODE_ARTICLE.get(self.type_article, "ART"))
         if not self.designation:
             morceaux = []
             if self.famille_id:
@@ -538,10 +553,37 @@ class Article(ValidationAvantEnregistrement, models.Model):
         super().save(*args, **kwargs)
 
     def clean(self):
+        if self.pk and self.type_article == TypeArticle.MATIERE_PREMIERE \
+                and valeur_en_base(self, "type_article") != TypeArticle.MATIERE_PREMIERE \
+                and self.fiches_techniques.exists():
+            raise ValidationError({"type_article": (
+                "Cet article a déjà une fiche de composition : il ne peut pas devenir une matière première."
+            )})
         exiger_positif(self.stock_minimum, "stock_minimum", "Le stock minimum", strict=False)
         exiger_positif(self.stock_alerte, "stock_alerte", "Le stock d'alerte", strict=False)
         if self.code_fiscal_id and not self.code_fiscal.actif and valeur_en_base(self, "code_fiscal") != self.code_fiscal_id:
             raise ValidationError({"code_fiscal": f"Le code fiscal {self.code_fiscal.code} est inactif."})
+
+    def creer_fiche_technique_brouillon(self, utilisateur):
+        """
+        Un produit fini doit toujours avoir sa fiche de composition :
+        dès sa création, une fiche v1 en BROUILLON est créée
+        automatiquement, prête à recevoir sa composition (toutes les
+        matières premières, emballages... nécessaires pour le fabriquer).
+        L'ADMIN_SI la complète puis la valide.
+        Ne fait rien si l'article n'est pas un produit fini ou a déjà une fiche.
+        """
+        if self.type_article != TypeArticle.PRODUIT_FINI or self.fiches_techniques.exists():
+            return None
+        return FicheTechnique.objects.create(article=self, version=1, cree_par=utilisateur)
+
+    @property
+    def fiche_technique_validee(self):
+        """La fiche de composition en vigueur (validée, version la plus récente), ou None."""
+        return (
+            self.fiches_techniques.filter(statut=StatutFicheTechnique.VALIDEE)
+            .order_by("-version").first()
+        )
 
     @property
     def peut_etre_facture(self):
@@ -632,6 +674,55 @@ class FicheTechnique(ValidationAvantEnregistrement, models.Model):
         if self.statut != StatutFicheTechnique.BROUILLON:
             raise ValidationError("Une fiche validée ou archivée ne se supprime pas (historique des versions).")
 
+    def elements_disponibles(self):
+        """
+        Articles pouvant être ajoutés à cette composition, pris dans le
+        référentiel : matières premières et produits intermédiaires
+        actifs, hors article de la fiche et hors éléments déjà présents.
+        """
+        return (
+            Article.objects.filter(
+                actif=True,
+                type_article__in=[TypeArticle.MATIERE_PREMIERE, TypeArticle.PRODUIT_INTERMEDIAIRE],
+            )
+            .exclude(pk=self.article_id)
+            .exclude(pk__in=self.composition.values("matiere_id"))
+            .order_by("type_article", "designation")
+        )
+
+    @transaction.atomic
+    def ajouter_elements(self, elements):
+        """
+        Ajoute plusieurs éléments choisis en une fois :
+        elements = [{"matiere": <id article>, "quantite_necessaire": ...}, ...]
+        Tout ou rien : si un seul élément est invalide (inexistant,
+        produit fini, doublon, quantité <= 0, fiche non brouillon...),
+        aucun n'est ajouté. Lève ValidationError (message par élément).
+        """
+        from apps.core.validation import convertir_decimal
+        if not isinstance(elements, list) or not elements:
+            raise ValidationError({"elements": "Envoyez une liste non vide d'éléments {matiere, quantite_necessaire}."})
+        erreurs, lignes = {}, []
+        for index, element in enumerate(elements):
+            try:
+                if not isinstance(element, dict):
+                    raise ValidationError("Format attendu : {matiere, quantite_necessaire}.")
+                matiere = Article.objects.filter(pk=element.get("matiere")).first()
+                if matiere is None:
+                    raise ValidationError(f"Article introuvable (id {element.get('matiere')!r}).")
+                try:
+                    quantite = convertir_decimal(element.get("quantite_necessaire"), "La quantité nécessaire")
+                except ValueError as erreur:
+                    raise ValidationError(str(erreur))
+                ligne = CompositionFicheTechnique(fiche_technique=self, matiere=matiere, quantite_necessaire=quantite)
+                ligne.save()
+                lignes.append(ligne)
+            except ValidationError as erreur:
+                erreurs[f"element_{index + 1}"] = erreur.messages
+        if erreurs:
+            raise ValidationError(erreurs)
+        return lignes
+
     @transaction.atomic
     def valider(self, utilisateur):
         """
@@ -700,8 +791,18 @@ class CompositionFicheTechnique(ValidationAvantEnregistrement, models.Model):
                 )})
             if self.matiere_id and self.matiere_id == fiche.article_id:
                 raise ValidationError({"matiere": "Un article ne peut pas entrer dans sa propre composition."})
-        if self.matiere_id and not self.matiere.actif:
-            raise ValidationError({"matiere": f"La matière {self.matiere.code} est inactive."})
+            if self.matiere_id and CompositionFicheTechnique.objects.filter(
+                fiche_technique_id=fiche.pk, matiere_id=self.matiere_id,
+            ).exclude(pk=self.pk).exists():
+                raise ValidationError({"matiere": f"{self.matiere.code} figure déjà dans cette composition : modifiez sa quantité."})
+        if self.matiere_id:
+            if not self.matiere.actif:
+                raise ValidationError({"matiere": f"La matière {self.matiere.code} est inactive."})
+            if self.matiere.type_article == TypeArticle.PRODUIT_FINI:
+                raise ValidationError({"matiere": (
+                    f"{self.matiere.code} est un produit fini : la composition ne contient que des "
+                    "matières premières et produits intermédiaires (emballages, étiquettes...)."
+                )})
 
     def verifier_suppression(self):
         if self.fiche_technique.statut != StatutFicheTechnique.BROUILLON:

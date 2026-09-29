@@ -170,8 +170,9 @@ class CodeFiscal(ValidationAvantEnregistrement, models.Model):
         EV-FISC-YAO-18  : yaourt, TVA + centimes, pas d'accise
     """
     code = models.CharField(
-        "Code fiscal", max_length=30, unique=True,
-        help_text="Ex : EV-FISC-JUS-10. Attribué manuellement (pas de numérotation automatique), il fait partie du paramétrage métier.",
+        "Code fiscal", max_length=30, unique=True, editable=False,
+        help_text="Généré automatiquement : EV-FISC-{famille}-{EXO | taux d'accise | taux de TVA}, "
+                  "ex : EV-FISC-JUS-10. Jamais saisi.",
     )
     famille_fiscale = models.ForeignKey(
         FamilleFiscale, verbose_name="Famille fiscale", on_delete=models.PROTECT,
@@ -212,6 +213,38 @@ class CodeFiscal(ValidationAvantEnregistrement, models.Model):
 
     def __str__(self):
         return f"{self.code} - {self.famille_fiscale}"
+
+    def save(self, *args, **kwargs):
+        if not self.code:
+            self.code = self.generer_code()
+        super().save(*args, **kwargs)
+
+    def generer_code(self):
+        """
+        Reproduit la codification de la matrice fiscale EVAM :
+            EV-FISC-EAU-EXO  (eau exonérée)
+            EV-FISC-EAU-18   (TVA 18 %)
+            EV-FISC-JUS-10   (accise 10 % : c'est l'accise qui distingue le code)
+            EV-FISC-YAO-18
+        Sigle = 3 premières lettres du premier mot de la famille fiscale
+        (sans accents). Le code est figé à la création : il ne change pas
+        si les taux évoluent ensuite. En cas de doublon : suffixe -2, -3...
+        """
+        import unicodedata
+        from decimal import Decimal
+        nom = unicodedata.normalize("NFKD", self.famille_fiscale.nom).encode("ascii", "ignore").decode()
+        mots = [mot for mot in nom.upper().replace("/", " ").split() if mot.isalpha()]
+        sigle = (mots[0] if mots else "GEN")[:3]
+        if self.exonere:
+            suffixe = "EXO"
+        else:
+            taux = self.taux_accise if self.taux_accise else self.taux_tva
+            suffixe = f"{Decimal(str(taux or 0)).normalize():f}".replace(".", "_")
+        base = f"EV-FISC-{sigle}-{suffixe}"
+        code, indice = base, 2
+        while CodeFiscal.objects.filter(code=code).exists():
+            code, indice = f"{base}-{indice}", indice + 1
+        return code
 
     def clean(self):
         exiger_pourcentage(self.taux_tva, "taux_tva", "Le taux de TVA")

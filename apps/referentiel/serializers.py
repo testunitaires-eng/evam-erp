@@ -75,12 +75,61 @@ class UniteVenteArticleSerializer(ValidationModeleMixin, serializers.ModelSerial
 
 
 class ArticleSerializer(ValidationModeleMixin, serializers.ModelSerializer):
+    """
+    fiche_technique_brouillon : id de la fiche en cours de paramétrage
+    (créée automatiquement pour un produit fini), pour ouvrir
+    directement l'écran de composition. fiche_technique_validee : id
+    de la fiche en vigueur (celle utilisée par les OF).
+    """
+    fiche_technique_brouillon = serializers.SerializerMethodField()
+    fiche_technique_validee = serializers.SerializerMethodField()
+
     class Meta:
         model = models.Article
         fields = "__all__"
 
+    def get_fiche_technique_brouillon(self, article):
+        fiche = article.fiches_techniques.filter(
+            statut=models.StatutFicheTechnique.BROUILLON,
+        ).order_by("-version").first()
+        return fiche.pk if fiche else None
+
+    def get_fiche_technique_validee(self, article):
+        fiche = article.fiche_technique_validee
+        return fiche.pk if fiche else None
+
+
+class ElementCompositionSerializer(serializers.ModelSerializer):
+    """
+    Un article pouvant entrer dans une composition (matière première ou
+    produit intermédiaire actif), tel qu'enregistré en base : sert à
+    alimenter la liste de choix, rien n'est ressaisi.
+    """
+    class Meta:
+        model = models.Article
+        fields = ["id", "code", "designation", "type_article", "unite_mesure"]
+        read_only_fields = fields
+
+
+class CompositionFicheTechniqueSerializer(ValidationModeleMixin, serializers.ModelSerializer):
+    """
+    On choisit l'élément (`matiere` = id d'un article existant) et on
+    indique sa quantité par unité produite. Code, désignation, type et
+    unité sont repris de la fiche article en base (lecture seule).
+    """
+    matiere_code = serializers.CharField(source="matiere.code", read_only=True)
+    matiere_designation = serializers.CharField(source="matiere.designation", read_only=True)
+    matiere_type = serializers.CharField(source="matiere.type_article", read_only=True)
+    unite_mesure = serializers.CharField(source="matiere.unite_mesure", read_only=True)
+
+    class Meta:
+        model = models.CompositionFicheTechnique
+        fields = "__all__"
+
 
 class FicheTechniqueSerializer(ValidationModeleMixin, serializers.ModelSerializer):
+    composition = CompositionFicheTechniqueSerializer(many=True, read_only=True)
+
     class Meta:
         model = models.FicheTechnique
         fields = "__all__"
@@ -94,12 +143,6 @@ class FicheTechniqueSerializer(ValidationModeleMixin, serializers.ModelSerialize
         if valeur != actuel and valeur == models.StatutFicheTechnique.VALIDEE:
             raise serializers.ValidationError("Utilisez l'action /valider/ pour valider une fiche technique.")
         return valeur
-
-
-class CompositionFicheTechniqueSerializer(ValidationModeleMixin, serializers.ModelSerializer):
-    class Meta:
-        model = models.CompositionFicheTechnique
-        fields = "__all__"
 
 
 class FicheConditionnementSerializer(ValidationModeleMixin, serializers.ModelSerializer):

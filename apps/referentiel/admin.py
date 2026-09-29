@@ -63,10 +63,21 @@ class UniteVenteArticleAdmin(admin.ModelAdmin):
 class ArticleAdmin(admin.ModelAdmin):
     search_fields = ()
 
+    def save_model(self, request, obj, form, change):
+        """Même règle que l'API : un produit fini reçoit sa fiche de composition (brouillon)."""
+        super().save_model(request, obj, form, change)
+        obj.creer_fiche_technique_brouillon(request.user)
+
+
+class CompositionFicheTechniqueInline(admin.TabularInline):
+    model = models.CompositionFicheTechnique
+    extra = 1
+
 
 @admin.register(models.FicheTechnique)
 class FicheTechniqueAdmin(admin.ModelAdmin):
     search_fields = ()
+    inlines = [CompositionFicheTechniqueInline]
 
 
 @admin.register(models.CompositionFicheTechnique)

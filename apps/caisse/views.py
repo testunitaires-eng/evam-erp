@@ -6,6 +6,7 @@ n'est exposée sur EcartCaisse, il doit toujours le justifier via un
 enregistrement.
 """
 
+from django.utils.dateparse import parse_date
 from rest_framework import viewsets, mixins
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -20,44 +21,121 @@ from apps.comptes.models import Profil
 #     serializer_class = serializers.CaisseSerializer
 #     permission_classes = [role_required(Profil.ADMIN_SI)]
 
+PROFILS_SUPERVISION_CAISSE = (Profil.ADMIN_SI, Profil.COMPTABILITE_DAF, Profil.DIRECTION)
+
+
+def voit_toutes_les_caisses(utilisateur):
+    return utilisateur.is_superuser or utilisateur.profil in PROFILS_SUPERVISION_CAISSE
+
+
+class FiltreCaissierMixin:
+    """Un caissier ne voit que les données de SA caisse (sessions, encaissements, décaissements)."""
+    filtre_caissier = "session_caisse__caissier"
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        utilisateur = self.request.user
+        if utilisateur.profil == Profil.CAISSIER and not utilisateur.is_superuser:
+            return queryset.filter(**{self.filtre_caissier: utilisateur})
+        return queryset
+
+
 class CaisseViewSet(viewsets.ModelViewSet):
-    queryset = models.Caisse.objects.all()
+    """
+    Création des caisses et affectation des caissiers : Administrateur SI.
+    La caisse principale est créée par le système (non supprimable).
+    """
+    queryset = models.Caisse.objects.all().order_by("-est_principale", "nom")
     serializer_class = serializers.CaisseSerializer
     permission_classes = [lecture_seule_pour(Profil.ADMIN_SI)]
+    filterset_fields = ["actif", "caissier", "est_principale"]
 
-class SessionCaisseViewSet(viewsets.ModelViewSet):
+    @action(detail=False, methods=["get"])
+    def principale(self, request):
+        """
+        GET /api/caisse/caisses/principale/
+        Montant global et détail par caisse (caissier, session ouverte,
+        solde). Réservé à l'Admin SI, la Comptabilité/DAF et la Direction.
+        """
+        if not voit_toutes_les_caisses(request.user):
+            return Response({"erreur": "Seuls l'Admin SI, la Comptabilité/DAF et la Direction voient la caisse principale."}, status=403)
+        principale = models.Caisse.principale()
+        caisses = models.Caisse.objects.filter(est_principale=False).order_by("nom")
+        return Response({
+            "caisse": self.get_serializer(principale).data if principale else None,
+            "montant_global": principale.solde_actuel if principale else sum((c.solde_propre() for c in caisses), 0),
+            "caisses": [
+                {
+                    "id": caisse.pk, "nom": caisse.nom, "actif": caisse.actif,
+                    "caissier": models.nom_utilisateur(caisse.caissier),
+                    "caissier_id": caisse.caissier_id,
+                    "session_ouverte": getattr(caisse.session_ouverte(), "pk", None),
+                    "solde": caisse.solde_propre(),
+                }
+                for caisse in caisses
+            ],
+        })
+
+    @action(detail=True, methods=["get"])
+    def journal(self, request, pk=None):
+        """
+        GET /api/caisse/caisses/{id}/journal/?date_debut=AAAA-MM-JJ&date_fin=AAAA-MM-JJ&caissier=<id>
+        Traçabilité : chaque entrée (encaissement) et sortie (décaissement)
+        avec montant, caisse, caissier, date et heure. Sur la caisse
+        principale : toutes les caisses. Un caissier ne consulte que sa caisse.
+        """
+        caisse = self.get_object()
+        if not voit_toutes_les_caisses(request.user) and caisse.caissier_id != request.user.id:
+            return Response({"erreur": "Vous ne pouvez consulter que le journal de votre propre caisse."}, status=403)
+        parametres = request.query_params
+        date_debut = parse_date(parametres["date_debut"]) if parametres.get("date_debut") else None
+        date_fin = parse_date(parametres["date_fin"]) if parametres.get("date_fin") else None
+        operations = caisse.operations(date_debut=date_debut, date_fin=date_fin, caissier=parametres.get("caissier"))
+        entrees = sum((o["montant"] for o in operations if o["type"] == "ENCAISSEMENT"), 0)
+        sorties = -sum((o["montant"] for o in operations if o["type"] == "DECAISSEMENT"), 0)
+        return Response({
+            "caisse": caisse.nom,
+            "est_principale": caisse.est_principale,
+            "solde_actuel": caisse.solde_actuel,
+            "total_encaissements": entrees,
+            "total_decaissements": sorties,
+            "operations": operations,
+        })
+
+class SessionCaisseViewSet(FiltreCaissierMixin, viewsets.ModelViewSet):
+    """
+    Ouverture : POST /api/caisse/sessions/ (corps vide suffit) - la caisse
+    du caissier et le solde d'ouverture sont déterminés automatiquement.
+    """
     queryset = models.SessionCaisse.objects.all()
     serializer_class = serializers.SessionCaisseSerializer
     permission_classes = [role_required(Profil.CAISSIER, Profil.ADMIN_SI, Profil.COMPTABILITE_DAF)]
     filterset_fields = ["caisse", "caissier", "statut"]
-
-    def perform_create(self, serializer):
-        serializer.save(caissier=self.request.user)
+    filtre_caissier = "caissier"
 
     @action(detail=True, methods=["post"])
     def cloturer(self, request, pk=None):
         """
         POST /api/caisse/sessions/{id}/cloturer/
-        Corps attendu : {"solde_compte": ...} (le solde théorique est
-        toujours calculé par le système).
-        Si un écart existe, il doit être justifié séparément via
-        /api/caisse/ecarts/ (le caissier ne peut jamais le supprimer).
+        Corps : {"solde_compte": ..., "justification": "..."}
+        Le solde théorique est calculé par le système. S'il y a un écart,
+        "justification" est obligatoire, sinon la session reste ouverte.
+        Seul le caissier de la session clôture sa caisse.
         """
         session = self.get_object()
+        if session.caissier_id != request.user.id and not request.user.is_superuser:
+            return Response({"erreur": "Seul le caissier de cette session peut clôturer sa caisse."}, status=403)
         try:
-            session.cloturer(solde_compte=request.data.get("solde_compte"))
+            session.cloturer(
+                solde_compte=request.data.get("solde_compte"),
+                justification=request.data.get("justification"),
+            )
         except ValueError as erreur:
             return Response({"erreur": str(erreur)}, status=400)
-        reponse = {"session": self.get_serializer(session).data}
-        if session.ecart and session.ecart != 0:
-            reponse["avertissement"] = (
-                f"Écart de {session.ecart} détecté. "
-                "Une justification est obligatoire (POST /api/caisse/ecarts/)."
-            )
-        return Response(reponse)
+        return Response({"session": self.get_serializer(session).data})
 
 
-class EncaissementViewSet(viewsets.ModelViewSet):
+class EncaissementViewSet(FiltreCaissierMixin, viewsets.ModelViewSet):
     queryset = models.Encaissement.objects.all()
     serializer_class = serializers.EncaissementSerializer
     permission_classes = [role_required(Profil.CAISSIER, Profil.ADMIN_SI, Profil.COMPTABILITE_DAF)]
@@ -81,11 +159,25 @@ class EcartCaisseViewSet(
     permission_classes = [role_required(Profil.CAISSIER, Profil.ADMIN_SI, Profil.COMPTABILITE_DAF)]
     filterset_fields = ["session_caisse"]
 
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        utilisateur = self.request.user
+        if utilisateur.profil == Profil.CAISSIER and not utilisateur.is_superuser:
+            return queryset.filter(session_caisse__caissier=utilisateur)
+        return queryset
+
+    def create(self, request, *args, **kwargs):
+        """L'écart se justifie à la clôture de la session (action /cloturer/), pas après."""
+        return Response({"erreur": (
+            "Un écart se justifie au moment de la clôture : "
+            "POST /api/caisse/sessions/{id}/cloturer/ avec solde_compte et justification."
+        )}, status=400)
 
 
 
 
-class DecaissementViewSet(viewsets.ModelViewSet):
+
+class DecaissementViewSet(FiltreCaissierMixin, viewsets.ModelViewSet):
     """§9.1/§9.2 : sortie de caisse autorisée, distincte d'un encaissement."""
     queryset = models.Decaissement.objects.all()
     serializer_class = serializers.DecaissementSerializer

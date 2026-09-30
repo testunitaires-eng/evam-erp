@@ -8,11 +8,12 @@ enregistrement.
 
 from django.utils.dateparse import parse_date
 from rest_framework import viewsets, mixins
+from apps.core.views import HistoriqueMixin
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from apps.core.validation import METHODES_CREATION_LECTURE
 from . import models, serializers
-from apps.comptes.permissions import role_required , lecture_seule_pour
+from apps.comptes.permissions import role_required , lecture_seule_pour, acces
 from apps.comptes.models import Profil, Utilisateur
 
 
@@ -47,8 +48,19 @@ class CaisseViewSet(viewsets.ModelViewSet):
     """
     queryset = models.Caisse.objects.all().order_by("-est_principale", "nom")
     serializer_class = serializers.CaisseSerializer
-    permission_classes = [lecture_seule_pour(Profil.ADMIN_SI)]
+    permission_classes = [acces(
+        lecture=(Profil.COMPTABILITE_DAF, Profil.DIRECTION, Profil.CAISSIER,),
+        ecriture=(Profil.ADMIN_SI,),
+    )]
     filterset_fields = ["actif", "caissier", "est_principale"]
+
+    def get_queryset(self):
+        """Un caissier ne voit que sa propre caisse (écran « Ma caisse »)."""
+        queryset = super().get_queryset()
+        utilisateur = self.request.user
+        if utilisateur.profil == Profil.CAISSIER and not utilisateur.is_superuser:
+            return queryset.filter(caissier=utilisateur)
+        return queryset
 
     @action(detail=False, methods=["get"])
     def principale(self, request):
@@ -102,14 +114,17 @@ class CaisseViewSet(viewsets.ModelViewSet):
             "operations": operations,
         })
 
-class SessionCaisseViewSet(FiltreCaissierMixin, viewsets.ModelViewSet):
+class SessionCaisseViewSet(HistoriqueMixin, FiltreCaissierMixin, viewsets.ModelViewSet):
     """
     Ouverture : POST /api/caisse/sessions/ (corps vide suffit) - la caisse
     du caissier et le solde d'ouverture sont déterminés automatiquement.
     """
     queryset = models.SessionCaisse.objects.all()
     serializer_class = serializers.SessionCaisseSerializer
-    permission_classes = [role_required(Profil.CAISSIER, Profil.ADMIN_SI, Profil.COMPTABILITE_DAF)]
+    permission_classes = [acces(
+        lecture=(Profil.DIRECTION,),
+        ecriture=(Profil.CAISSIER, Profil.ADMIN_SI, Profil.COMPTABILITE_DAF,),
+    )]
     filterset_fields = ["caisse", "caissier", "statut"]
     filtre_caissier = "caissier"
 
@@ -138,7 +153,10 @@ class SessionCaisseViewSet(FiltreCaissierMixin, viewsets.ModelViewSet):
 class EncaissementViewSet(FiltreCaissierMixin, viewsets.ModelViewSet):
     queryset = models.Encaissement.objects.all()
     serializer_class = serializers.EncaissementSerializer
-    permission_classes = [role_required(Profil.CAISSIER, Profil.ADMIN_SI, Profil.COMPTABILITE_DAF)]
+    permission_classes = [acces(
+        lecture=(Profil.DIRECTION,),
+        ecriture=(Profil.CAISSIER, Profil.ADMIN_SI, Profil.COMPTABILITE_DAF,),
+    )]
     filterset_fields = ["session_caisse", "facture", "mode_paiement"]
     search_fields = ["numero"]
     # Un encaissement ne se modifie ni ne se supprime (traçabilité caisse).
@@ -156,7 +174,10 @@ class EcartCaisseViewSet(
     """
     queryset = models.EcartCaisse.objects.all()
     serializer_class = serializers.EcartCaisseSerializer
-    permission_classes = [role_required(Profil.CAISSIER, Profil.ADMIN_SI, Profil.COMPTABILITE_DAF)]
+    permission_classes = [acces(
+        lecture=(Profil.DIRECTION,),
+        ecriture=(Profil.CAISSIER, Profil.ADMIN_SI, Profil.COMPTABILITE_DAF,),
+    )]
     filterset_fields = ["session_caisse"]
 
     def get_queryset(self):
@@ -177,18 +198,64 @@ class EcartCaisseViewSet(
 
 
 
-class DecaissementViewSet(FiltreCaissierMixin, viewsets.ModelViewSet):
+class DecaissementViewSet(HistoriqueMixin, FiltreCaissierMixin, viewsets.ModelViewSet):
     """§9.1/§9.2 : sortie de caisse autorisée, distincte d'un encaissement."""
     queryset = models.Decaissement.objects.all()
     serializer_class = serializers.DecaissementSerializer
-    permission_classes = [role_required(Profil.CAISSIER, Profil.ADMIN_SI, Profil.COMPTABILITE_DAF)]
-    filterset_fields = ["session_caisse"]
+    permission_classes = [acces(
+        lecture=(Profil.DIRECTION,),
+        ecriture=(Profil.CAISSIER, Profil.ADMIN_SI, Profil.COMPTABILITE_DAF,),
+    )]
+    filterset_fields = ["session_caisse", "statut"]
     search_fields = ["numero"]
-    # Un décaissement ne se modifie ni ne se supprime (traçabilité caisse).
+    # Une demande ne se modifie ni ne se supprime (traçabilité caisse) :
+    # elle évolue uniquement par les actions autoriser / refuser / effectuer.
     http_method_names = METHODES_CREATION_LECTURE
 
     def perform_create(self, serializer):
         serializer.save(effectue_par=self.request.user)
+
+    @action(detail=False, methods=["get"])
+    def a_autoriser(self, request):
+        """
+        GET /api/caisse/decaissements/a_autoriser/
+        Écran « À autoriser » de la Direction et de la Comptabilité/DAF :
+        demandes en attente, les plus anciennes d'abord.
+        """
+        demandes = self.get_queryset().filter(
+            statut=models.StatutDecaissement.EN_ATTENTE,
+        ).order_by("date_decaissement")
+        return Response(self.get_serializer(demandes, many=True).data)
+
+    @action(detail=True, methods=["post"], permission_classes=[acces(ecriture=models.PROFILS_AUTORISANT_DECAISSEMENT)])
+    def autoriser(self, request, pk=None):
+        """POST .../autoriser/ - Direction ou Comptabilité/DAF."""
+        decaissement = self.get_object()
+        try:
+            decaissement.autoriser(request.user)
+        except ValueError as erreur:
+            return Response({"erreur": str(erreur)}, status=400)
+        return Response(self.get_serializer(decaissement).data)
+
+    @action(detail=True, methods=["post"], permission_classes=[acces(ecriture=models.PROFILS_AUTORISANT_DECAISSEMENT)])
+    def refuser(self, request, pk=None):
+        """POST .../refuser/  Corps : {"motif": "..."} (obligatoire) - Direction ou Comptabilité/DAF."""
+        decaissement = self.get_object()
+        try:
+            decaissement.refuser(request.user, request.data.get("motif"))
+        except ValueError as erreur:
+            return Response({"erreur": str(erreur)}, status=400)
+        return Response(self.get_serializer(decaissement).data)
+
+    @action(detail=True, methods=["post"], permission_classes=[acces(ecriture=(Profil.CAISSIER,))])
+    def effectuer(self, request, pk=None):
+        """POST .../effectuer/ - le caissier sort l'argent d'un décaissement AUTORISÉ."""
+        decaissement = self.get_object()
+        try:
+            decaissement.effectuer(request.user)
+        except ValueError as erreur:
+            return Response({"erreur": str(erreur)}, status=400)
+        return Response(self.get_serializer(decaissement).data)
 
     @action(detail=False, methods=["get"])
     def autorisateurs(self, request):

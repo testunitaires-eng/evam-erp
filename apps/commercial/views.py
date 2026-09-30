@@ -7,18 +7,22 @@ module n'expose lui-même aucune écriture sur le stock.
 """
 
 from rest_framework import viewsets
+from apps.core.views import HistoriqueMixin
 from rest_framework.decorators import action, api_view, permission_classes as drf_permission_classes
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from . import models, serializers
-from apps.comptes.permissions import role_required
+from apps.comptes.permissions import role_required, acces
 from apps.comptes.models import Profil
 
 
 class ClientViewSet(viewsets.ModelViewSet):
     queryset = models.Client.objects.all()
     serializer_class = serializers.ClientSerializer
-    permission_classes = [role_required(Profil.COMMERCIAL, Profil.ADMIN_SI, Profil.COMPTABILITE_DAF)]
+    permission_classes = [acces(
+        lecture=(Profil.DIRECTION, Profil.RESPONSABLE_DISTRIBUTION,),
+        ecriture=(Profil.COMMERCIAL, Profil.ADMIN_SI, Profil.COMPTABILITE_DAF,),
+    )]
     filterset_fields = ["type_client", "bloque"]
     search_fields = ["code", "nom"]
 
@@ -26,29 +30,39 @@ class ClientViewSet(viewsets.ModelViewSet):
 class ProspectViewSet(viewsets.ModelViewSet):
     queryset = models.Prospect.objects.all()
     serializer_class = serializers.ProspectSerializer
-    permission_classes = [role_required(Profil.COMMERCIAL, Profil.ADMIN_SI)]
+    permission_classes = [acces(
+        lecture=(Profil.DIRECTION,),
+        ecriture=(Profil.COMMERCIAL, Profil.ADMIN_SI,),
+    )]
     search_fields = ["nom"]
 
 
 class ContratClientViewSet(viewsets.ModelViewSet):
     queryset = models.ContratClient.objects.all()
     serializer_class = serializers.ContratClientSerializer
-    permission_classes = [role_required(Profil.COMMERCIAL, Profil.ADMIN_SI)]
+    permission_classes = [acces(
+        lecture=(Profil.DIRECTION,),
+        ecriture=(Profil.COMMERCIAL, Profil.ADMIN_SI,),
+    )]
     filterset_fields = ["client"]
 
 
 class TarifViewSet(viewsets.ModelViewSet):
     queryset = models.Tarif.objects.all()
     serializer_class = serializers.TarifSerializer
-    permission_classes = [role_required(Profil.COMMERCIAL, Profil.ADMIN_SI)]
+    permission_classes = [acces(
+        lecture=(Profil.DIRECTION, Profil.RESPONSABLE_DISTRIBUTION, Profil.COMPTABILITE_DAF,),
+        ecriture=(Profil.COMMERCIAL, Profil.ADMIN_SI,),
+    )]
     filterset_fields = ["article", "client"]
 
 
-class CommandeViewSet(viewsets.ModelViewSet):
+class CommandeViewSet(HistoriqueMixin, viewsets.ModelViewSet):
     queryset = models.Commande.objects.all()
     serializer_class = serializers.CommandeSerializer
-    permission_classes = [role_required(
-        Profil.COMMERCIAL, Profil.ADMIN_SI, Profil.CAISSIER, Profil.RESPONSABLE_DISTRIBUTION,
+    permission_classes = [acces(
+        lecture=(Profil.CAISSIER, Profil.RESPONSABLE_DISTRIBUTION, Profil.COMPTABILITE_DAF, Profil.DIRECTION,),
+        ecriture=(Profil.COMMERCIAL, Profil.ADMIN_SI,),
     )]
     filterset_fields = ["client", "type_commande", "statut"]
     search_fields = ["numero"]
@@ -60,7 +74,10 @@ class CommandeViewSet(viewsets.ModelViewSet):
 class LigneCommandeViewSet(viewsets.ModelViewSet):
     queryset = models.LigneCommande.objects.all()
     serializer_class = serializers.LigneCommandeSerializer
-    permission_classes = [role_required(Profil.COMMERCIAL, Profil.ADMIN_SI)]
+    permission_classes = [acces(
+        lecture=(Profil.CAISSIER, Profil.RESPONSABLE_DISTRIBUTION, Profil.COMPTABILITE_DAF, Profil.DIRECTION,),
+        ecriture=(Profil.COMMERCIAL, Profil.ADMIN_SI,),
+    )]
     filterset_fields = ["commande", "article"]
 
 
@@ -74,11 +91,12 @@ class LigneCommandeViewSet(viewsets.ModelViewSet):
 #     search_fields = ["numero"]
 
 
-class FactureViewSet(viewsets.ModelViewSet):
+class FactureViewSet(HistoriqueMixin, viewsets.ModelViewSet):
     queryset = models.Facture.objects.all()
     serializer_class = serializers.FactureSerializer
-    permission_classes = [role_required(
-        Profil.COMMERCIAL, Profil.CAISSIER, Profil.COMPTABILITE_DAF, Profil.ADMIN_SI,
+    permission_classes = [acces(
+        lecture=(Profil.CAISSIER, Profil.COMPTABILITE_DAF, Profil.DIRECTION, Profil.RESPONSABLE_DISTRIBUTION,),
+        ecriture=(Profil.COMMERCIAL, Profil.ADMIN_SI,),
     )]
     filterset_fields = ["client", "statut"]
     search_fields = ["numero"]
@@ -110,8 +128,9 @@ class LigneFactureViewSet(viewsets.ReadOnlyModelViewSet):
     """
     queryset = models.LigneFacture.objects.all()
     serializer_class = serializers.LigneFactureSerializer
-    permission_classes = [role_required(
-        Profil.COMMERCIAL, Profil.CAISSIER, Profil.COMPTABILITE_DAF, Profil.ADMIN_SI,
+    permission_classes = [acces(
+        lecture=(Profil.COMMERCIAL, Profil.CAISSIER, Profil.COMPTABILITE_DAF, Profil.DIRECTION, Profil.RESPONSABLE_DISTRIBUTION, Profil.ADMIN_SI,),
+        ecriture=(),
     )]
     filterset_fields = ["facture", "article"]
 
@@ -119,10 +138,13 @@ class LigneFactureViewSet(viewsets.ReadOnlyModelViewSet):
 
 
 
-class AvoirViewSet(viewsets.ModelViewSet):
+class AvoirViewSet(HistoriqueMixin, viewsets.ModelViewSet):
     queryset = models.Avoir.objects.all()
     serializer_class = serializers.AvoirSerializer
-    permission_classes = [role_required(Profil.COMMERCIAL, Profil.COMPTABILITE_DAF, Profil.ADMIN_SI)]
+    permission_classes = [acces(
+        lecture=(Profil.DIRECTION,),
+        ecriture=(Profil.COMMERCIAL, Profil.COMPTABILITE_DAF, Profil.ADMIN_SI,),
+    )]
     filterset_fields = ["client", "statut"]
     search_fields = ["numero"]
 
@@ -144,7 +166,7 @@ class AvoirViewSet(viewsets.ModelViewSet):
 
 
 @api_view(["GET"])
-@drf_permission_classes([IsAuthenticated])
+@drf_permission_classes([acces(lecture=(Profil.COMMERCIAL, Profil.COMPTABILITE_DAF, Profil.DIRECTION, Profil.CAISSIER, Profil.ADMIN_SI,))])
 def impayes(request):
     """
     GET /api/commercial/impayes/

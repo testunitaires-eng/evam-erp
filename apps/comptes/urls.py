@@ -11,4 +11,5 @@ urlpatterns = [
     # /moi/ ne soit jamais interprété comme un {id} par le
     # UtilisateurViewSet (qui exige le profil ADMIN_SI).
     path("moi/", views.moi, name="moi"),
+    path("annuaire/", views.annuaire, name="annuaire"),
 ] + router.urls

@@ -26,7 +26,7 @@ from rest_framework.decorators import api_view, permission_classes as drf_permis
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework import viewsets
-from apps.comptes.permissions import role_required
+from apps.comptes.permissions import role_required, acces
 from apps.comptes.models import Profil
 from . import models, serializers
 
@@ -267,7 +267,7 @@ def _bloc_alertes():
 
 
 @api_view(["GET"])
-@drf_permission_classes([IsAuthenticated])
+@drf_permission_classes([acces(lecture=(Profil.DIRECTION, Profil.COMPTABILITE_DAF, Profil.ADMIN_SI,))])
 def tableau_de_bord_direction(request):
     """
     GET /api/reporting/tableau-de-bord-direction/
@@ -288,43 +288,43 @@ def tableau_de_bord_direction(request):
 
 
 @api_view(["GET"])
-@drf_permission_classes([IsAuthenticated])
+@drf_permission_classes([acces(lecture=(Profil.DIRECTION, Profil.COMPTABILITE_DAF, Profil.ADMIN_SI,))])
 def bloc_production(request):
     return Response(_bloc_production())
 
 
 @api_view(["GET"])
-@drf_permission_classes([IsAuthenticated])
+@drf_permission_classes([acces(lecture=(Profil.DIRECTION, Profil.COMPTABILITE_DAF, Profil.ADMIN_SI,))])
 def bloc_stock(request):
     return Response(_bloc_stock())
 
 
 @api_view(["GET"])
-@drf_permission_classes([IsAuthenticated])
+@drf_permission_classes([acces(lecture=(Profil.DIRECTION, Profil.COMPTABILITE_DAF, Profil.ADMIN_SI,))])
 def bloc_commercial(request):
     return Response(_bloc_commercial())
 
 
 @api_view(["GET"])
-@drf_permission_classes([IsAuthenticated])
+@drf_permission_classes([acces(lecture=(Profil.DIRECTION, Profil.COMPTABILITE_DAF, Profil.ADMIN_SI,))])
 def bloc_caisse(request):
     return Response(_bloc_caisse())
 
 
 @api_view(["GET"])
-@drf_permission_classes([IsAuthenticated])
+@drf_permission_classes([acces(lecture=(Profil.DIRECTION, Profil.COMPTABILITE_DAF, Profil.ADMIN_SI,))])
 def bloc_distribution(request):
     return Response(_bloc_distribution())
 
 
 @api_view(["GET"])
-@drf_permission_classes([IsAuthenticated])
+@drf_permission_classes([acces(lecture=(Profil.DIRECTION, Profil.COMPTABILITE_DAF, Profil.ADMIN_SI,))])
 def bloc_rentabilite(request):
     return Response(_bloc_rentabilite())
 
 
 @api_view(["GET"])
-@drf_permission_classes([IsAuthenticated])
+@drf_permission_classes([acces(lecture=(Profil.DIRECTION, Profil.COMPTABILITE_DAF, Profil.ADMIN_SI,))])
 def bloc_alertes(request):
     return Response(_bloc_alertes())
 

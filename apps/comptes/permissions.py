@@ -73,3 +73,31 @@ def lecture_seule_pour(*profils_lecture_seule):
             return getattr(utilisateur, "profil", None) in profils_lecture_seule
 
     return LectureSeule
+
+
+def acces(lecture=(), ecriture=()):
+    """
+    Permission selon la matrice « qui voit quoi » (document UX par rôle) :
+    - `ecriture` : profils qui consultent ET modifient ;
+    - `lecture`  : profils qui consultent seulement (👁) ;
+    - tous les autres profils n'ont aucun accès (⛔), même en lecture.
+    Compte désactivé toujours refusé, superutilisateur toujours autorisé.
+    """
+    profils_ecriture = set(ecriture)
+    profils_lecture = set(lecture) | profils_ecriture
+
+    class Acces(BasePermission):
+        message = "Votre profil n'a pas accès à ce module (ou seulement en lecture)."
+
+        def has_permission(self, request, view):
+            utilisateur = request.user
+            if not utilisateur or not utilisateur.is_authenticated or not utilisateur.is_active:
+                return False
+            if utilisateur.is_superuser:
+                return True
+            profil = getattr(utilisateur, "profil", None)
+            if request.method in ("GET", "HEAD", "OPTIONS"):
+                return profil in profils_lecture
+            return profil in profils_ecriture
+
+    return Acces

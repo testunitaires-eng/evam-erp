@@ -59,3 +59,60 @@ def generer_code_unique(modele, prefixe, champ="code", largeur=6):
         code = generer_numero(prefixe, largeur)
         if not modele._default_manager.filter(**{champ: code}).exists():
             return code
+
+
+
+class Historique(models.Model):
+    """
+    Une ligne de l'historique d'un document (création, changement de
+    statut). Écrite automatiquement (apps/core/historique.py), jamais
+    saisie ni modifiée.
+    """
+    content_type = models.ForeignKey(
+        "contenttypes.ContentType", verbose_name="Type de document", on_delete=models.CASCADE,
+    )
+    objet_id = models.PositiveBigIntegerField("Identifiant du document")
+    reference = models.CharField("Référence", max_length=50, blank=True)
+    action = models.CharField("Action", max_length=50)
+    ancien_statut = models.CharField("Ancien statut", max_length=60, blank=True)
+    nouveau_statut = models.CharField("Nouveau statut", max_length=60, blank=True)
+    utilisateur = models.ForeignKey(
+        "comptes.Utilisateur", verbose_name="Par", on_delete=models.PROTECT, null=True, blank=True,
+    )
+    date = models.DateTimeField("Date", auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Historique de document"
+        verbose_name_plural = "Historique des documents"
+        ordering = ["date", "pk"]
+        indexes = [models.Index(fields=["content_type", "objet_id"])]
+
+    def __str__(self):
+        return f"{self.reference} : {self.action} ({self.ancien_statut} -> {self.nouveau_statut})"
+
+
+class Notification(models.Model):
+    """
+    Notification (cloche de la barre du haut) : chaque notification
+    ouvre directement le tiroir du document concerné (type + id).
+    Créée automatiquement (apps/core/notifications.py), jamais saisie.
+    """
+    destinataire = models.ForeignKey(
+        "comptes.Utilisateur", verbose_name="Destinataire", on_delete=models.CASCADE, related_name="notifications",
+    )
+    titre = models.CharField("Titre", max_length=150)
+    message = models.CharField("Message", max_length=500, blank=True)
+    type_document = models.CharField("Type de document", max_length=60, blank=True, help_text="Ex : caisse.decaissement")
+    document_id = models.PositiveBigIntegerField("Identifiant du document", null=True, blank=True)
+    reference = models.CharField("Référence", max_length=50, blank=True)
+    lue = models.BooleanField("Lue", default=False)
+    date = models.DateTimeField("Date", auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Notification"
+        verbose_name_plural = "Notifications"
+        ordering = ["-date", "-pk"]
+        indexes = [models.Index(fields=["destinataire", "lue"])]
+
+    def __str__(self):
+        return f"{self.destinataire} : {self.titre}"

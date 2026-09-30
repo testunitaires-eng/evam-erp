@@ -649,7 +649,7 @@ class CaissePrincipaleTests(BaseValidation):
         self.assertEqual({(o["caisse"], o["caissier"]) for o in journal["operations"]},
                          {("Caisse A", "caissier_Caisse A"), ("Caisse B", "caissier_Caisse B")})
         self.assertEqual(api_a.get("/api/caisse/caisses/principale/").status_code, 403)
-        self.assertEqual(api_a.get(f"/api/caisse/caisses/{session_b.caisse_id}/journal/").status_code, 403)
+        self.assertIn(api_a.get(f"/api/caisse/caisses/{session_b.caisse_id}/journal/").status_code, (403, 404))
         self.assertEqual(len(api_a.get(f"/api/caisse/caisses/{session_a.caisse_id}/journal/").data["operations"]), 1)
 
 
@@ -697,23 +697,546 @@ class CodificationProduitsFinisTests(BaseValidation):
 
 
 class AutorisationDecaissementTests(BaseValidation):
-    def test_autorise_par_direction_ou_daf_uniquement(self):
+    def test_circuit_demande_autorisation_sortie(self):
         session, api = self.ouvrir_caisse()
         commande = self.commande(statut="VALIDEE")
         facture = Facture.objects.create(commande=commande)
         facture.generer_lignes_depuis_commande()
         Encaissement.objects.create(session_caisse=session, facture=facture, montant=500, mode_paiement="ESPECES")
         daf = Utilisateur.objects.create_user("daf", password="x", profil=Profil.COMPTABILITE_DAF, first_name="Awa", last_name="Kodia")
+        api_daf = APIClient()
+        api_daf.force_authenticate(daf)
         Utilisateur.objects.create_user("dg", password="x", profil=Profil.DIRECTION)
         Utilisateur.objects.create_user("dg_parti", password="x", profil=Profil.DIRECTION, is_active=False)
-        commercial = Utilisateur.objects.create_user("com", password="x", profil=Profil.COMMERCIAL)
+        self.assertEqual({p["username"] for p in api.get("/api/caisse/decaissements/autorisateurs/").data}, {"daf", "dg"})
 
-        liste = api.get("/api/caisse/decaissements/autorisateurs/").data
-        self.assertEqual({p["username"] for p in liste}, {"daf", "dg"})
-        self.assertIn("Awa Kodia", {p["nom"] for p in liste})
+        # 1. Demande du caissier : l'argent ne sort pas encore.
+        r = api.post("/api/caisse/decaissements/", {"session_caisse": session.id, "montant": "100", "motif": "Achat fournitures"}, format="json")
+        self.assertEqual((r.status_code, r.data.get("statut")), (201, "EN_ATTENTE"), r.content)
+        demande = r.data["id"]
+        session.refresh_from_db()
+        self.assertEqual(session.calculer_solde_theorique(), Decimal("500"))
+        self.assert_refus(api.post(f"/api/caisse/decaissements/{demande}/effectuer/"))       # pas encore autorisé
+        self.assertEqual(api.post(f"/api/caisse/decaissements/{demande}/autoriser/").status_code, 403)  # le caissier n'autorise pas
 
-        donnees = {"session_caisse": session.id, "montant": "100", "motif": "Achat fournitures"}
-        self.assert_refus(api.post("/api/caisse/decaissements/", {**donnees, "autorise_par": commercial.id}, format="json"))
-        r = api.post("/api/caisse/decaissements/", {**donnees, "autorise_par": daf.id}, format="json")
+        # 2. Écran « À autoriser » de la DAF, refus sans motif interdit, puis autorisation.
+        self.assertEqual([d["id"] for d in api_daf.get("/api/caisse/decaissements/a_autoriser/").data], [demande])
+        self.assert_refus(api_daf.post(f"/api/caisse/decaissements/{demande}/refuser/", {}, format="json"))
+        r = api_daf.post(f"/api/caisse/decaissements/{demande}/autoriser/")
+        self.assertEqual((r.data["statut"], r.data["autorise_par_nom"]), ("AUTORISE", "Awa Kodia"))
+
+        # 3. Le caissier effectue la sortie : le solde baisse, c'est tracé.
+        r = api.post(f"/api/caisse/decaissements/{demande}/effectuer/")
+        self.assertEqual(r.data["statut"], "EFFECTUE", r.content)
+        self.assertEqual(session.calculer_solde_theorique(), Decimal("400"))
+        self.assert_refus(api.post(f"/api/caisse/decaissements/{demande}/effectuer/"))       # pas deux fois
+        historique = [h["nouveau_statut"] for h in api.get(f"/api/caisse/decaissements/{demande}/historique/").data]
+        self.assertEqual(historique, ["En attente d'autorisation", "Autorisé", "Effectué"])
+
+    def test_refus_avec_motif(self):
+        session, api = self.ouvrir_caisse()
+        daf = Utilisateur.objects.create_user("daf", password="x", profil=Profil.COMPTABILITE_DAF)
+        api_daf = APIClient()
+        api_daf.force_authenticate(daf)
+        demande = api.post("/api/caisse/decaissements/", {"session_caisse": session.id, "montant": "50", "motif": "x"}, format="json").data["id"]
+        r = api_daf.post(f"/api/caisse/decaissements/{demande}/refuser/", {"motif": "Non justifié"}, format="json")
+        self.assertEqual((r.data["statut"], r.data["motif_refus"]), ("REFUSE", "Non justifié"))
+        self.assert_refus(api_daf.post(f"/api/caisse/decaissements/{demande}/autoriser/"))
+
+class AgentProductionTests(BaseValidation):
+    def setUp(self):
+        super().setUp()
+        self.agent = Utilisateur.objects.create_user("agent", password="x", profil=Profil.AGENT_PRODUCTION)
+        self.api_agent = APIClient()
+        self.api_agent.force_authenticate(self.agent)
+        self.responsable = Utilisateur.objects.create_user("resp", password="x", profil=Profil.RESPONSABLE_PRODUCTION)
+        self.api_resp = APIClient()
+        self.api_resp.force_authenticate(self.responsable)
+        self.mon_of = OrdreFabrication.objects.create(article=self.produit, quantite_a_produire=10, responsable=self.admin)
+        self.autre_of = OrdreFabrication.objects.create(article=self.produit, quantite_a_produire=10, responsable=self.admin)
+        self.mon_of.affecter_agents([self.agent], par=self.responsable)
+
+    def demarrer(self, of):
+        OrdreFabrication.objects.filter(pk=of.pk).update(statut="EN_PRODUCTION")
+        of.refresh_from_db()
+
+    def perte(self, of):
+        return self.api_agent.post("/api/production/pertes/", {
+            "ordre_fabrication": of.id, "quantite_perte": "3", "motif": "CASSE",
+        }, format="json")
+
+    def test_of_en_lecture_seule_et_filtres(self):
+        self.assertEqual(self.api_agent.post("/api/production/ordres-fabrication/", {
+            "article": self.produit.id, "quantite_a_produire": "5",
+        }, format="json").status_code, 403)
+        url = f"/api/production/ordres-fabrication/{self.mon_of.id}/"
+        self.assertEqual(self.api_agent.patch(url, {"quantite_a_produire": "99"}, format="json").status_code, 403)
+        self.assertEqual(self.api_agent.delete(url).status_code, 403)
+        self.assertEqual([o["id"] for o in self.api_agent.get("/api/production/ordres-fabrication/").data["results"]], [self.mon_of.id])
+        self.assertEqual(self.api_agent.get("/api/production/tableau-de-bord/").data["detail_par_statut"], {"BROUILLON": 1})
+
+    def test_saisie_uniquement_sur_son_of_en_production(self):
+        self.assert_refus_ou_interdit(self.perte(self.mon_of))            # OF pas démarré
+        self.demarrer(self.mon_of)
+        self.demarrer(self.autre_of)
+        self.assertEqual(self.perte(self.autre_of).status_code, 403)      # OF non affecté
+        r = self.perte(self.mon_of)
         self.assertEqual(r.status_code, 201, r.content)
-        self.assertEqual(r.data["autorise_par_nom"], "Awa Kodia")
+        self.assertEqual(r.data["saisi_par_nom"], "agent")
+        url = f"/api/production/pertes/{r.data['id']}/"
+        self.assertEqual(self.api_agent.patch(url, {"quantite_perte": "1"}, format="json").status_code, 403)
+        self.assertEqual(self.api_agent.delete(url).status_code, 403)
+        self.assertEqual(self.api_resp.patch(url, {"quantite_perte": "1"}, format="json").status_code, 200)
+
+    def test_personne_ne_saisit_avant_le_demarrage(self):
+        self.assert_refus(self.api_resp.post("/api/production/pertes/", {
+            "ordre_fabrication": self.mon_of.id, "quantite_perte": "3", "motif": "CASSE",
+        }, format="json"))
+
+    def test_donnees_des_autres_of_invisibles(self):
+        from apps.production.models import DemandeComplementaire, SuiviEau
+        self.demarrer(self.autre_of)
+        SuiviEau.objects.create(ordre_fabrication=self.autre_of, volume_capte_l=10, volume_obtenu_traitement_l=9,
+                                volume_envoye_embouteillage_l=8, bouteilles_produites=5, bouteilles_conformes=5)
+        DemandeComplementaire.objects.create(ordre_fabrication=self.autre_of, matiere=self.matiere, quantite=1,
+                                             motif="x", demandeur=self.admin)
+        self.assertEqual(self.api_agent.get("/api/production/suivis-eau/").data["count"], 0)
+        self.assertEqual(self.api_agent.get("/api/production/demandes-complementaires/").data["count"], 0)
+
+    def test_demande_complementaire_pendant_la_production(self):
+        donnees = {"ordre_fabrication": self.mon_of.id, "matiere": self.matiere.id, "quantite": "2", "motif": "Défauts au soufflage"}
+        self.assert_refus_ou_interdit(self.api_agent.post("/api/production/demandes-complementaires/", donnees, format="json"))
+        self.demarrer(self.mon_of)
+        r = self.api_agent.post("/api/production/demandes-complementaires/", donnees, format="json")
+        self.assertEqual(r.status_code, 201, r.content)
+
+    def test_affectation_par_le_responsable_tracee(self):
+        from apps.comptes.models import JournalAction
+        url = f"/api/production/ordres-fabrication/{self.autre_of.id}/affecter_agents/"
+        self.assertEqual(self.api_agent.post(url, {"agents": [self.agent.id]}, format="json").status_code, 403)
+        caissier = Utilisateur.objects.create_user("caissier", password="x", profil=Profil.CAISSIER)
+        self.assert_refus(self.api_resp.post(url, {"agents": [caissier.id]}, format="json"))
+        r = self.api_resp.post(url, {"agents": [self.agent.id]}, format="json")
+        self.assertEqual(r.status_code, 200, r.content)
+        self.assertEqual(r.data["agents_affectes_noms"], ["agent"])
+        trace = JournalAction.objects.get(document_id=self.autre_of.numero, action__startswith="Ajout")
+        self.assertEqual(trace.utilisateur, self.responsable)
+        self.assertIn("agent", trace.nouvelle_valeur)
+        agents = self.api_resp.get("/api/production/ordres-fabrication/agents_disponibles/").data
+        self.assertEqual([a["username"] for a in agents], ["agent"])
+
+    def test_agents_affectes_a_la_conversion_du_plan(self):
+        from apps.production.models import PlanProduction
+        plan = PlanProduction.objects.create(article=self.produit, date_prevue="2026-10-01", quantite_prevue=50, cree_par=self.responsable)
+        r = self.api_resp.post(f"/api/production/plans/{plan.id}/convertir_en_of/", {"agents_affectes": [self.agent.id]}, format="json")
+        self.assertEqual(r.status_code, 201, r.content)
+        self.assertEqual(r.data["agents_affectes"], [self.agent.id])
+
+    def assert_refus_ou_interdit(self, reponse):
+        self.assertIn(reponse.status_code, (400, 403), reponse.content)
+
+
+class MatriceAccesTests(BaseValidation):
+    def client_pour(self, profil, nom=None):
+        utilisateur = Utilisateur.objects.create_user(nom or profil.lower(), password="x", profil=profil)
+        api = APIClient()
+        api.force_authenticate(utilisateur)
+        return utilisateur, api
+
+    def test_modules_invisibles_selon_le_role(self):
+        _, caissier = self.client_pour(Profil.CAISSIER)
+        _, agent = self.client_pour(Profil.AGENT_PRODUCTION)
+        _, chauffeur = self.client_pour(Profil.CHAUFFEUR)
+        self.assertEqual(caissier.get("/api/referentiel/articles/").status_code, 403)
+        self.assertEqual(caissier.get("/api/production/ordres-fabrication/").status_code, 403)
+        self.assertEqual(agent.get("/api/stocks/stock-articles/").status_code, 403)
+        self.assertEqual(agent.get("/api/commercial/commandes/").status_code, 403)
+        self.assertEqual(chauffeur.get("/api/commercial/tarifs/").status_code, 403)
+        self.assertEqual(caissier.get("/api/commercial/commandes/").status_code, 200)   # 👁 à encaisser
+
+    def test_lecture_seule_ne_permet_pas_d_ecrire(self):
+        _, distribution = self.client_pour(Profil.RESPONSABLE_DISTRIBUTION)
+        commande = self.commande(statut="VALIDEE")
+        lignes = distribution.get(f"/api/commercial/lignes-commande/?commande={commande.id}").data["results"]
+        self.assertEqual((lignes[0]["article_code"], lignes[0]["stock_disponible"]), ("EAU70P8", 0))
+        self.assertEqual(distribution.patch(f"/api/commercial/commandes/{commande.id}/", {"statut": "ANNULEE"}, format="json").status_code, 403)
+
+    def test_annuaire_des_noms_pour_tous(self):
+        _, chauffeur = self.client_pour(Profil.CHAUFFEUR)
+        Utilisateur.objects.create_user("awa", password="x", profil=Profil.COMPTABILITE_DAF, first_name="Awa", last_name="Kodia")
+        noms = {c["username"]: c["nom"] for c in chauffeur.get("/api/comptes/annuaire/").data}
+        self.assertEqual(noms["awa"], "Awa Kodia")
+        self.assertNotIn("email", chauffeur.get("/api/comptes/annuaire/").data[0])
+
+    def test_article_verrouille_une_fois_utilise(self):
+        url = f"/api/referentiel/articles/{self.produit.id}/"
+        self.assertFalse(self.api.get(url).data["est_verrouille"])
+        self.entree_stock(self.produit, 1, depot="Dépôt produits finis")
+        self.assertTrue(self.api.get(url).data["est_verrouille"])
+
+    def test_chauffeur_mes_livraisons(self):
+        from apps.distribution.models import BonLivraison, Chauffeur, Tournee, Vehicule
+        utilisateur, chauffeur = self.client_pour(Profil.CHAUFFEUR)
+        tournee = Tournee.objects.create(
+            chauffeur=Chauffeur.objects.create(utilisateur=utilisateur),
+            vehicule=Vehicule.objects.create(immatriculation="AB-123"), date_tournee="2026-10-01",
+        )
+        self.entree_stock(self.produit, 100, depot="Dépôt produits finis")
+        commande = self.commande(statut="VALIDEE")
+        preparation = PreparationLivraison.objects.create(commande=commande, lancee_par=self.admin)
+        self.api.post(f"/api/distribution/preparations/{preparation.id}/confirmer_preparation/")
+        self.api.post(f"/api/distribution/preparations/{preparation.id}/confirmer_sortie/")
+        bon = BonLivraison.objects.create(commande=commande, tournee=tournee)
+        autre = self.commande(statut="VALIDEE")   # BL sans tournée du chauffeur : invisible pour lui
+        preparation = PreparationLivraison.objects.create(commande=autre, lancee_par=self.admin)
+        self.api.post(f"/api/distribution/preparations/{preparation.id}/confirmer_preparation/")
+        self.api.post(f"/api/distribution/preparations/{preparation.id}/confirmer_sortie/")
+        BonLivraison.objects.create(commande=autre)
+
+        mes = chauffeur.get("/api/distribution/bons-livraison/mes_livraisons/").data
+        self.assertEqual([(b["numero"], b["client_nom"], b["statut_paiement"]) for b in mes],
+                         [(bon.numero, "Client test", "Non facturée")])
+        self.assertEqual(chauffeur.patch(f"/api/distribution/bons-livraison/{bon.id}/", {"statut": "RETOURNEE"}, format="json").status_code, 403)
+        self.assert_refus(chauffeur.post(f"/api/distribution/bons-livraison/{bon.id}/probleme/", {}, format="json"))
+        self.assertEqual(chauffeur.post(f"/api/distribution/bons-livraison/{bon.id}/livre/").status_code, 200)
+        bon.refresh_from_db()
+        self.assertEqual((bon.signature_client, bon.statut), (True, "EN_LIVRAISON"))   # confirmation finale : Resp. Distribution
+
+
+class HistoriqueTests(BaseValidation):
+    def test_historique_commande_et_facture(self):
+        commercial = Utilisateur.objects.create_user("com", password="x", profil=Profil.COMMERCIAL, first_name="Jean", last_name="Mavoungou")
+        api = APIClient()
+        api.force_authenticate(commercial)
+        r = api.post("/api/commercial/commandes/", {"client": self.client_evam.id, "type_commande": "COMPTANT"}, format="json")
+        commande_id = r.data["id"]
+        api.post("/api/commercial/lignes-commande/", {"commande": commande_id, "article": self.produit.id, "quantite": "1", "prix_unitaire": "100"}, format="json")
+        api.patch(f"/api/commercial/commandes/{commande_id}/", {"statut": "VALIDEE"}, format="json")
+        self.assert_refus(api.patch(f"/api/commercial/commandes/{commande_id}/", {"statut": "LIVREE"}, format="json"))
+
+        historique = api.get(f"/api/commercial/commandes/{commande_id}/historique/").data
+        self.assertEqual(
+            [(h["action"], h["ancien_statut"], h["nouveau_statut"], h["par"]) for h in historique],
+            [("Création", "", "Brouillon", "Jean Mavoungou"), ("Changement de statut", "Brouillon", "Validée", "Jean Mavoungou")],
+        )   # le passage refusé n'a laissé aucune trace
+
+        facture = Facture.objects.create(commande_id=commande_id)
+        facture.generer_lignes_depuis_commande()
+        session, api_caissier = self.ouvrir_caisse()
+        api_caissier.post("/api/caisse/encaissements/", {
+            "session_caisse": session.id, "facture": facture.id, "montant": str(facture.montant_total), "mode_paiement": "ESPECES",
+        }, format="json")
+        derniere = api.get(f"/api/commercial/factures/{facture.id}/historique/").data[-1]
+        self.assertEqual((derniere["nouveau_statut"], derniere["par"]), ("Payée", "caissier_Caisse 1"))
+
+
+class BesoinAutomatiqueTests(BaseValidation):
+    def sortie(self, quantite):
+        MouvementStock.objects.create(
+            article=self.preforme, depot=depot_par_defaut("Magasin principal"), type_mouvement="SORTIE",
+            quantite=quantite, utilisateur=self.admin,
+        )
+
+    def test_besoin_cree_sous_le_seuil_puis_demande_d_achat(self):
+        from apps.achats.models import BesoinApprovisionnement, DemandeAchat
+        self.preforme = Article.objects.create(type_article="MATIERE_PREMIERE", unite_mesure="UNITE", stock_alerte=100)
+        self.entree_stock(self.preforme, 150)
+        self.sortie(40)
+        self.assertFalse(BesoinApprovisionnement.objects.exists())          # 110 >= 100
+        self.sortie(40)                                                     # 70 < 100
+        besoin = BesoinApprovisionnement.objects.get()
+        self.assertEqual((besoin.origine, besoin.quantite_besoin, besoin.satisfait), ("SEUIL_ALERTE", Decimal("30"), False))
+        self.sortie(10)                                                     # 60 : même besoin mis à jour
+        besoin.refresh_from_db()
+        self.assertEqual((BesoinApprovisionnement.objects.count(), besoin.quantite_besoin), (1, Decimal("40")))
+
+        acheteur = Utilisateur.objects.create_user("achat", password="x", profil=Profil.RESPONSABLE_ACHATS)
+        api = APIClient()
+        api.force_authenticate(acheteur)
+        r = api.post(f"/api/achats/besoins/{besoin.id}/creer_demande/")
+        self.assertEqual((r.status_code, Decimal(r.data["quantite_demandee"])), (201, Decimal("40")), r.content)
+        self.assert_refus(api.post(f"/api/achats/besoins/{besoin.id}/creer_demande/"))
+        DemandeAchat.objects.get().rejeter(acheteur)                         # rejet : le besoin revient à traiter
+        besoin.refresh_from_db()
+        self.assertFalse(besoin.satisfait)
+
+    def test_besoin_solde_si_le_stock_remonte(self):
+        from apps.achats.models import BesoinApprovisionnement
+        self.preforme = Article.objects.create(type_article="MATIERE_PREMIERE", unite_mesure="UNITE", stock_alerte=100)
+        self.entree_stock(self.preforme, 50)
+        self.assertEqual(BesoinApprovisionnement.objects.filter(satisfait=False).count(), 1)
+        self.entree_stock(self.preforme, 60)
+        self.assertEqual(BesoinApprovisionnement.objects.filter(satisfait=False).count(), 0)
+
+
+class ComptabiliteTests(BaseValidation):
+    def ecriture(self, document):
+        from apps.comptabilite.ecritures import ecritures_de
+        return {(l.compte, l.compte_tiers, l.debit, l.credit) for e in ecritures_de(document) for l in e.lignes.all()}
+
+    def test_chaine_vente_encaissement_annulation(self):
+        from apps.comptabilite.models import CompteParametre, EcritureComptable
+        commande = self.commande(statut="VALIDEE")          # 10 x 100 HT, TVA 18 %
+        facture = Facture.objects.create(commande=commande)
+        facture.generer_lignes_depuis_commande()
+        self.assertEqual(self.ecriture(facture), {
+            ("411", self.client_evam.code, Decimal("1180.00"), Decimal("0")),
+            ("702", "", Decimal("0"), Decimal("1000.00")),
+            ("4431", "", Decimal("0"), Decimal("180.00")),
+        })
+
+        CompteParametre.objects.filter(cle="CAISSE").update(numero="5711")      # paramétrage DAF
+        session, api = self.ouvrir_caisse()
+        api.post("/api/caisse/encaissements/", {
+            "session_caisse": session.id, "facture": facture.id, "montant": "500", "mode_paiement": "ESPECES",
+        }, format="json")
+        encaissement = Encaissement.objects.get()
+        self.assertEqual(self.ecriture(encaissement), {
+            ("5711", "", Decimal("500.00"), Decimal("0")), ("411", self.client_evam.code, Decimal("0"), Decimal("500.00")),
+        })
+
+        for ecriture in EcritureComptable.objects.prefetch_related("lignes"):
+            lignes = list(ecriture.lignes.all())
+            self.assertEqual(sum(l.debit for l in lignes), sum(l.credit for l in lignes))
+
+        # Facture non payée annulée : contre-passation (solde du compte client revient à 0).
+        autre = Facture.objects.create(commande=self.commande(statut="VALIDEE"))
+        autre.generer_lignes_depuis_commande()
+        autre.statut = "ANNULEE"
+        autre.save()
+        from apps.comptabilite.models import LigneEcriture
+        lignes = LigneEcriture.objects.filter(ecriture__piece=autre.numero, compte="411")
+        self.assertEqual(sum(l.debit - l.credit for l in lignes), 0)
+
+    def test_periode_cloturee_bloque_le_document(self):
+        from django.utils import timezone
+        from apps.comptabilite.models import Cloture
+        Cloture.objects.create(type_cloture="MENSUELLE", periode=timezone.localdate().strftime("%Y-%m"), valide_par=self.admin)
+        facture = Facture.objects.create(commande=self.commande(statut="VALIDEE"))
+        r = self.assert_refus(self.api.post(f"/api/commercial/factures/{facture.id}/generer_lignes/"))
+        self.assertIn("clôturée", str(r.data))
+        self.assertEqual(LigneFacture.objects.count(), 0)                  # rien n'a été enregistré
+
+    def test_export_sage(self):
+        from apps.comptabilite.models import ExportComptable
+        from django.utils import timezone
+        facture = Facture.objects.create(commande=self.commande(statut="VALIDEE"))
+        facture.generer_lignes_depuis_commande()
+        daf = Utilisateur.objects.create_user("daf", password="x", profil=Profil.COMPTABILITE_DAF)
+        api = APIClient()
+        api.force_authenticate(daf)
+        aujourd_hui = timezone.localdate()
+        r = api.post("/api/comptabilite/exports/", {"type_export": "VENTES", "periode_debut": str(aujourd_hui), "periode_fin": str(aujourd_hui)}, format="json")
+        self.assertEqual(r.status_code, 201, r.content)
+        contenu = api.get(f"/api/comptabilite/exports/{r.data['id']}/telecharger/").content.decode()
+        lignes = contenu.strip().splitlines()
+        self.assertEqual(lignes[0], "Journal;Date;Piece;Compte general;Compte tiers;Libelle;Debit;Credit")
+        self.assertIn(f"VT;{aujourd_hui:%d/%m/%Y};{facture.numero};411;{self.client_evam.code}", contenu)
+        self.assertIn(";1180,00;0,00", contenu)
+        self.assertEqual(len(lignes), 4)
+
+
+class NotificationsTests(BaseValidation):
+    def test_decaissement_notifie_la_direction_puis_le_caissier(self):
+        from apps.core.models import Notification
+        session, api = self.ouvrir_caisse()
+        daf = Utilisateur.objects.create_user("daf", password="x", profil=Profil.COMPTABILITE_DAF)
+        dg = Utilisateur.objects.create_user("dg", password="x", profil=Profil.DIRECTION)
+        commande = self.commande(statut="VALIDEE")
+        facture = Facture.objects.create(commande=commande)
+        facture.generer_lignes_depuis_commande()
+        Encaissement.objects.create(session_caisse=session, facture=facture, montant=500, mode_paiement="ESPECES")
+        demande = api.post("/api/caisse/decaissements/", {"session_caisse": session.id, "montant": "80", "motif": "Carburant"}, format="json").data["id"]
+
+        api_dg = APIClient()
+        api_dg.force_authenticate(dg)
+        self.assertEqual(api_dg.get("/api/notifications/non_lues/").data["non_lues"], 1)
+        notif = api_dg.get("/api/notifications/").data["results"][0]
+        self.assertEqual((notif["titre"], notif["type_document"], notif["document_id"]), ("Décaissement à autoriser", "caisse.decaissement", demande))
+        self.assertTrue(Notification.objects.filter(destinataire=daf).exists())
+
+        api_dg.post(f"/api/caisse/decaissements/{demande}/autoriser/")
+        caissier_notifs = [n["titre"] for n in api.get("/api/notifications/").data["results"]]
+        self.assertIn("Décaissement autorisé : à effectuer", caissier_notifs)
+        self.assertFalse(Notification.objects.filter(destinataire=dg, titre__startswith="Décaissement autorisé").exists())  # pas l'auteur
+        api_dg.post("/api/notifications/tout_lire/")
+        self.assertEqual(api_dg.get("/api/notifications/non_lues/").data["non_lues"], 0)
+
+    def test_notifications_personnelles(self):
+        from apps.core.models import Notification
+        autre = Utilisateur.objects.create_user("autre", password="x", profil=Profil.MAGASINIER)
+        Notification.objects.create(destinataire=autre, titre="Pour autre")
+        titres = [n["titre"] for n in self.api.get("/api/notifications/").data["results"]]
+        self.assertNotIn("Pour autre", titres)
+        self.assertIn("Fiche de composition à paramétrer", titres)   # la sienne (ADMIN_SI)
+
+
+class AnomaliesTests(BaseValidation):
+    def test_ecart_de_caisse_et_impaye(self):
+        from apps.comptabilite.anomalies import detecter_anomalies
+        from apps.comptabilite.models import AnomalieDetectee
+        from apps.core.models import Notification
+        daf = Utilisateur.objects.create_user("daf", password="x", profil=Profil.COMPTABILITE_DAF)
+        session, api = self.ouvrir_caisse()
+        api.post(f"/api/caisse/sessions/{session.id}/cloturer/", {"solde_compte": "20", "justification": "Pièce trouvée"}, format="json")
+        anomalie = AnomalieDetectee.objects.get(type_anomalie="ECART_CAISSE")
+        self.assertIn("Écart de 20", anomalie.description)
+        self.assertTrue(Notification.objects.filter(destinataire=daf, titre__startswith="Anomalie").exists())
+
+        # Facture échue impayée : détectée une fois, puis résolue automatiquement après paiement.
+        commande = self.commande(statut="VALIDEE")
+        facture = Facture.objects.create(commande=commande)
+        facture.generer_lignes_depuis_commande()
+        Facture.objects.filter(pk=facture.pk).update(date_echeance="2020-01-01")
+        self.assertEqual(detecter_anomalies()[0], 1)
+        self.assertEqual(detecter_anomalies()[0], 0)                       # pas de doublon
+        session2, api2 = self.ouvrir_caisse("Caisse 2")
+        Encaissement.objects.create(session_caisse=session2, facture=facture, montant=facture.montant_total, mode_paiement="ESPECES")
+        self.assertEqual(detecter_anomalies()[1], 1)
+        self.assertEqual(AnomalieDetectee.objects.get(type_anomalie="IMPAYE").statut, "TRAITEE")
+
+    def test_traitement_par_la_daf(self):
+        from apps.comptabilite.anomalies import signaler_anomalie
+        anomalie = signaler_anomalie("AUTRE", "Test", "Anomalie de test", cle="test-1")
+        daf = Utilisateur.objects.create_user("daf", password="x", profil=Profil.COMPTABILITE_DAF)
+        api = APIClient()
+        api.force_authenticate(daf)
+        self.assert_refus(api.post("/api/comptabilite/anomalies/", {"type_anomalie": "AUTRE"}, format="json"))
+        self.assert_refus(api.post(f"/api/comptabilite/anomalies/{anomalie.id}/ignorer/", {}, format="json"))
+        r = api.post(f"/api/comptabilite/anomalies/{anomalie.id}/ignorer/", {"commentaire": "Cas connu"}, format="json")
+        self.assertEqual((r.data["statut"], r.data["traite_par_nom"]), ("IGNOREE", "daf"))
+
+
+class ValorisationTests(BaseValidation):
+    def mouvement(self, type_mouvement, quantite, cout=None, depot="Magasin principal", article=None):
+        return MouvementStock.objects.create(
+            article=article or self.matiere, depot=depot_par_defaut(depot), type_mouvement=type_mouvement,
+            quantite=quantite, cout_unitaire=cout, utilisateur=self.admin,
+        )
+
+    def test_cout_moyen_pondere(self):
+        from apps.stocks.models import ValorisationArticle
+        self.mouvement("ENTREE", 100, cout=10)                  # 100 x 10
+        self.mouvement("ENTREE", 100, cout=20)                  # CMUP = (1000 + 2000) / 200 = 15
+        self.assertEqual(ValorisationArticle.objects.get(article=self.matiere).cout_unitaire_moyen, Decimal("15"))
+        sortie = self.mouvement("SORTIE", 50)
+        self.assertEqual((sortie.cout_unitaire, sortie.valeur), (Decimal("15"), Decimal("750.00")))
+        self.mouvement("ENTREE", 50, cout=27)                   # (150 x 15 + 50 x 27) / 200 = 18
+        self.assertEqual(ValorisationArticle.objects.get(article=self.matiere).cout_unitaire_moyen, Decimal("18"))
+
+        daf = Utilisateur.objects.create_user("daf", password="x", profil=Profil.COMPTABILITE_DAF)
+        api = APIClient()
+        api.force_authenticate(daf)
+        r = api.get("/api/stocks/valorisation/")
+        self.assertEqual(Decimal(r.data["valeur_totale"]), Decimal("3600.00"))   # 200 x 18
+        responsable = Utilisateur.objects.create_user("rp", password="x", profil=Profil.RESPONSABLE_PRODUCTION)
+        api.force_authenticate(responsable)
+        self.assertEqual(api.get("/api/stocks/valorisation/").status_code, 403)   # donnée financière
+
+    def test_cout_de_revient_de_l_of_et_entree_du_produit_fini(self):
+        from apps.couts.models import CoutMainOeuvre, CoutReel
+        from apps.production.models import SortieMatiere
+        from apps.stocks.models import ValorisationArticle
+        self.mouvement("ENTREE", 100, cout=5)                   # matière à 5 / kg
+        of = OrdreFabrication.objects.create(article=self.produit, quantite_a_produire=10, responsable=self.admin)
+        SortieMatiere.objects.create(ordre_fabrication=of, matiere=self.matiere, quantite_sortie=20)   # 100 de matières
+        CoutMainOeuvre.objects.create(ordre_fabrication=of, heures=2, cout_horaire=25)                 # 50 de main-d'œuvre
+        lot = Lot.objects.create(article=self.produit, ordre_fabrication=of, quantite=10, date_production="2026-09-01")
+        Lot.objects.filter(pk=lot.pk).update(statut="CONFORME")
+        lot.refresh_from_db()
+        lot.liberer(self.admin)
+
+        cout = CoutReel.objects.get(ordre_fabrication=of)
+        self.assertEqual((cout.cout_matiere_total, cout.cout_main_oeuvre_total), (Decimal("100.00"), Decimal("50.00")))
+        self.assertEqual(cout.cout_unitaire_reel, Decimal("15"))                   # 150 / 10 produits
+        self.assertEqual(ValorisationArticle.objects.get(article=self.produit).cout_unitaire_moyen, Decimal("15"))
+
+        facture = Facture.objects.create(commande=self.commande(statut="VALIDEE"))   # vendu 100 HT l'unité
+        facture.generer_lignes_depuis_commande()
+        daf = Utilisateur.objects.create_user("daf", password="x", profil=Profil.COMPTABILITE_DAF)
+        api = APIClient()
+        api.force_authenticate(daf)
+        r = api.get(f"/api/couts/couts-reels/{cout.id}/")
+        self.assertEqual((Decimal(r.data["marge_unitaire"]), Decimal(r.data["taux_marge"])), (Decimal("85"), Decimal("85")))
+
+
+class SeuilsControlesTests(BaseValidation):
+    def test_la_daf_regle_les_seuils(self):
+        from apps.caisse.models import Decaissement
+        from apps.comptabilite.anomalies import detecter_anomalies
+        from apps.comptabilite.models import AnomalieDetectee
+        from apps.comptes.models import JournalAction
+        from django.utils import timezone
+        from datetime import timedelta
+        daf = Utilisateur.objects.create_user("daf", password="x", profil=Profil.COMPTABILITE_DAF)
+        api = APIClient()
+        api.force_authenticate(daf)
+        seuils = {s["cle"]: s for s in api.get("/api/comptabilite/seuils-controles/").data["results"]}
+        self.assertEqual(Decimal(seuils["DELAI_DECAISSEMENT_EN_ATTENTE_JOURS"]["valeur"]), Decimal("2"))
+
+        # Une demande de décaissement d'il y a 3 jours : alerte avec 2 jours, pas avec 5.
+        session, api_caissier = self.ouvrir_caisse()
+        demande = api_caissier.post("/api/caisse/decaissements/", {"session_caisse": session.id, "montant": "10", "motif": "x"}, format="json").data["id"]
+        Decaissement.objects.filter(pk=demande).update(date_decaissement=timezone.now() - timedelta(days=3))
+        url = f"/api/comptabilite/seuils-controles/{seuils['DELAI_DECAISSEMENT_EN_ATTENTE_JOURS']['id']}/"
+        self.assertEqual(api.patch(url, {"valeur": "5"}, format="json").status_code, 200)
+        detecter_anomalies()
+        self.assertFalse(AnomalieDetectee.objects.filter(type_anomalie="DECAISSEMENT_EN_ATTENTE").exists())
+        api.patch(url, {"valeur": "2"}, format="json")
+        detecter_anomalies()
+        self.assertTrue(AnomalieDetectee.objects.filter(type_anomalie="DECAISSEMENT_EN_ATTENTE").exists())
+
+        self.assert_refus(api.patch(url, {"valeur": "2.5"}, format="json"))     # jours entiers
+        self.assert_refus(api.patch(url, {"valeur": "500"}, format="json"))     # hors bornes
+        self.assertEqual(JournalAction.objects.filter(
+            document_type="comptabilite.parametrecontrole", action__startswith="Modification", utilisateur=daf,
+        ).count(), 2)
+        responsable = Utilisateur.objects.create_user("rp", password="x", profil=Profil.RESPONSABLE_PRODUCTION)
+        api.force_authenticate(responsable)
+        self.assertEqual(api.patch(url, {"valeur": "9"}, format="json").status_code, 403)
+
+
+class JournalCompletTests(BaseValidation):
+    def test_toutes_les_actions_sont_journalisees(self):
+        from apps.comptes.models import JournalAction
+        commercial = Utilisateur.objects.create_user("com", password="x", profil=Profil.COMMERCIAL)
+        api = APIClient()
+        api.force_authenticate(commercial)
+        commande_id = api.post("/api/commercial/commandes/", {"client": self.client_evam.id, "type_commande": "COMPTANT"}, format="json").data["id"]
+        ligne_id = api.post("/api/commercial/lignes-commande/", {"commande": commande_id, "article": self.produit.id, "quantite": "2", "prix_unitaire": "100"}, format="json").data["id"]
+        api.patch(f"/api/commercial/lignes-commande/{ligne_id}/", {"quantite": "3"}, format="json")
+        api.delete(f"/api/commercial/lignes-commande/{ligne_id}/")
+
+        traces = JournalAction.objects.filter(utilisateur=commercial, document_type="commercial.lignecommande").order_by("pk")
+        self.assertEqual([t.action.split(" :")[0] for t in traces], ["Création", "Modification", "Suppression"])
+        modification = traces[1]
+        self.assertEqual((modification.ancienne_valeur, modification.nouvelle_valeur), ("Quantité : 2.000", "Quantité : 3.000"))
+        self.assertEqual(modification.requete, f"PATCH /api/commercial/lignes-commande/{ligne_id}/")
+        self.assertEqual(modification.adresse_ip, "127.0.0.1")
+        creation = JournalAction.objects.get(document_type="commercial.commande", action__startswith="Création")
+        self.assertIn("Client : ", creation.nouvelle_valeur)
+        self.assertIn("Client test", creation.nouvelle_valeur)
+        self.assertEqual(creation.module, "COMMERCIAL")
+
+    def test_connexions_et_mot_de_passe_masque(self):
+        from apps.comptes.models import JournalAction
+        Utilisateur.objects.create_user("awa", password="MotDePasse!2026", profil=Profil.CAISSIER)
+        client = APIClient()
+        self.assertEqual(client.post("/api/auth/connexion/", {"username": "awa", "password": "MotDePasse!2026"}, format="json").status_code, 200)
+        self.assertEqual(client.post("/api/auth/connexion/", {"username": "awa", "password": "faux"}, format="json").status_code, 401)
+        self.assertTrue(JournalAction.objects.filter(action="Connexion", utilisateur__username="awa").exists())
+        self.assertTrue(JournalAction.objects.filter(action="Échec de connexion", nouvelle_valeur="Identifiant : awa").exists())
+        creation = JournalAction.objects.get(document_type="comptes.utilisateur", document_id="awa", action__startswith="Création")
+        self.assertIn("(masqué)", creation.nouvelle_valeur)
+        self.assertNotIn("MotDePasse", creation.nouvelle_valeur)
+
+    def test_consultation_du_journal(self):
+        daf = Utilisateur.objects.create_user("daf", password="x", profil=Profil.COMPTABILITE_DAF, first_name="Awa", last_name="Kodia")
+        api = APIClient()
+        api.force_authenticate(daf)
+        api.post("/api/comptabilite/anomalies/detecter/")
+        self.api.post("/api/caisse/caisses/", {"nom": "Caisse Nord"}, format="json")
+        lignes = api.get("/api/comptes/journal/?document_type=caisse.caisse").data["results"]
+        self.assertEqual([(l["action"], l["utilisateur_nom"]) for l in lignes], [("Création : Caisse", "admin")])
+        _, api_caissier = self.ouvrir_caisse()
+        self.assertEqual(api_caissier.get("/api/comptes/journal/").status_code, 403)

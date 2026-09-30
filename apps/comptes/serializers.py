@@ -61,6 +61,14 @@ class UtilisateurSerializer(serializers.ModelSerializer):
 
 
 class JournalActionSerializer(serializers.ModelSerializer):
+    utilisateur_nom = serializers.SerializerMethodField()
+    module_libelle = serializers.CharField(source="get_module_display", read_only=True)
+
+    def get_utilisateur_nom(self, action):
+        if action.utilisateur is None:
+            return "Système"
+        return action.utilisateur.get_full_name() or action.utilisateur.username
+
     class Meta:
         model = models.JournalAction
         fields = "__all__"

@@ -8,6 +8,8 @@ exact, jamais un enregistrement partiel ni une erreur 500.
 from django.core.exceptions import ValidationError as DjangoValidationError
 from rest_framework import serializers
 
+from .models import Notification
+
 
 def erreur_django_vers_drf(erreur):
     """Convertit une ValidationError Django en ValidationError DRF lisible par le frontend."""
@@ -44,3 +46,23 @@ class ValidationModeleMixin:
         except DjangoValidationError as erreur:
             raise erreur_django_vers_drf(erreur)
         return attrs
+
+
+class HistoriqueSerializer(serializers.Serializer):
+    date = serializers.DateTimeField()
+    action = serializers.CharField()
+    ancien_statut = serializers.CharField()
+    nouveau_statut = serializers.CharField()
+    par = serializers.SerializerMethodField()
+
+    def get_par(self, ligne):
+        if ligne.utilisateur is None:
+            return "Système"
+        return ligne.utilisateur.get_full_name() or ligne.utilisateur.username
+
+
+class NotificationSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Notification
+        fields = ["id", "titre", "message", "type_document", "document_id", "reference", "lue", "date"]
+        read_only_fields = fields

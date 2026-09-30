@@ -42,6 +42,17 @@ class CoutStandardSerializer(ValidationModeleMixin, serializers.ModelSerializer)
 
 
 class CoutReelSerializer(ValidationModeleMixin, serializers.ModelSerializer):
+    """Coût de revient complet de l'OF et rentabilité (calculés, lecture seule)."""
+    of_numero = serializers.CharField(source="ordre_fabrication.numero", read_only=True)
+    article = serializers.CharField(source="ordre_fabrication.article.code", read_only=True)
+    quantite_produite = serializers.DecimalField(max_digits=16, decimal_places=3, read_only=True)
+    cout_total = serializers.DecimalField(max_digits=16, decimal_places=2, read_only=True)
+    cout_unitaire_reel = serializers.DecimalField(max_digits=16, decimal_places=4, read_only=True)
+    ecart_vs_standard = serializers.DecimalField(max_digits=16, decimal_places=4, read_only=True, allow_null=True)
+    prix_vente_moyen = serializers.DecimalField(max_digits=16, decimal_places=2, read_only=True, allow_null=True)
+    marge_unitaire = serializers.DecimalField(max_digits=16, decimal_places=4, read_only=True, allow_null=True)
+    taux_marge = serializers.DecimalField(max_digits=8, decimal_places=2, read_only=True, allow_null=True)
+
     class Meta:
         model = models.CoutReel
         fields = "__all__"

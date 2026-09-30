@@ -170,8 +170,41 @@ class CoutReel(models.Model):
         )
 
     @property
+    def quantite_produite(self):
+        """
+        Quantité réellement produite et bonne : somme des lots de l'OF
+        (hors lots non conformes, qui sont une perte). À défaut de lot,
+        la quantité prévue.
+        """
+        from django.db.models import Sum
+        total = self.ordre_fabrication.lots.exclude(statut="NON_CONFORME").aggregate(total=Sum("quantite"))["total"]
+        return total or self.ordre_fabrication.quantite_a_produire
+
+    @property
+    def prix_vente_moyen(self):
+        """Prix de vente HT moyen de l'article facturé (factures non annulées), ou None."""
+        from django.db.models import Sum
+        from apps.commercial.models import LigneFacture
+        totaux = LigneFacture.objects.filter(
+            article=self.ordre_fabrication.article,
+        ).exclude(facture__statut="ANNULEE").aggregate(ht=Sum("montant_ht"), quantite=Sum("quantite"))
+        if not totaux["quantite"]:
+            return None
+        return totaux["ht"] / totaux["quantite"]
+
+    @property
+    def marge_unitaire(self):
+        prix = self.prix_vente_moyen
+        return None if prix is None else prix - self.cout_unitaire_reel
+
+    @property
+    def taux_marge(self):
+        prix = self.prix_vente_moyen
+        return None if not prix else round(self.marge_unitaire / prix * 100, 2)
+
+    @property
     def cout_unitaire_reel(self):
-        quantite = self.ordre_fabrication.quantite_a_produire
+        quantite = self.quantite_produite
         return self.cout_total / quantite if quantite else 0
 
     @property
@@ -211,27 +244,19 @@ class CoutReel(models.Model):
 
         of = self.ordre_fabrication
 
-        # 1. Coût matières = (sorties - retours) x dernier coût unitaire connu
+        # 1. Coût matières = valeur RÉELLE des sorties matières de l'OF
+        #    (au CMUP du jour de la sortie) - valeur des retours magasin.
+        #    Mouvements anciens sans valeur : dernier coût matière connu.
+        from apps.stocks.models import MouvementStock
         cout_matieres = 0
-        matieres_utilisees = (
-            SortieMatiere.objects.filter(ordre_fabrication=of)
-            .values_list("matiere", flat=True).distinct()
-        )
-        for matiere_id in matieres_utilisees:
-            total_sorti = SortieMatiere.objects.filter(
-                ordre_fabrication=of, matiere_id=matiere_id
-            ).aggregate(total=Sum("quantite_sortie"))["total"] or 0
-            total_retourne = RetourMatiere.objects.filter(
-                ordre_fabrication=of, matiere_id=matiere_id
-            ).aggregate(total=Sum("quantite_retournee"))["total"] or 0
-            consommation_nette = total_sorti - total_retourne
-
-            dernier_cout = (
-                CoutMatiere.objects.filter(article_id=matiere_id)
-                .order_by("-date_valorisation").first()
-            )
-            if dernier_cout:
-                cout_matieres += consommation_nette * dernier_cout.cout_unitaire
+        for mouvement in MouvementStock.objects.filter(
+            document_origine=of.numero, type_mouvement__in=["SORTIE", "RETOUR"],
+        ):
+            valeur = mouvement.valeur
+            if valeur is None:
+                dernier = CoutMatiere.objects.filter(article_id=mouvement.article_id).order_by("-date_valorisation").first()
+                valeur = mouvement.quantite * dernier.cout_unitaire if dernier else 0
+            cout_matieres += valeur if mouvement.type_mouvement == "SORTIE" else -valeur
 
         # 2. Coût main-d'œuvre = somme des lignes liées à l'OF
         cout_main_oeuvre = sum(

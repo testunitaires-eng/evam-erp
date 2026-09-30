@@ -109,18 +109,14 @@ class AutorisateurSerializer(serializers.ModelSerializer):
 
 
 class DecaissementSerializer(ValidationModeleMixin, serializers.ModelSerializer):
-    # Liste de choix limitée à la Direction et à la Comptabilité/DAF (comptes actifs).
-    autorise_par = serializers.PrimaryKeyRelatedField(
-        queryset=Utilisateur.objects.filter(
-            profil__in=models.PROFILS_AUTORISANT_DECAISSEMENT, is_active=True,
-        ),
-        error_messages={"does_not_exist": (
-            "Choisissez une personne de la Direction ou de la Comptabilité/DAF "
-            "(liste : /api/caisse/decaissements/autorisateurs/)."
-        )},
-    )
+    """
+    Le caissier crée la DEMANDE (session, montant, motif, bénéficiaire).
+    Statut, autorisation et sortie d'argent passent uniquement par les
+    actions /autoriser/, /refuser/ et /effectuer/.
+    """
     autorise_par_nom = serializers.SerializerMethodField()
     effectue_par_nom = serializers.SerializerMethodField()
+    caisse_nom = serializers.CharField(source="session_caisse.caisse.nom", read_only=True)
 
     def get_autorise_par_nom(self, decaissement):
         return models.nom_utilisateur(decaissement.autorise_par)
@@ -132,14 +128,11 @@ class DecaissementSerializer(ValidationModeleMixin, serializers.ModelSerializer)
         model = models.Decaissement
         fields = "__all__"
         extra_kwargs = {"effectue_par": {"required": False}}
-        read_only_fields = ["effectue_par"]
+        read_only_fields = [
+            "effectue_par", "statut", "autorise_par", "date_autorisation", "motif_refus", "date_execution",
+        ]
 
     def validate(self, attrs):
-        utilisateur = self.context["request"].user
-        attrs["effectue_par"] = utilisateur
-        attrs = super().validate(attrs)
-        if attrs.get("autorise_par") and attrs["autorise_par"].id == utilisateur.id:
-            raise serializers.ValidationError({"autorise_par": (
-                "Le décaissement doit être autorisé par une autre personne que celle qui l'effectue."
-            )})
-        return attrs
+        if self.instance is None:
+            attrs["effectue_par"] = self.context["request"].user
+        return super().validate(attrs)

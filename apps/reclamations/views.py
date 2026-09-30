@@ -16,11 +16,12 @@ Répartition des droits fidèle au croquis :
 """
 
 from rest_framework import viewsets
+from apps.core.views import HistoriqueMixin
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from apps.core.validation import METHODES_CREATION_LECTURE
 from . import models, serializers
-from apps.comptes.permissions import role_required, lecture_seule_pour
+from apps.comptes.permissions import role_required, lecture_seule_pour, acces
 from apps.comptes.models import Profil
 
 PROFILS_RECLAMATION = (Profil.RESPONSABLE_DISTRIBUTION, Profil.COMMERCIAL, Profil.ADMIN_SI)
@@ -28,7 +29,7 @@ PROFILS_STOCK_QUALITE = (Profil.MAGASINIER, Profil.RESPONSABLE_QUALITE, Profil.A
 PROFILS_RECONDITIONNEMENT = (Profil.RESPONSABLE_PRODUCTION, Profil.AGENT_PRODUCTION, Profil.MAGASINIER, Profil.ADMIN_SI)
 
 
-class ReclamationClientViewSet(viewsets.ModelViewSet):
+class ReclamationClientViewSet(HistoriqueMixin, viewsets.ModelViewSet):
     queryset = models.ReclamationClient.objects.all()
     serializer_class = serializers.ReclamationClientSerializer
     permission_classes = [role_required(*PROFILS_RECLAMATION)]
@@ -39,7 +40,7 @@ class ReclamationClientViewSet(viewsets.ModelViewSet):
         serializer.save(cree_par=self.request.user)
 
 
-class RetourPhysiqueViewSet(viewsets.ModelViewSet):
+class RetourPhysiqueViewSet(HistoriqueMixin, viewsets.ModelViewSet):
     queryset = models.RetourPhysique.objects.all()
     serializer_class = serializers.RetourPhysiqueSerializer
     permission_classes = [role_required(*PROFILS_STOCK_QUALITE)]
@@ -68,7 +69,7 @@ class ControleRetourViewSet(viewsets.ModelViewSet):
         serializer.save(controle_par=self.request.user)
 
 
-class ReconditionnementViewSet(viewsets.ModelViewSet):
+class ReconditionnementViewSet(HistoriqueMixin, viewsets.ModelViewSet):
     queryset = models.Reconditionnement.objects.all()
     serializer_class = serializers.ReconditionnementSerializer
     permission_classes = [role_required(*PROFILS_RECONDITIONNEMENT)]
@@ -101,7 +102,10 @@ class CoutRetourPerteViewSet(viewsets.ModelViewSet):
     """
     queryset = models.CoutRetourPerte.objects.all()
     serializer_class = serializers.CoutRetourPerteSerializer
-    permission_classes = [lecture_seule_pour(Profil.COMPTABILITE_DAF, Profil.ADMIN_SI)]
+    permission_classes = [acces(
+        lecture=(Profil.DIRECTION,),
+        ecriture=(Profil.COMPTABILITE_DAF, Profil.ADMIN_SI,),
+    )]
     filterset_fields = ["reclamation"]
 
 

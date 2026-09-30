@@ -7,17 +7,21 @@ ce qui est vendable/sortable) mais jamais modifier leur statut.
 """
 
 from rest_framework import viewsets
+from apps.core.views import HistoriqueMixin
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from . import models, serializers
-from apps.comptes.permissions import role_required, lecture_seule_pour
+from apps.comptes.permissions import role_required, lecture_seule_pour, acces
 from apps.comptes.models import Profil
 
 
-class LotViewSet(viewsets.ModelViewSet):
+class LotViewSet(HistoriqueMixin, viewsets.ModelViewSet):
     queryset = models.Lot.objects.all()
     serializer_class = serializers.LotSerializer
-    permission_classes = [lecture_seule_pour(Profil.RESPONSABLE_QUALITE, Profil.ADMIN_SI)]
+    permission_classes = [acces(
+        lecture=(Profil.DIRECTION, Profil.RESPONSABLE_PRODUCTION,),
+        ecriture=(Profil.RESPONSABLE_QUALITE, Profil.ADMIN_SI,),
+    )]
     filterset_fields = ["article", "statut", "ordre_fabrication"]
     search_fields = ["numero_lot"]
 
@@ -53,7 +57,10 @@ class LotViewSet(viewsets.ModelViewSet):
 class ControleQualiteViewSet(viewsets.ModelViewSet):
     queryset = models.ControleQualite.objects.all()
     serializer_class = serializers.ControleQualiteSerializer
-    permission_classes = [role_required(Profil.RESPONSABLE_QUALITE, Profil.ADMIN_SI)]
+    permission_classes = [acces(
+        lecture=(Profil.DIRECTION, Profil.RESPONSABLE_PRODUCTION,),
+        ecriture=(Profil.RESPONSABLE_QUALITE, Profil.ADMIN_SI,),
+    )]
     filterset_fields = ["lot", "resultat"]
 
     def perform_create(self, serializer):

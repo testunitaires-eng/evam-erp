@@ -62,6 +62,20 @@ Sérialiseurs DRF du module production.
 
 from rest_framework import serializers
 from apps.core.serializers import ValidationModeleMixin
+
+
+def nom_utilisateur(utilisateur):
+    """Nom lisible (nom complet, sinon identifiant) : évite d'afficher « #12 »."""
+    if utilisateur is None:
+        return None
+    return utilisateur.get_full_name() or utilisateur.username
+
+
+class SaisiParMixin(serializers.Serializer):
+    saisi_par_nom = serializers.SerializerMethodField()
+
+    def get_saisi_par_nom(self, instance):
+        return nom_utilisateur(instance.saisi_par)
 from . import models
 
 class PlanProductionSerializer(ValidationModeleMixin, serializers.ModelSerializer):
@@ -88,6 +102,19 @@ class OrdreFabricationSerializer(ValidationModeleMixin, serializers.ModelSeriali
             "responsable", "statut", "motif_annulation", "date_debut_production", "date_fin",
         ]
 
+    agents_affectes_noms = serializers.SerializerMethodField()
+
+    def get_agents_affectes_noms(self, of):
+        return [nom_utilisateur(agent) for agent in of.agents_affectes.all()]
+
+    def validate_agents_affectes(self, agents):
+        from django.core.exceptions import ValidationError as DjangoValidationError
+        try:
+            models.OrdreFabrication.verifier_agents(agents)
+        except DjangoValidationError as erreur:
+            raise serializers.ValidationError(erreur.message_dict["agents_affectes"])
+        return agents
+
 
 class BesoinMatierePrevuSerializer(ValidationModeleMixin, serializers.ModelSerializer):
     class Meta:
@@ -96,6 +123,14 @@ class BesoinMatierePrevuSerializer(ValidationModeleMixin, serializers.ModelSeria
 
 
 class DemandeMatiereSerializer(ValidationModeleMixin, serializers.ModelSerializer):
+    of_numero = serializers.CharField(source="ordre_fabrication.numero", read_only=True)
+    matiere_code = serializers.CharField(source="matiere.code", read_only=True)
+    matiere_designation = serializers.CharField(source="matiere.designation", read_only=True)
+    demandeur_nom = serializers.SerializerMethodField()
+
+    def get_demandeur_nom(self, demande):
+        return nom_utilisateur(demande.demandeur)
+
     class Meta:
         model = models.DemandeMatiere
         fields = "__all__"
@@ -115,6 +150,14 @@ class DemandeMatiereSerializer(ValidationModeleMixin, serializers.ModelSerialize
 
 
 class DemandeComplementaireSerializer(ValidationModeleMixin, serializers.ModelSerializer):
+    of_numero = serializers.CharField(source="ordre_fabrication.numero", read_only=True)
+    matiere_code = serializers.CharField(source="matiere.code", read_only=True)
+    matiere_designation = serializers.CharField(source="matiere.designation", read_only=True)
+    demandeur_nom = serializers.SerializerMethodField()
+
+    def get_demandeur_nom(self, demande):
+        return nom_utilisateur(demande.demandeur)
+
     class Meta:
         model = models.DemandeComplementaire
         fields = "__all__"
@@ -135,16 +178,18 @@ class RetourMatiereSerializer(ValidationModeleMixin, serializers.ModelSerializer
         fields = "__all__"
 
 
-class SuiviProductionSerializer(ValidationModeleMixin, serializers.ModelSerializer):
+class SuiviProductionSerializer(ValidationModeleMixin, SaisiParMixin, serializers.ModelSerializer):
     class Meta:
         model = models.SuiviProduction
         fields = "__all__"
+        read_only_fields = ["saisi_par"]
 
 
-class SuiviEauSerializer(ValidationModeleMixin, serializers.ModelSerializer):
+class SuiviEauSerializer(ValidationModeleMixin, SaisiParMixin, serializers.ModelSerializer):
     class Meta:
         model = models.SuiviEau
         fields = "__all__"
+        read_only_fields = ["saisi_par"]
 
 
 class EtapeProductionSerializer(ValidationModeleMixin, serializers.ModelSerializer):
@@ -154,8 +199,14 @@ class EtapeProductionSerializer(ValidationModeleMixin, serializers.ModelSerializ
         extra_kwargs = {"agent": {"required": False}}
         read_only_fields = ["agent"]
 
+    agent_nom = serializers.SerializerMethodField()
 
-class PerteProductionSerializer(ValidationModeleMixin, serializers.ModelSerializer):
+    def get_agent_nom(self, etape):
+        return nom_utilisateur(etape.agent)
+
+
+class PerteProductionSerializer(ValidationModeleMixin, SaisiParMixin, serializers.ModelSerializer):
     class Meta:
         model = models.PerteProduction
         fields = "__all__"
+        read_only_fields = ["saisi_par"]

@@ -218,6 +218,8 @@ class CommandeSerializer(ValidationModeleMixin, serializers.ModelSerializer):
     Client bloqué, encours dépassé, workflow de statut, commande sans
     ligne... : voir Commande.clean().
     """
+    client_nom = serializers.CharField(source="client.nom", read_only=True)
+    montant_total = serializers.DecimalField(max_digits=16, decimal_places=2, read_only=True)
     class Meta:
         model = models.Commande
         fields = "__all__"
@@ -226,10 +228,23 @@ class CommandeSerializer(ValidationModeleMixin, serializers.ModelSerializer):
 
 
 class LigneCommandeSerializer(ValidationModeleMixin, serializers.ModelSerializer):
-    """Encours, commande figée, quantité/prix positifs : voir LigneCommande.clean()."""
+    """
+    Encours, commande figée, quantité/prix positifs : voir LigneCommande.clean().
+    stock_disponible : information (non bloquante) sur le stock produits
+    finis disponible, affichée à la saisie de la ligne.
+    """
+    article_code = serializers.CharField(source="article.code", read_only=True)
+    article_designation = serializers.CharField(source="article.designation", read_only=True)
+    stock_disponible = serializers.SerializerMethodField()
+
     class Meta:
         model = models.LigneCommande
         fields = "__all__"
+
+    def get_stock_disponible(self, ligne):
+        from apps.stocks.models import StockArticle
+        stock = StockArticle.objects.filter(article=ligne.article, depot__nom="Dépôt produits finis").first()
+        return stock.quantite_disponible if stock else 0
 
 
 class FactureSerializer(ValidationModeleMixin, serializers.ModelSerializer):
@@ -245,6 +260,10 @@ class FactureSerializer(ValidationModeleMixin, serializers.ModelSerializer):
         extra_kwargs = {"client": {"required": False}}
         read_only_fields = ["montant_ht_total", "montant_taxes_total", "montant_total"]
 
+    client_nom = serializers.CharField(source="client.nom", read_only=True)
+    commande_numero = serializers.CharField(source="commande.numero", read_only=True)
+    solde_restant = serializers.DecimalField(max_digits=16, decimal_places=2, read_only=True)
+
     def validate_statut(self, valeur):
         actuel = self.instance.statut if self.instance is not None else models.StatutFacture.EMISE
         if valeur != actuel and valeur != models.StatutFacture.ANNULEE:
@@ -256,6 +275,9 @@ class FactureSerializer(ValidationModeleMixin, serializers.ModelSerializer):
 
 
 class LigneFactureSerializer(serializers.ModelSerializer):
+    article_code = serializers.CharField(source="article.code", read_only=True)
+    article_designation = serializers.CharField(source="article.designation", read_only=True)
+
     class Meta:
         model = models.LigneFacture
         fields = "__all__"

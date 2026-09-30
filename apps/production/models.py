@@ -1092,6 +1092,22 @@ class SaisieSurOFMixin:
                 f"L'OF {of.numero} est {of.get_statut_display().lower()} : plus aucune saisie n'est possible."
             )})
 
+    def controler_of_en_production(self):
+        """
+        Saisies du RÉEL (suivi, étapes, suivi eau, pertes) : l'OF doit
+        avoir démarré. Rien avant « En production » (on ne constate pas
+        une production qui n'a pas commencé) ; corrections possibles
+        jusqu'au contrôle, puis figé à la clôture.
+        """
+        self.controler_of()
+        if self.ordre_fabrication_id:
+            of = self.ordre_fabrication
+            if of.statut not in STATUTS_SAISIE_REELLE:
+                raise ValidationError({"ordre_fabrication": (
+                    f"L'OF {of.numero} est « {of.get_statut_display()} » : la production n'a pas "
+                    "encore démarré, aucune saisie du réel n'est possible."
+                )})
+
     def verifier_suppression(self):
         of = self.ordre_fabrication
         if of.est_verrouille:
@@ -1162,7 +1178,7 @@ class PlanProduction(ValidationAvantEnregistrement, models.Model):
             raise ValidationError({"statut": "Une prévision passe à « Convertie » uniquement via l'action de conversion en OF."})
 
     @transaction.atomic
-    def convertir_en_of(self, responsable):
+    def convertir_en_of(self, responsable, agents=None):
         """
         Transforme la prévision en Ordre de Fabrication réel (§5.3 :
         "Le responsable pourra ensuite convertir la prévision en OF").
@@ -1178,6 +1194,8 @@ class PlanProduction(ValidationAvantEnregistrement, models.Model):
             plan_production=self, article=self.article,
             quantite_a_produire=self.quantite_prevue, responsable=responsable,
         )
+        if agents:
+            of.affecter_agents(agents, par=responsable)
         self.statut = StatutPlanProduction.CONVERTIE
         self.save()
         return of
@@ -1202,6 +1220,9 @@ class StatutOF(models.TextChoices):
 
 
 # Ordre officiel du workflow normal (hors ANNULE, qui est une branche à part)
+# Statuts où l'on peut saisir le réel de production (voir SaisieSurOFMixin).
+STATUTS_SAISIE_REELLE = ("EN_PRODUCTION", "PRODUCTION_TERMINEE", "EN_CONTROLE")
+
 ORDRE_STATUTS_OF = [
     StatutOF.BROUILLON, StatutOF.A_PREPARER, StatutOF.MATIERES_EN_PREPARATION,
     StatutOF.PRET, StatutOF.EN_PRODUCTION, StatutOF.PRODUCTION_TERMINEE,
@@ -1359,6 +1380,13 @@ class OrdreFabrication(ValidationAvantEnregistrement, models.Model):
 
         self.statut = nouveau_statut
         self.save()
+        if nouveau_statut == StatutOF.PRODUCTION_TERMINEE:
+            from apps.comptabilite.anomalies import controler_consommation_of
+            controler_consommation_of(self)
+        if nouveau_statut == StatutOF.CLOTURE:
+            from apps.couts.models import CoutReel
+            cout_reel, _ = CoutReel.objects.get_or_create(ordre_fabrication=self)
+            cout_reel.calculer()
         return self.statut
 
     def annuler(self, motif):
@@ -1399,6 +1427,39 @@ class OrdreFabrication(ValidationAvantEnregistrement, models.Model):
                 defaults={
                     "quantite_theorique": ligne.quantite_necessaire * self.quantite_a_produire
                 },
+            )
+
+    @staticmethod
+    def verifier_agents(agents):
+        """Seuls des comptes Agent Production actifs peuvent être affectés à un OF."""
+        invalides = [
+            agent.username for agent in agents
+            if agent.profil != "AGENT_PRODUCTION" or not agent.is_active
+        ]
+        if invalides:
+            raise ValidationError({"agents_affectes": (
+                "Seuls des comptes Agent Production actifs peuvent être affectés : " + ", ".join(invalides) + "."
+            )})
+
+    @transaction.atomic
+    def affecter_agents(self, agents, par):
+        """
+        Le Responsable Production définit les agents autorisés sur l'OF
+        (remplace la liste). Tracé dans le journal des actions : qui,
+        quand, agents ajoutés / retirés (journal automatique).
+        """
+        if self.est_verrouille:
+            raise ValidationError(f"L'OF {self.numero} est {self.get_statut_display().lower()} : l'affectation est figée.")
+        agents = list(agents)
+        self.verifier_agents(agents)
+        avant = set(self.agents_affectes.values_list("username", flat=True))
+        nouveaux = [agent for agent in agents if agent.username not in avant]
+        self.agents_affectes.set(agents)   # ajouts / retraits tracés par le journal automatique
+        if nouveaux:
+            from apps.core.notifications import notifier
+            notifier(
+                "Vous êtes affecté à un OF", f"{self.numero} - {self.article.designation} x {self.quantite_a_produire}",
+                document=self, utilisateurs=nouveaux,
             )
 
     @transaction.atomic
@@ -1692,6 +1753,11 @@ class DemandeComplementaire(ValidationAvantEnregistrement, models.Model):
             raise ValidationError({"motif": "Le motif est obligatoire pour une demande complémentaire."})
         if self.ordre_fabrication_id and self.ordre_fabrication.est_verrouille:
             raise ValidationError({"ordre_fabrication": "Cet OF est clôturé ou annulé : aucune demande complémentaire possible."})
+        if self.pk is None and self.ordre_fabrication_id and self.ordre_fabrication.statut != StatutOF.EN_PRODUCTION:
+            raise ValidationError({"ordre_fabrication": (
+                "Une demande complémentaire se fait pendant la production (§5.7) : "
+                f"l'OF {self.ordre_fabrication.numero} est « {self.ordre_fabrication.get_statut_display()} »."
+            )})
         ancien_statut = valeur_en_base(self, "statut")
         if ancien_statut not in (None, StatutDemandeComplementaire.EN_ATTENTE):
             raise ValidationError("Cette demande a déjà été traitée : elle ne peut plus être modifiée.")
@@ -1907,6 +1973,11 @@ class SuiviProduction(SaisieSurOFMixin, ValidationAvantEnregistrement, models.Mo
     arrets = models.TextField("Arrêts", blank=True, help_text="Ex : 'Arrêt 15 min réglage'")
     incidents = models.TextField("Incidents", blank=True)
     observations = models.TextField("Observations", blank=True)
+    saisi_par = models.ForeignKey(
+        Utilisateur, verbose_name="Saisi par", on_delete=models.PROTECT,
+        null=True, blank=True, related_name="suivis_production_saisis",
+        help_text="Traçabilité : renseigné automatiquement avec l'utilisateur connecté.",
+    )
 
     class Meta:
         verbose_name = "Suivi de production"
@@ -1917,7 +1988,7 @@ class SuiviProduction(SaisieSurOFMixin, ValidationAvantEnregistrement, models.Mo
         return f"{self.ordre_fabrication.numero} - {self.date} {self.heure_debut}"
 
     def clean(self):
-        self.controler_of()
+        self.controler_of_en_production()
         exiger_positif(self.quantite_entree, "quantite_entree", "La quantité entrée", strict=False)
         exiger_positif_optionnel(self.quantite_produite, "quantite_produite", "La quantité produite")
         exiger_positif_optionnel(self.quantite_conforme, "quantite_conforme", "La quantité conforme")
@@ -1950,6 +2021,11 @@ class SuiviEau(SaisieSurOFMixin, ValidationAvantEnregistrement, models.Model):
     bouteilles_conformes = models.PositiveIntegerField("Bouteilles conformes")
     bouteilles_rejetees = models.PositiveIntegerField("Bouteilles rejetées", default=0)
     nombre_packs = models.PositiveIntegerField("Nombre de packs", null=True, blank=True)
+    saisi_par = models.ForeignKey(
+        Utilisateur, verbose_name="Saisi par", on_delete=models.PROTECT,
+        null=True, blank=True, related_name="suivis_eau_saisis",
+        help_text="Traçabilité : renseigné automatiquement avec l'utilisateur connecté.",
+    )
 
     class Meta:
         verbose_name = "Suivi de l'eau"
@@ -1960,7 +2036,7 @@ class SuiviEau(SaisieSurOFMixin, ValidationAvantEnregistrement, models.Model):
 
     def clean(self):
         """Chaque étape du flux ne peut pas recevoir plus d'eau que l'étape précédente n'en a fourni (§5.9)."""
-        self.controler_of()
+        self.controler_of_en_production()
         exiger_positif(self.volume_capte_l, "volume_capte_l", "Le volume capté", strict=False)
         exiger_positif_optionnel(self.volume_envoye_traitement_l, "volume_envoye_traitement_l", "Le volume envoyé au traitement")
         exiger_positif(self.volume_obtenu_traitement_l, "volume_obtenu_traitement_l", "Le volume obtenu après traitement", strict=False)
@@ -2036,7 +2112,7 @@ class EtapeProduction(SaisieSurOFMixin, ValidationAvantEnregistrement, models.Mo
         return f"{self.ordre_fabrication.numero} - {self.get_etape_display()}"
 
     def clean(self):
-        self.controler_of()
+        self.controler_of_en_production()
         exiger_positif_optionnel(self.quantite_produite, "quantite_produite", "La quantité produite")
         exiger_ordre_dates(self.date_debut, self.date_fin, "date_fin", "le début", "La fin")
 
@@ -2072,6 +2148,11 @@ class PerteProduction(SaisieSurOFMixin, ValidationAvantEnregistrement, models.Mo
     )
     motif = models.CharField("Motif", max_length=30, choices=MotifPerte.choices)
     observations = models.TextField("Observations", blank=True)
+    saisi_par = models.ForeignKey(
+        Utilisateur, verbose_name="Saisi par", on_delete=models.PROTECT,
+        null=True, blank=True, related_name="pertes_saisies",
+        help_text="Traçabilité : renseigné automatiquement avec l'utilisateur connecté.",
+    )
     date_constat = models.DateTimeField("Date du constat", auto_now_add=True)
 
     class Meta:
@@ -2082,7 +2163,7 @@ class PerteProduction(SaisieSurOFMixin, ValidationAvantEnregistrement, models.Mo
         return f"Perte {self.quantite_perte} sur {self.ordre_fabrication.numero} ({self.get_motif_display()})"
 
     def clean(self):
-        self.controler_of()
+        self.controler_of_en_production()
         exiger_positif(self.quantite_perte, "quantite_perte", "La quantité perdue")
         exiger_pourcentage(self.taux_perte, "taux_perte", "Le taux de perte")
         if self.etape_id and self.ordre_fabrication_id and self.etape.ordre_fabrication_id != self.ordre_fabrication_id:

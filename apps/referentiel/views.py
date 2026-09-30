@@ -8,10 +8,11 @@ seule sur ce module.
 """
 
 from rest_framework import viewsets
+from apps.core.views import HistoriqueMixin
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from . import models, serializers
-from apps.comptes.permissions import role_required, lecture_seule_pour
+from apps.comptes.permissions import role_required, lecture_seule_pour, acces
 from apps.comptes.models import Profil
 
 
@@ -25,7 +26,10 @@ from apps.comptes.models import Profil
 class ArticleViewSet(viewsets.ModelViewSet):
     queryset = models.Article.objects.all()
     serializer_class = serializers.ArticleSerializer
-    permission_classes = [lecture_seule_pour(Profil.RESPONSABLE_PRODUCTION, Profil.RESPONSABLE_ACHATS, Profil.ADMIN_SI)]
+    permission_classes = [acces(
+        lecture=(Profil.DIRECTION, Profil.RESPONSABLE_QUALITE, Profil.MAGASINIER, Profil.COMMERCIAL, Profil.COMPTABILITE_DAF,),
+        ecriture=(Profil.RESPONSABLE_PRODUCTION, Profil.RESPONSABLE_ACHATS, Profil.ADMIN_SI,),
+    )]
     filterset_fields = ["type_article", "famille", "actif"]
     search_fields = ["code", "designation"]
 
@@ -67,7 +71,7 @@ class ArticleViewSet(viewsets.ModelViewSet):
 #     filterset_fields = ["article", "statut"]
 
 
-class FicheTechniqueViewSet(viewsets.ModelViewSet):
+class FicheTechniqueViewSet(HistoriqueMixin, viewsets.ModelViewSet):
     """
     Paramétrage des fiches de composition : réservé à l'ADMIN_SI
     (création de version, validation, archivage). Lecture pour tous
@@ -75,7 +79,10 @@ class FicheTechniqueViewSet(viewsets.ModelViewSet):
     """
     queryset = models.FicheTechnique.objects.all()
     serializer_class = serializers.FicheTechniqueSerializer
-    permission_classes = [lecture_seule_pour(Profil.ADMIN_SI)]
+    permission_classes = [acces(
+        lecture=(Profil.RESPONSABLE_PRODUCTION,),
+        ecriture=(Profil.ADMIN_SI,),
+    )]
     filterset_fields = ["article", "statut"]
     def perform_create(self, serializer):
         serializer.save(cree_par=self.request.user)
@@ -125,7 +132,10 @@ class CompositionFicheTechniqueViewSet(viewsets.ModelViewSet):
     """Lignes de composition (matières et quantités par unité produite) : écriture ADMIN_SI uniquement."""
     queryset = models.CompositionFicheTechnique.objects.all()
     serializer_class = serializers.CompositionFicheTechniqueSerializer
-    permission_classes = [lecture_seule_pour(Profil.ADMIN_SI)]
+    permission_classes = [acces(
+        lecture=(Profil.RESPONSABLE_PRODUCTION,),
+        ecriture=(Profil.ADMIN_SI,),
+    )]
     filterset_fields = ["fiche_technique", "matiere"]
 
 
@@ -153,7 +163,10 @@ class FamilleArticleViewSet(viewsets.ModelViewSet):
     """Liste déroulante des familles - écriture Production/Achat/Admin, lecture ouverte à tous."""
     queryset = models.FamilleArticle.objects.all()
     serializer_class = serializers.FamilleArticleSerializer
-    permission_classes = [lecture_seule_pour(Profil.RESPONSABLE_PRODUCTION, Profil.RESPONSABLE_ACHATS, Profil.ADMIN_SI)]
+    permission_classes = [acces(
+        lecture=(Profil.DIRECTION, Profil.RESPONSABLE_QUALITE, Profil.MAGASINIER, Profil.COMMERCIAL, Profil.COMPTABILITE_DAF,),
+        ecriture=(Profil.RESPONSABLE_PRODUCTION, Profil.RESPONSABLE_ACHATS, Profil.ADMIN_SI,),
+    )]
     filterset_fields = ["actif"]
     search_fields = ["nom"]
 
@@ -162,7 +175,10 @@ class FormatArticleViewSet(viewsets.ModelViewSet):
     """Liste déroulante des formats."""
     queryset = models.FormatArticle.objects.all()
     serializer_class = serializers.FormatArticleSerializer
-    permission_classes = [lecture_seule_pour(Profil.RESPONSABLE_PRODUCTION, Profil.RESPONSABLE_ACHATS, Profil.ADMIN_SI)]
+    permission_classes = [acces(
+        lecture=(Profil.DIRECTION, Profil.RESPONSABLE_QUALITE, Profil.MAGASINIER, Profil.COMMERCIAL, Profil.COMPTABILITE_DAF,),
+        ecriture=(Profil.RESPONSABLE_PRODUCTION, Profil.RESPONSABLE_ACHATS, Profil.ADMIN_SI,),
+    )]
     filterset_fields = ["actif"]
     search_fields = ["valeur"]
 
@@ -171,7 +187,10 @@ class ParfumViewSet(viewsets.ModelViewSet):
     """Liste déroulante des parfums/variantes."""
     queryset = models.Parfum.objects.all()
     serializer_class = serializers.ParfumSerializer
-    permission_classes = [lecture_seule_pour(Profil.RESPONSABLE_PRODUCTION, Profil.RESPONSABLE_ACHATS, Profil.ADMIN_SI)]
+    permission_classes = [acces(
+        lecture=(Profil.DIRECTION, Profil.RESPONSABLE_QUALITE, Profil.MAGASINIER, Profil.COMMERCIAL, Profil.COMPTABILITE_DAF,),
+        ecriture=(Profil.RESPONSABLE_PRODUCTION, Profil.RESPONSABLE_ACHATS, Profil.ADMIN_SI,),
+    )]
     filterset_fields = ["actif"]
     search_fields = ["nom"]
 
@@ -180,6 +199,9 @@ class UniteVenteArticleViewSet(viewsets.ModelViewSet):
     """Liste déroulante des unités de vente."""
     queryset = models.UniteVenteArticle.objects.all()
     serializer_class = serializers.UniteVenteArticleSerializer
-    permission_classes = [lecture_seule_pour(Profil.RESPONSABLE_PRODUCTION, Profil.RESPONSABLE_ACHATS, Profil.ADMIN_SI)]
+    permission_classes = [acces(
+        lecture=(Profil.DIRECTION, Profil.RESPONSABLE_QUALITE, Profil.MAGASINIER, Profil.COMMERCIAL, Profil.COMPTABILITE_DAF,),
+        ecriture=(Profil.RESPONSABLE_PRODUCTION, Profil.RESPONSABLE_ACHATS, Profil.ADMIN_SI,),
+    )]
     filterset_fields = ["actif"]
     search_fields = ["nom"]

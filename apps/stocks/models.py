@@ -328,6 +328,12 @@ class MouvementStock(models.Model):
         "Type de mouvement", max_length=20, choices=TypeMouvement.choices
     )
     quantite = models.DecimalField("Quantité", max_digits=14, decimal_places=3)
+    cout_unitaire = models.DecimalField(
+        "Coût unitaire", max_digits=14, decimal_places=4, null=True, blank=True,
+        help_text="Entrée : coût réel (prix d'achat, coût de revient de l'OF) ou, à défaut, coût moyen. "
+                  "Sortie : toujours le coût moyen pondéré (CMUP) du moment.",
+    )
+    valeur = models.DecimalField("Valeur", max_digits=16, decimal_places=2, null=True, blank=True, editable=False)
     motif = models.CharField("Motif", max_length=255, blank=True)
     document_origine = models.CharField(
         "Document d'origine", max_length=100, blank=True,
@@ -395,7 +401,8 @@ class MouvementStock(models.Model):
 
     def save(self, *args, **kwargs):
         with transaction.atomic():
-            if self._state.adding and self.article_id and self.depot_id:
+            creation = self._state.adding
+            if creation and self.article_id and self.depot_id:
                 # Verrouille la ligne de stock pendant le contrôle de
                 # disponibilité (deux sorties simultanées ne peuvent pas
                 # consommer deux fois le même stock).
@@ -405,7 +412,74 @@ class MouvementStock(models.Model):
             self.clean()
             if not self.numero:
                 self.numero = generer_numero("MVT")
+            if creation:
+                self._valoriser()
             super().save(*args, **kwargs)
+
+    def _valoriser(self):
+        """
+        Coût moyen unitaire pondéré (CMUP), calculé par article tous dépôts
+        confondus :
+        - ENTREE / RETOUR / AJUSTEMENT positif : au coût fourni (achat,
+          coût de revient...) ou, à défaut, au coût de référence ; le CMUP
+          est recalculé : (stock x CMUP + quantité x coût) / (stock + quantité) ;
+        - SORTIE / AJUSTEMENT négatif : au CMUP du moment (inchangé).
+        """
+        from decimal import Decimal
+        from django.db.models import Sum
+        valorisation, _ = ValorisationArticle.objects.select_for_update().get_or_create(
+            article_id=self.article_id, defaults={"cout_unitaire_moyen": cout_de_reference(self.article)},
+        )
+        entree = self.type_mouvement in (TypeMouvement.ENTREE, TypeMouvement.RETOUR) or (
+            self.type_mouvement == TypeMouvement.AJUSTEMENT and self.quantite > 0
+        )
+        if entree:
+            if self.cout_unitaire is None:
+                self.cout_unitaire = valorisation.cout_unitaire_moyen or cout_de_reference(self.article)
+            stock_avant = StockArticle.objects.filter(article_id=self.article_id).aggregate(
+                total=Sum("quantite_physique"),
+            )["total"] or Decimal("0")
+            stock_apres = stock_avant + self.quantite
+            if stock_avant > 0 and stock_apres > 0:
+                valorisation.cout_unitaire_moyen = (
+                    stock_avant * valorisation.cout_unitaire_moyen + self.quantite * Decimal(self.cout_unitaire)
+                ) / stock_apres
+            else:
+                valorisation.cout_unitaire_moyen = Decimal(self.cout_unitaire)
+            valorisation.save()
+        else:
+            self.cout_unitaire = valorisation.cout_unitaire_moyen
+        self.valeur = (Decimal(self.quantite) * Decimal(self.cout_unitaire)).quantize(Decimal("0.01"))
+
+
+def cout_de_reference(article):
+    """
+    Coût à défaut, pour une entrée sans coût connu (stock initial, retour...) :
+    dernier coût matière valorisé par la DAF, sinon dernier coût standard, sinon 0.
+    """
+    from decimal import Decimal
+    from apps.couts.models import CoutMatiere, CoutStandard
+    cout = CoutMatiere.objects.filter(article=article).order_by("-date_valorisation").first()
+    if cout:
+        return cout.cout_unitaire
+    standard = CoutStandard.objects.filter(article=article).order_by("-date_debut_validite").first()
+    return standard.cout_standard_unitaire if standard else Decimal("0")
+
+
+class ValorisationArticle(models.Model):
+    """Coût moyen unitaire pondéré (CMUP) courant d'un article, mis à jour à chaque entrée en stock."""
+    article = models.OneToOneField(
+        Article, verbose_name="Article", on_delete=models.CASCADE, related_name="valorisation",
+    )
+    cout_unitaire_moyen = models.DecimalField("Coût moyen unitaire pondéré", max_digits=14, decimal_places=4, default=0)
+    date_mise_a_jour = models.DateTimeField("Mis à jour le", auto_now=True)
+
+    class Meta:
+        verbose_name = "Valorisation d'article (CMUP)"
+        verbose_name_plural = "Valorisations d'articles (CMUP)"
+
+    def __str__(self):
+        return f"{self.article.code} : {self.cout_unitaire_moyen}"
 
 
 class StatutInventaire(models.TextChoices):
@@ -429,6 +503,14 @@ class Inventaire(ValidationAvantEnregistrement, models.Model):
 
     def __str__(self):
         return f"Inventaire {self.depot.nom} du {self.date_inventaire}"
+
+    def save(self, *args, **kwargs):
+        cloture = self.statut == StatutInventaire.CLOTURE and valeur_en_base(self, "statut") == StatutInventaire.EN_COURS
+        with transaction.atomic():
+            super().save(*args, **kwargs)
+            if cloture:
+                from apps.comptabilite.anomalies import controler_inventaire
+                controler_inventaire(self)
 
     def clean(self):
         ancien_statut = valeur_en_base(self, "statut")

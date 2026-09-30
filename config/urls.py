@@ -9,13 +9,14 @@ documentation interactive de l'API est disponible sur /api/docs/.
 from django.contrib import admin
 from django.urls import path, include
 from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
+from apps.comptes.views import ConnexionJournaliseeView
 from drf_spectacular.views import SpectacularAPIView, SpectacularSwaggerView
 
 urlpatterns = [
     path("admin/", admin.site.urls),
 
     # Authentification par jeton JWT
-    path("api/auth/connexion/", TokenObtainPairView.as_view(), name="token_obtain_pair"),
+    path("api/auth/connexion/", ConnexionJournaliseeView.as_view(), name="token_obtain_pair"),
     path("api/auth/rafraichir/", TokenRefreshView.as_view(), name="token_refresh"),
 
     # Documentation interactive de l'API
@@ -37,4 +38,5 @@ urlpatterns = [
     path("api/comptabilite/", include("apps.comptabilite.urls")),
     path("api/reporting/", include("apps.reporting.urls")),
     path("api/reclamations/", include("apps.reclamations.urls")),
+    path("api/notifications/", include("apps.core.urls")),
 ]

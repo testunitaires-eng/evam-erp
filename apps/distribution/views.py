@@ -152,35 +152,48 @@ dépôts, cohérent avec ses autres droits).
 """
 
 from rest_framework import viewsets
+from apps.core.views import HistoriqueMixin
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from . import models, serializers
-from apps.comptes.permissions import role_required, lecture_seule_pour
+from apps.comptes.permissions import role_required, lecture_seule_pour, acces
 from apps.comptes.models import Profil
 
 
 class VehiculeViewSet(viewsets.ModelViewSet):
     queryset = models.Vehicule.objects.all()
     serializer_class = serializers.VehiculeSerializer
-    permission_classes = [role_required(Profil.RESPONSABLE_DISTRIBUTION, Profil.ADMIN_SI)]
+    permission_classes = [acces(
+        lecture=(Profil.DIRECTION,),
+        ecriture=(Profil.RESPONSABLE_DISTRIBUTION, Profil.ADMIN_SI,),
+    )]
 
 
 class ChauffeurViewSet(viewsets.ModelViewSet):
     queryset = models.Chauffeur.objects.all()
     serializer_class = serializers.ChauffeurSerializer
-    permission_classes = [role_required(Profil.RESPONSABLE_DISTRIBUTION, Profil.ADMIN_SI)]
+    permission_classes = [acces(
+        lecture=(Profil.DIRECTION,),
+        ecriture=(Profil.RESPONSABLE_DISTRIBUTION, Profil.ADMIN_SI,),
+    )]
 
 
 class DepotViewSet(viewsets.ModelViewSet):
     queryset = models.Depot.objects.all()
     serializer_class = serializers.DepotSerializer
-    permission_classes = [role_required(Profil.RESPONSABLE_DISTRIBUTION, Profil.ADMIN_SI)]
+    permission_classes = [acces(
+        lecture=(Profil.DIRECTION,),
+        ecriture=(Profil.RESPONSABLE_DISTRIBUTION, Profil.ADMIN_SI,),
+    )]
 
 
 class TourneeViewSet(viewsets.ModelViewSet):
     queryset = models.Tournee.objects.all()
     serializer_class = serializers.TourneeSerializer
-    permission_classes = [lecture_seule_pour(Profil.RESPONSABLE_DISTRIBUTION, Profil.ADMIN_SI)]
+    permission_classes = [acces(
+        lecture=(Profil.DIRECTION, Profil.CHAUFFEUR,),
+        ecriture=(Profil.RESPONSABLE_DISTRIBUTION, Profil.ADMIN_SI,),
+    )]
     filterset_fields = ["chauffeur", "vehicule", "date_tournee"]
 
     def get_queryset(self):
@@ -194,11 +207,12 @@ class TourneeViewSet(viewsets.ModelViewSet):
         return queryset
 
 
-class PreparationLivraisonViewSet(viewsets.ModelViewSet):
+class PreparationLivraisonViewSet(HistoriqueMixin, viewsets.ModelViewSet):
     queryset = models.PreparationLivraison.objects.all()
     serializer_class = serializers.PreparationLivraisonSerializer
-    permission_classes = [role_required(
-        Profil.RESPONSABLE_DISTRIBUTION, Profil.MAGASINIER, Profil.ADMIN_SI,
+    permission_classes = [acces(
+        lecture=(Profil.DIRECTION,),
+        ecriture=(Profil.RESPONSABLE_DISTRIBUTION, Profil.MAGASINIER, Profil.ADMIN_SI,),
     )]
     filterset_fields = ["commande", "statut"]
 
@@ -240,11 +254,12 @@ class PreparationLivraisonViewSet(viewsets.ModelViewSet):
         return Response(self.get_serializer(preparation).data)
 
 
-class BonLivraisonViewSet(viewsets.ModelViewSet):
+class BonLivraisonViewSet(HistoriqueMixin, viewsets.ModelViewSet):
     queryset = models.BonLivraison.objects.all()
     serializer_class = serializers.BonLivraisonSerializer
-    permission_classes = [role_required(
-        Profil.RESPONSABLE_DISTRIBUTION, Profil.CHAUFFEUR, Profil.ADMIN_SI,
+    permission_classes = [acces(
+        lecture=(Profil.DIRECTION, Profil.CHAUFFEUR,),
+        ecriture=(Profil.RESPONSABLE_DISTRIBUTION, Profil.ADMIN_SI,),
     )]
     filterset_fields = ["commande", "tournee", "statut"]
     search_fields = ["numero"]
@@ -259,13 +274,47 @@ class BonLivraisonViewSet(viewsets.ModelViewSet):
             return queryset.filter(tournee__chauffeur__utilisateur=utilisateur)
         return queryset
 
+    @action(detail=False, methods=["get"])
+    def mes_livraisons(self, request):
+        """
+        GET /api/distribution/bons-livraison/mes_livraisons/?date=AAAA-MM-JJ
+        Vue mobile du chauffeur : ses BL (par défaut ceux en cours), avec
+        client, adresse, articles et statut de paiement de la facture.
+        """
+        bons = self.get_queryset().select_related("commande__client", "tournee")
+        if request.query_params.get("date"):
+            bons = bons.filter(tournee__date_tournee=request.query_params["date"])
+        else:
+            bons = bons.filter(statut=models.StatutLivraison.EN_LIVRAISON)
+        return Response(self.get_serializer(bons, many=True).data)
+
+    @action(detail=True, methods=["post"], permission_classes=[acces(ecriture=(Profil.CHAUFFEUR, Profil.RESPONSABLE_DISTRIBUTION, Profil.ADMIN_SI))])
+    def livre(self, request, pk=None):
+        """POST .../livre/ - le chauffeur indique la remise au client (signature). La confirmation finale reste au Responsable Distribution."""
+        bon = self.get_object()
+        try:
+            bon.marquer_remis_par_chauffeur()
+        except ValueError as erreur:
+            return Response({"erreur": str(erreur)}, status=400)
+        return Response(self.get_serializer(bon).data)
+
+    @action(detail=True, methods=["post"], permission_classes=[acces(ecriture=(Profil.CHAUFFEUR, Profil.RESPONSABLE_DISTRIBUTION, Profil.ADMIN_SI))])
+    def probleme(self, request, pk=None):
+        """POST .../probleme/  Corps : {"motif": "..."} - le chauffeur signale un problème de livraison."""
+        bon = self.get_object()
+        try:
+            bon.signaler_probleme(request.data.get("motif"))
+        except ValueError as erreur:
+            return Response({"erreur": str(erreur)}, status=400)
+        return Response(self.get_serializer(bon).data)
+
     @action(detail=True, methods=["post"])
     def confirmer_livraison(self, request, pk=None):
         """
         POST /api/distribution/bons-livraison/{id}/confirmer_livraison/
         Réservé au Responsable Distribution (§12.3 point 13).
         """
-        if request.user.profil != Profil.RESPONSABLE_DISTRIBUTION and not request.user.is_superuser:
+        if request.user.profil not in (Profil.RESPONSABLE_DISTRIBUTION, Profil.ADMIN_SI) and not request.user.is_superuser:
             return Response({"erreur": "Seul le Responsable Distribution peut confirmer la livraison."}, status=403)
         bon = self.get_object()
         # Statut, facture active et paiement (vente au comptant) : voir

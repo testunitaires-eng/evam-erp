@@ -118,7 +118,9 @@ class JournalAction(models.Model):
     fait une contre-opération, jamais une suppression silencieuse.
     """
     utilisateur = models.ForeignKey(
-        Utilisateur, verbose_name="Utilisateur", on_delete=models.PROTECT
+        Utilisateur, verbose_name="Utilisateur", on_delete=models.PROTECT,
+        null=True, blank=True,
+        help_text="Vide pour une action du système (commande planifiée, migration...).",
     )
     module = models.CharField("Module", max_length=32, choices=Module.choices)
     action = models.CharField(
@@ -130,6 +132,8 @@ class JournalAction(models.Model):
     ancienne_valeur = models.TextField("Ancienne valeur", blank=True)
     nouvelle_valeur = models.TextField("Nouvelle valeur", blank=True)
     motif = models.TextField("Motif", blank=True)
+    adresse_ip = models.GenericIPAddressField("Adresse IP", null=True, blank=True)
+    requete = models.CharField("Requête", max_length=255, blank=True, help_text="Ex : POST /api/caisse/decaissements/12/autoriser/")
     date_action = models.DateTimeField("Date de l'action", auto_now_add=True)
 
     class Meta:

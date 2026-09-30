@@ -650,11 +650,14 @@ class SolutionClient(ValidationAvantEnregistrement, models.Model):
         )
         if not session_ouverte:
             return
+        # La Direction / DAF qui décide le remboursement l'autorise d'office :
+        # il reste au caissier à EFFECTUER la sortie d'argent.
         decaissement = Decaissement.objects.create(
             session_caisse=session_ouverte, montant=self.montant_rembourse,
             motif=f"Remboursement réclamation {self.reclamation.numero}",
             beneficiaire=self.reclamation.client.nom,
-            autorise_par=self.autorise_par, effectue_par=session_ouverte.caissier,
+            effectue_par=session_ouverte.caissier,
         )
+        decaissement.autoriser(self.autorise_par)
         self.reference_sortie_caisse = decaissement.numero
         super().save(update_fields=["reference_sortie_caisse"])

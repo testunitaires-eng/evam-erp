@@ -49,7 +49,23 @@ class BonLivraisonSerializer(ValidationModeleMixin, serializers.ModelSerializer)
     class Meta:
         model = models.BonLivraison
         fields = "__all__"
-        read_only_fields = ["confirme_par", "date_livraison"]
+        read_only_fields = ["confirme_par", "date_livraison", "date_signature", "incident_livraison"]
+
+    commande_numero = serializers.CharField(source="commande.numero", read_only=True)
+    client_nom = serializers.CharField(source="commande.client.nom", read_only=True)
+    client_adresse = serializers.CharField(source="commande.client.adresse", read_only=True)
+    articles = serializers.SerializerMethodField()
+    statut_paiement = serializers.SerializerMethodField()
+
+    def get_articles(self, bon):
+        return [
+            {"code": l.article.code, "designation": l.article.designation, "quantite": l.quantite}
+            for l in bon.commande.lignes.select_related("article")
+        ]
+
+    def get_statut_paiement(self, bon):
+        facture = getattr(bon.commande, "facture", None)
+        return facture.get_statut_display() if facture else "Non facturée"
 
     def validate_statut(self, valeur):
         actuel = self.instance.statut if self.instance is not None else models.StatutLivraison.EN_LIVRAISON

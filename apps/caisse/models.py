@@ -15,7 +15,7 @@ from apps.comptes.models import Utilisateur, Profil
 from apps.commercial.models import Facture, StatutFacture
 from apps.core.models import generer_numero
 from apps.core.validation import (
-    ValidationAvantEnregistrement, exiger_positif, valeur_en_base, convertir_decimal,
+    ValidationAvantEnregistrement, exiger_positif, valeur_en_base, convertir_decimal, verifier_transition,
 )
 
 
@@ -134,7 +134,7 @@ class Caisse(ValidationAvantEnregistrement, models.Model):
         encaissements = Encaissement.objects.select_related(
             "session_caisse__caisse", "session_caisse__caissier", "encaisse_par", "facture__client",
         )
-        decaissements = Decaissement.objects.select_related(
+        decaissements = Decaissement.objects.filter(statut=StatutDecaissement.EFFECTUE).select_related(
             "session_caisse__caisse", "effectue_par", "autorise_par",
         )
         if not self.est_principale:
@@ -142,10 +142,10 @@ class Caisse(ValidationAvantEnregistrement, models.Model):
             decaissements = decaissements.filter(session_caisse__caisse=self)
         if date_debut:
             encaissements = encaissements.filter(date_encaissement__date__gte=date_debut)
-            decaissements = decaissements.filter(date_decaissement__date__gte=date_debut)
+            decaissements = decaissements.filter(date_execution__date__gte=date_debut)
         if date_fin:
             encaissements = encaissements.filter(date_encaissement__date__lte=date_fin)
-            decaissements = decaissements.filter(date_decaissement__date__lte=date_fin)
+            decaissements = decaissements.filter(date_execution__date__lte=date_fin)
         if caissier:
             encaissements = encaissements.filter(session_caisse__caissier_id=caissier)
             decaissements = decaissements.filter(session_caisse__caissier_id=caissier)
@@ -162,7 +162,7 @@ class Caisse(ValidationAvantEnregistrement, models.Model):
             for e in encaissements
         ] + [
             {
-                "type": "DECAISSEMENT", "numero": d.numero, "date": d.date_decaissement,
+                "type": "DECAISSEMENT", "numero": d.numero, "date": d.date_execution or d.date_decaissement,
                 "montant": -d.montant, "caisse": d.session_caisse.caisse.nom,
                 "caissier": nom_utilisateur(d.effectue_par), "caissier_id": d.effectue_par_id,
                 "session": d.session_caisse_id, "mode_paiement": None,
@@ -315,7 +315,9 @@ class SessionCaisse(ValidationAvantEnregistrement, models.Model):
         """
         from django.db.models import Sum
         total_encaissements = self.encaissements.aggregate(total=Sum("montant"))["total"] or 0
-        total_decaissements = self.decaissements.aggregate(total=Sum("montant"))["total"] or 0
+        total_decaissements = self.decaissements.filter(
+            statut=StatutDecaissement.EFFECTUE,
+        ).aggregate(total=Sum("montant"))["total"] or 0
         return self.solde_ouverture + total_encaissements - total_decaissements
 
     @transaction.atomic
@@ -349,6 +351,8 @@ class SessionCaisse(ValidationAvantEnregistrement, models.Model):
         self.save()
         if ecart:
             EcartCaisse.objects.create(session_caisse=self, justification=justification)
+            from apps.comptabilite.anomalies import controler_ecart_caisse
+            controler_ecart_caisse(self)
 
 class ModePaiement(models.TextChoices):
     ESPECES = "ESPECES", "Espèces"
@@ -410,10 +414,14 @@ class Encaissement(ValidationAvantEnregistrement, models.Model):
 
     def save(self, *args, **kwargs):
         with transaction.atomic():
+            creation = self._state.adding
             if not self.numero:
                 self.numero = generer_numero("ENC")
             super().save(*args, **kwargs)
             self.facture.mettre_a_jour_statut_paiement()
+            if creation:
+                from apps.comptabilite.ecritures import ecrire_encaissement
+                ecrire_encaissement(self)
 
 
 class EcartCaisse(ValidationAvantEnregistrement, models.Model):
@@ -469,14 +477,28 @@ class EcartCaisse(ValidationAvantEnregistrement, models.Model):
 
 
 
+class StatutDecaissement(models.TextChoices):
+    EN_ATTENTE = "EN_ATTENTE", "En attente d'autorisation"
+    AUTORISE = "AUTORISE", "Autorisé"
+    REFUSE = "REFUSE", "Refusé"
+    EFFECTUE = "EFFECTUE", "Effectué"
+
+
 class Decaissement(ValidationAvantEnregistrement, models.Model):
     """
-    §9.1/§9.2 : sortie de caisse autorisée (remboursement client,
-    dépense de fonctionnement...), distincte d'un encaissement.
-    Toujours rattachée à une session et à un motif ; nécessite une
-    autorisation (le caissier seul ne peut pas sortir d'argent sans
-    validation).
+    §9.1/§9.2 : sortie de caisse, distincte d'un encaissement, en 3 temps :
+    1. le caissier fait la DEMANDE (montant, motif, bénéficiaire) ;
+    2. la Direction ou la Comptabilité/DAF l'AUTORISE ou la REFUSE (motif) ;
+    3. le caissier EFFECTUE la sortie d'argent (seulement si autorisée,
+       sur une session ouverte, dans la limite de l'argent en caisse).
+    Seuls les décaissements EFFECTUÉS diminuent le solde de la caisse.
     """
+    TRANSITIONS = {
+        StatutDecaissement.EN_ATTENTE: {StatutDecaissement.AUTORISE, StatutDecaissement.REFUSE},
+        StatutDecaissement.AUTORISE: {StatutDecaissement.EFFECTUE},
+    }
+    CHAMPS_FIGES = ("montant", "motif", "beneficiaire", "effectue_par")
+
     numero = models.CharField("Numéro", max_length=30, unique=True, editable=False)
     session_caisse = models.ForeignKey(
         SessionCaisse, verbose_name="Session de caisse", on_delete=models.PROTECT,
@@ -485,17 +507,23 @@ class Decaissement(ValidationAvantEnregistrement, models.Model):
     montant = models.DecimalField("Montant", max_digits=14, decimal_places=2)
     motif = models.TextField("Motif")
     beneficiaire = models.CharField("Bénéficiaire", max_length=200, blank=True)
-    autorise_par = models.ForeignKey(
-        Utilisateur, verbose_name="Autorisé par", on_delete=models.PROTECT,
-        related_name="decaissements_autorises",
-        limit_choices_to={"profil__in": PROFILS_AUTORISANT_DECAISSEMENT, "is_active": True},
-        help_text="Direction ou Comptabilité/DAF uniquement.",
+    statut = models.CharField(
+        "Statut", max_length=15, choices=StatutDecaissement.choices, default=StatutDecaissement.EN_ATTENTE,
     )
+    autorise_par = models.ForeignKey(
+        Utilisateur, verbose_name="Autorisé / refusé par", on_delete=models.PROTECT,
+        null=True, blank=True, related_name="decaissements_autorises",
+        limit_choices_to={"profil__in": PROFILS_AUTORISANT_DECAISSEMENT, "is_active": True},
+        help_text="Direction ou Comptabilité/DAF : renseigné par l'action Autoriser / Refuser.",
+    )
+    date_autorisation = models.DateTimeField("Date d'autorisation / de refus", null=True, blank=True)
+    motif_refus = models.TextField("Motif du refus", blank=True)
     effectue_par = models.ForeignKey(
-        Utilisateur, verbose_name="Effectué par (caissier)", on_delete=models.PROTECT,
+        Utilisateur, verbose_name="Caissier", on_delete=models.PROTECT,
         related_name="decaissements_effectues",
     )
-    date_decaissement = models.DateTimeField("Date", auto_now_add=True)
+    date_decaissement = models.DateTimeField("Date de la demande", auto_now_add=True)
+    date_execution = models.DateTimeField("Date de sortie d'argent", null=True, blank=True)
 
     class Meta:
         verbose_name = "Décaissement"
@@ -507,34 +535,55 @@ class Decaissement(ValidationAvantEnregistrement, models.Model):
 
     def clean(self):
         """
-        - un décaissement ne se modifie pas après coup ;
-        - montant strictement positif, motif obligatoire ;
-        - uniquement sur une session OUVERTE et dans la limite de
-          l'argent présent en caisse (solde théorique) ;
-        - autorisé uniquement par la Direction ou la Comptabilité/DAF, et
-          par une autre personne que celle qui décaisse (le caissier seul
-          ne peut pas sortir d'argent sans validation, §9.1).
+        - montant > 0, motif obligatoire, demande faite par le caissier de
+          la session, sur une session ouverte ;
+        - statut : En attente -> Autorisé / Refusé ; Autorisé -> Effectué.
+          Refusé et Effectué sont définitifs ; montant, motif, bénéficiaire
+          et caissier ne changent plus après la demande ;
+        - autorisation uniquement par la Direction ou la Comptabilité/DAF,
+          jamais par le caissier lui-même ;
+        - sortie d'argent : session ouverte et montant <= argent en caisse.
         """
-        if self.pk is not None:
-            raise ValidationError("Un décaissement enregistré ne peut pas être modifié.")
         exiger_positif(self.montant, "montant", "Le montant du décaissement")
         if not (self.motif or "").strip():
             raise ValidationError({"motif": "Le motif du décaissement est obligatoire."})
+        ancien_statut = valeur_en_base(self, "statut")
+        if ancien_statut in (StatutDecaissement.REFUSE, StatutDecaissement.EFFECTUE):
+            raise ValidationError(
+                f"Ce décaissement est {dict(StatutDecaissement.choices)[ancien_statut].lower()} : il ne peut plus être modifié."
+            )
+        verifier_transition(
+            ancien_statut, self.statut, self.TRANSITIONS, "statut du décaissement",
+            initial=StatutDecaissement.EN_ATTENTE,
+        )
+        if self.pk is not None:
+            for champ in self.CHAMPS_FIGES:
+                attribut = f"{champ}_id" if champ == "effectue_par" else champ
+                if valeur_en_base(self, champ) != getattr(self, attribut):
+                    raise ValidationError({champ: "Ce champ ne peut plus être modifié après la demande."})
+
         if self.session_caisse_id:
             session = self.session_caisse
-            if session.statut != StatutSession.OUVERTE:
-                raise ValidationError({"session_caisse": "Cette session de caisse est clôturée : aucun décaissement possible."})
             if self.effectue_par_id and self.effectue_par_id != session.caissier_id:
                 raise ValidationError({"session_caisse": "Seul le caissier de cette session peut y décaisser (sa propre caisse)."})
-            disponible = session.calculer_solde_theorique()
-            if self.montant > disponible:
-                raise ValidationError({"montant": (
-                    f"Montant supérieur à l'argent disponible en caisse ({disponible})."
-                )})
+            if ancien_statut is None and session.statut != StatutSession.OUVERTE:
+                raise ValidationError({"session_caisse": "Cette session de caisse est clôturée : aucune demande de décaissement possible."})
+            if self.statut == StatutDecaissement.EFFECTUE and ancien_statut != StatutDecaissement.EFFECTUE:
+                if session.statut != StatutSession.OUVERTE:
+                    raise ValidationError({"session_caisse": "Ouvrez votre session de caisse pour effectuer ce décaissement."})
+                disponible = session.calculer_solde_theorique()
+                if self.montant > disponible:
+                    raise ValidationError({"montant": f"Montant supérieur à l'argent disponible en caisse ({disponible})."})
+
+        if self.statut in (StatutDecaissement.AUTORISE, StatutDecaissement.REFUSE) and ancien_statut == StatutDecaissement.EN_ATTENTE:
+            if not self.autorise_par_id:
+                raise ValidationError({"autorise_par": "La personne qui autorise ou refuse doit être renseignée."})
+            if self.statut == StatutDecaissement.REFUSE and not (self.motif_refus or "").strip():
+                raise ValidationError({"motif_refus": "Le motif du refus est obligatoire."})
         if self.autorise_par_id:
             if not self.autorise_par.is_active:
                 raise ValidationError({"autorise_par": "Le compte de la personne qui autorise est désactivé."})
-            if self.autorise_par.profil not in PROFILS_AUTORISANT_DECAISSEMENT:
+            if self.autorise_par.profil not in PROFILS_AUTORISANT_DECAISSEMENT and not self.autorise_par.is_superuser:
                 raise ValidationError({"autorise_par": (
                     "Un décaissement ne peut être autorisé que par la Direction ou la Comptabilité/DAF."
                 )})
@@ -542,7 +591,52 @@ class Decaissement(ValidationAvantEnregistrement, models.Model):
                 raise ValidationError({"autorise_par": "Le décaissement doit être autorisé par une autre personne que celle qui l'effectue."})
 
     def verifier_suppression(self):
-        raise ValidationError("Un décaissement ne peut pas être supprimé.")
+        raise ValidationError("Un décaissement ne peut pas être supprimé (refusez la demande si elle n'a pas lieu d'être).")
+
+    def _decider(self, utilisateur, statut, motif_refus=""):
+        from django.utils import timezone
+        if self.statut != StatutDecaissement.EN_ATTENTE:
+            raise ValueError(f"Cette demande est déjà « {self.get_statut_display()} ».")
+        self.statut = statut
+        self.autorise_par = utilisateur
+        self.date_autorisation = timezone.now()
+        self.motif_refus = (motif_refus or "").strip()
+        self.save()
+
+    def autoriser(self, utilisateur):
+        """Direction ou Comptabilité/DAF : autorise la sortie d'argent."""
+        self._decider(utilisateur, StatutDecaissement.AUTORISE)
+
+    def refuser(self, utilisateur, motif):
+        """Direction ou Comptabilité/DAF : refuse, avec motif obligatoire."""
+        if not (motif or "").strip():
+            raise ValueError("Le motif du refus est obligatoire.")
+        self._decider(utilisateur, StatutDecaissement.REFUSE, motif)
+
+    @transaction.atomic
+    def effectuer(self, utilisateur):
+        """
+        Le caissier sort l'argent. Si la session de la demande a été
+        clôturée entre-temps, la sortie est rattachée à la session
+        OUVERTE de sa caisse (le jour où l'argent sort réellement).
+        """
+        from django.utils import timezone
+        if self.statut != StatutDecaissement.AUTORISE:
+            raise ValueError(
+                f"Ce décaissement est « {self.get_statut_display()} » : seul un décaissement autorisé peut être effectué."
+            )
+        if utilisateur.pk != self.effectue_par_id and not utilisateur.is_superuser:
+            raise ValueError("Seul le caissier qui a fait la demande peut effectuer ce décaissement.")
+        if self.session_caisse.statut != StatutSession.OUVERTE:
+            session = self.session_caisse.caisse.session_ouverte()
+            if session is None:
+                raise ValueError("Ouvrez votre session de caisse pour effectuer ce décaissement.")
+            self.session_caisse = session
+        self.statut = StatutDecaissement.EFFECTUE
+        self.date_execution = timezone.now()
+        self.save()
+        from apps.comptabilite.ecritures import ecrire_decaissement
+        ecrire_decaissement(self)
 
     def save(self, *args, **kwargs):
         if not self.numero:

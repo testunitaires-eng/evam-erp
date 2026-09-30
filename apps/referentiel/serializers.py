@@ -83,6 +83,12 @@ class ArticleSerializer(ValidationModeleMixin, serializers.ModelSerializer):
     """
     fiche_technique_brouillon = serializers.SerializerMethodField()
     fiche_technique_validee = serializers.SerializerMethodField()
+    # Vrai dès que l'article figure dans un document : type, famille,
+    # parfum, format et unité de vente sont alors figés (à griser).
+    est_verrouille = serializers.SerializerMethodField()
+
+    def get_est_verrouille(self, article):
+        return article.est_utilise()
 
     class Meta:
         model = models.Article

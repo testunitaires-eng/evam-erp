@@ -43,3 +43,7 @@ def appliquer_mouvement_au_stock(sender, instance, created, **kwargs):
     elif instance.type_mouvement == "SORTIE":
         stock.quantite_physique -= instance.quantite
     stock.save()
+
+    # Circuit achats : besoin automatique si la matière passe sous son seuil d'alerte.
+    from apps.achats.models import verifier_seuil_alerte
+    verifier_seuil_alerte(instance.article)

@@ -8,4 +8,6 @@ router.register("mouvements", views.MouvementStockViewSet, basename="mouvementst
 router.register("inventaires", views.InventaireViewSet, basename="inventaire")
 router.register("lignes-inventaire", views.LigneInventaireViewSet, basename="ligneinventaire")
 
-urlpatterns = router.urls
+from django.urls import path
+
+urlpatterns = [path("valorisation/", views.valorisation, name="valorisation-stock")] + router.urls

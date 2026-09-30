@@ -35,9 +35,17 @@ class ValidationAvantEnregistrement:
     """
 
     def save(self, *args, **kwargs):
+        # Historique : tout modèle doté d'un champ « statut » trace sa
+        # création et chacun de ses changements de statut.
+        suivi = any(champ.name == "statut" for champ in self._meta.fields)
+        creation = self._state.adding
+        ancien_statut = None if creation or not suivi else valeur_en_base(self, "statut")
         if not kwargs.get("update_fields"):
             self.clean()
         super().save(*args, **kwargs)
+        if suivi and (creation or ancien_statut != self.statut):
+            from .historique import enregistrer_historique
+            enregistrer_historique(self, None if creation else ancien_statut)
 
     def delete(self, *args, **kwargs):
         verifier = getattr(self, "verifier_suppression", None)

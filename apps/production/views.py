@@ -157,52 +157,74 @@ suivi spécifique de l'eau.
 """
 
 from rest_framework import viewsets
+from apps.core.views import HistoriqueMixin
 from rest_framework.decorators import action, api_view, permission_classes as drf_permission_classes
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.exceptions import PermissionDenied
 from apps.core.validation import METHODES_CREATION_LECTURE
 from . import models, serializers
-from apps.comptes.permissions import role_required
+from apps.comptes.permissions import role_required, acces
 from apps.comptes.models import Profil
 from apps.comptes.permissions import role_required, lecture_seule_pour
 
 
+def est_agent(utilisateur):
+    return utilisateur.profil == Profil.AGENT_PRODUCTION and not utilisateur.is_superuser
+
+
 class AffectationAgentMixin:
     """
-    Règle du cahier des charges : un Agent Production n'agit que sur
-    les OF où il est affecté. Le filtrage de get_queryset() ne couvre
-    que la LECTURE ; ce mixin l'applique aussi à la création et à la
-    modification (sinon un agent pouvait saisir sur n'importe quel OF
-    en envoyant son identifiant).
+    Règles de l'Agent Production (scénarios par rôle, §4) sur ses saisies :
+    - il ne voit que les données de SES OF (ceux où il est affecté) ;
+    - il ne saisit que sur un OF affecté ET « En production » ;
+    - il crée ses saisies mais ne les modifie ni ne les supprime :
+      les corrections sont faites par le Responsable Production.
+    Chaque saisie est tracée (saisi_par / agent / demandeur).
     """
 
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        if est_agent(self.request.user):
+            return queryset.filter(ordre_fabrication__agents_affectes=self.request.user)
+        return queryset
+
     def verifier_affectation(self, of):
-        utilisateur = self.request.user
-        if utilisateur.is_superuser or utilisateur.profil != Profil.AGENT_PRODUCTION:
+        if not est_agent(self.request.user):
             return
-        if not of.agents_affectes.filter(pk=utilisateur.pk).exists():
+        if not of.agents_affectes.filter(pk=self.request.user.pk).exists():
             raise PermissionDenied(f"Vous n'êtes pas affecté à l'OF {of.numero}.")
+        if of.statut != models.StatutOF.EN_PRODUCTION:
+            raise PermissionDenied(
+                f"L'OF {of.numero} est « {of.get_statut_display()} » : vous ne pouvez saisir que sur un OF en production."
+            )
 
     def perform_create(self, serializer):
         self.verifier_affectation(serializer.validated_data["ordre_fabrication"])
-        super().perform_create(serializer)
+        champs = {f.name for f in serializer.Meta.model._meta.fields}
+        if "saisi_par" in champs:
+            serializer.save(saisi_par=self.request.user)
+        else:
+            super().perform_create(serializer)
 
     def perform_update(self, serializer):
-        self.verifier_affectation(
-            serializer.validated_data.get("ordre_fabrication", serializer.instance.ordre_fabrication)
-        )
+        if est_agent(self.request.user):
+            raise PermissionDenied("Un Agent Production ne modifie pas une saisie : demandez la correction au Responsable Production.")
         super().perform_update(serializer)
 
     def perform_destroy(self, instance):
-        self.verifier_affectation(instance.ordre_fabrication)
+        if est_agent(self.request.user):
+            raise PermissionDenied("Un Agent Production ne supprime pas une saisie : demandez la correction au Responsable Production.")
         super().perform_destroy(instance)
 
 
-class PlanProductionViewSet(viewsets.ModelViewSet):
+class PlanProductionViewSet(HistoriqueMixin, viewsets.ModelViewSet):
     queryset = models.PlanProduction.objects.all()
     serializer_class = serializers.PlanProductionSerializer
-    permission_classes = [role_required(Profil.RESPONSABLE_PRODUCTION, Profil.ADMIN_SI)]
+    permission_classes = [acces(
+        lecture=(Profil.DIRECTION, Profil.RESPONSABLE_QUALITE,),
+        ecriture=(Profil.RESPONSABLE_PRODUCTION, Profil.ADMIN_SI,),
+    )]
     filterset_fields = ["article", "statut", "priorite"]
 
     def perform_create(self, serializer):
@@ -215,9 +237,14 @@ class PlanProductionViewSet(viewsets.ModelViewSet):
         Transforme la prévision en OF réel (§5.3). Déclenche
         automatiquement le calcul des besoins matières.
         """
+        from apps.comptes.models import Utilisateur
         plan = self.get_object()
+        identifiants = request.data.get("agents_affectes") or []
+        agents = list(Utilisateur.objects.filter(pk__in=identifiants))
+        if len(agents) != len(set(identifiants)):
+            return Response({"erreur": "Un ou plusieurs agents sont introuvables."}, status=400)
         try:
-            of = plan.convertir_en_of(responsable=request.user)
+            of = plan.convertir_en_of(responsable=request.user, agents=agents)
         except ValueError as erreur:
             return Response({"erreur": str(erreur)}, status=400)
         return Response(serializers.OrdreFabricationSerializer(of).data, status=201)
@@ -231,11 +258,14 @@ class PlanProductionViewSet(viewsets.ModelViewSet):
 #     )]
 #     filterset_fields = ["article", "statut"]
 
-class OrdreFabricationViewSet(viewsets.ModelViewSet):
+class OrdreFabricationViewSet(HistoriqueMixin, viewsets.ModelViewSet):
     queryset = models.OrdreFabrication.objects.all()
     serializer_class = serializers.OrdreFabricationSerializer
-    permission_classes = [lecture_seule_pour(
-        Profil.RESPONSABLE_PRODUCTION, Profil.AGENT_PRODUCTION, Profil.ADMIN_SI,
+    # L'Agent Production consulte ses OF (lecture seule, filtrés ci-dessous) ;
+    # seuls le Responsable Production et l'Admin SI les gèrent.
+    permission_classes = [acces(
+        lecture=(Profil.AGENT_PRODUCTION, Profil.DIRECTION, Profil.RESPONSABLE_QUALITE,),
+        ecriture=(Profil.RESPONSABLE_PRODUCTION, Profil.ADMIN_SI,),
     )]
     filterset_fields = ["article", "statut"]
     search_fields = ["numero"]
@@ -251,7 +281,49 @@ class OrdreFabricationViewSet(viewsets.ModelViewSet):
         return queryset
 
     def perform_create(self, serializer):
-        serializer.save(responsable=self.request.user)
+        agents = serializer.validated_data.pop("agents_affectes", [])
+        of = serializer.save(responsable=self.request.user)
+        if agents:
+            of.affecter_agents(agents, par=self.request.user)
+
+    def perform_update(self, serializer):
+        agents = serializer.validated_data.pop("agents_affectes", None)
+        of = serializer.save()
+        if agents is not None:
+            of.affecter_agents(agents, par=self.request.user)
+
+    @action(detail=False, methods=["get"])
+    def agents_disponibles(self, request):
+        """
+        GET /api/production/ordres-fabrication/agents_disponibles/
+        Liste de choix des agents : comptes Agent Production actifs (id, nom d'utilisateur, nom).
+        """
+        from apps.comptes.models import Utilisateur
+        agents = Utilisateur.objects.filter(profil=Profil.AGENT_PRODUCTION, is_active=True).order_by("username")
+        return Response([
+            {"id": agent.pk, "username": agent.username, "nom": serializers.nom_utilisateur(agent)}
+            for agent in agents
+        ])
+
+    @action(detail=True, methods=["post"])
+    def affecter_agents(self, request, pk=None):
+        """
+        POST /api/production/ordres-fabrication/{id}/affecter_agents/
+        Corps : {"agents": [<id>, ...]} (remplace la liste). Réservé au
+        Responsable Production. Tracé dans le journal des actions.
+        """
+        if request.user.profil not in (Profil.RESPONSABLE_PRODUCTION, Profil.ADMIN_SI) and not request.user.is_superuser:
+            return Response({"erreur": "Seul le Responsable Production affecte les agents à un OF."}, status=403)
+        from apps.comptes.models import Utilisateur
+        identifiants = request.data.get("agents")
+        if not isinstance(identifiants, list):
+            return Response({"erreur": "Envoyez « agents » : une liste d'identifiants (liste vide pour tout retirer)."}, status=400)
+        agents = list(Utilisateur.objects.filter(pk__in=identifiants))
+        if len(agents) != len(set(identifiants)):
+            return Response({"erreur": "Un ou plusieurs agents sont introuvables."}, status=400)
+        of = self.get_object()
+        of.affecter_agents(agents, par=request.user)
+        return Response(self.get_serializer(of).data)
 
     @action(detail=True, methods=["post"])
     def avancer_statut(self, request, pk=None):
@@ -332,8 +404,9 @@ class BesoinMatierePrevuViewSet(viewsets.ReadOnlyModelViewSet):
     """Lecture seule : calculé automatiquement à la création de l'OF."""
     queryset = models.BesoinMatierePrevu.objects.all()
     serializer_class = serializers.BesoinMatierePrevuSerializer
-    permission_classes = [role_required(
-        Profil.RESPONSABLE_PRODUCTION, Profil.MAGASINIER, Profil.ADMIN_SI,
+    permission_classes = [acces(
+        lecture=(Profil.RESPONSABLE_PRODUCTION, Profil.MAGASINIER, Profil.ADMIN_SI, Profil.DIRECTION,),
+        ecriture=(),
     )]
     filterset_fields = ["ordre_fabrication", "matiere"]
 
@@ -347,11 +420,12 @@ class BesoinMatierePrevuViewSet(viewsets.ReadOnlyModelViewSet):
         return reponse
 
 
-class DemandeMatiereViewSet(viewsets.ModelViewSet):
+class DemandeMatiereViewSet(HistoriqueMixin, viewsets.ModelViewSet):
     queryset = models.DemandeMatiere.objects.all()
     serializer_class = serializers.DemandeMatiereSerializer
-    permission_classes = [role_required(
-        Profil.RESPONSABLE_PRODUCTION, Profil.MAGASINIER, Profil.ADMIN_SI,
+    permission_classes = [acces(
+        lecture=(Profil.DIRECTION,),
+        ecriture=(Profil.RESPONSABLE_PRODUCTION, Profil.MAGASINIER, Profil.ADMIN_SI,),
     )]
     filterset_fields = ["ordre_fabrication", "matiere", "statut"]
     search_fields = ["numero"]
@@ -383,11 +457,12 @@ class DemandeMatiereViewSet(viewsets.ModelViewSet):
         return Response(self.get_serializer(demande).data)
 
 
-class DemandeComplementaireViewSet(AffectationAgentMixin, viewsets.ModelViewSet):
+class DemandeComplementaireViewSet(HistoriqueMixin, AffectationAgentMixin, viewsets.ModelViewSet):
     queryset = models.DemandeComplementaire.objects.all()
     serializer_class = serializers.DemandeComplementaireSerializer
-    permission_classes = [role_required(
-        Profil.RESPONSABLE_PRODUCTION, Profil.AGENT_PRODUCTION, Profil.MAGASINIER, Profil.ADMIN_SI,
+    permission_classes = [acces(
+        lecture=(Profil.DIRECTION,),
+        ecriture=(Profil.RESPONSABLE_PRODUCTION, Profil.AGENT_PRODUCTION, Profil.MAGASINIER, Profil.ADMIN_SI,),
     )]
     filterset_fields = ["ordre_fabrication", "matiere", "statut"]
     search_fields = ["numero"]
@@ -429,7 +504,10 @@ class DemandeComplementaireViewSet(AffectationAgentMixin, viewsets.ModelViewSet)
 class SortieMatiereViewSet(viewsets.ModelViewSet):
     queryset = models.SortieMatiere.objects.all()
     serializer_class = serializers.SortieMatiereSerializer
-    permission_classes = [lecture_seule_pour(Profil.MAGASINIER, Profil.ADMIN_SI)]
+    permission_classes = [acces(
+        lecture=(Profil.RESPONSABLE_PRODUCTION, Profil.DIRECTION,),
+        ecriture=(Profil.MAGASINIER, Profil.ADMIN_SI,),
+    )]
     filterset_fields = ["ordre_fabrication", "matiere", "type_sortie"]
     # Toutes les règles (OF verrouillé, motif, quantité, stock disponible)
     # sont vérifiées AVANT l'enregistrement (SortieMatiere.clean() +
@@ -446,7 +524,10 @@ class SortieMatiereViewSet(viewsets.ModelViewSet):
 class RetourMatiereViewSet(viewsets.ModelViewSet):
     queryset = models.RetourMatiere.objects.all()
     serializer_class = serializers.RetourMatiereSerializer
-    permission_classes = [lecture_seule_pour(Profil.MAGASINIER, Profil.ADMIN_SI)]
+    permission_classes = [acces(
+        lecture=(Profil.RESPONSABLE_PRODUCTION, Profil.DIRECTION,),
+        ecriture=(Profil.MAGASINIER, Profil.ADMIN_SI,),
+    )]
     filterset_fields = ["ordre_fabrication", "matiere"]
     # Un retour ne se modifie ni ne se supprime (le stock a déjà été mouvementé).
     http_method_names = METHODES_CREATION_LECTURE
@@ -454,8 +535,9 @@ class RetourMatiereViewSet(viewsets.ModelViewSet):
 class SuiviProductionViewSet(AffectationAgentMixin, viewsets.ModelViewSet):
     queryset = models.SuiviProduction.objects.all()
     serializer_class = serializers.SuiviProductionSerializer
-    permission_classes = [role_required(
-        Profil.RESPONSABLE_PRODUCTION, Profil.AGENT_PRODUCTION, Profil.ADMIN_SI,
+    permission_classes = [acces(
+        lecture=(Profil.DIRECTION, Profil.RESPONSABLE_QUALITE,),
+        ecriture=(Profil.RESPONSABLE_PRODUCTION, Profil.AGENT_PRODUCTION, Profil.ADMIN_SI,),
     )]
     filterset_fields = ["ordre_fabrication", "date"]
 
@@ -472,8 +554,9 @@ class SuiviProductionViewSet(AffectationAgentMixin, viewsets.ModelViewSet):
 class SuiviEauViewSet(AffectationAgentMixin, viewsets.ModelViewSet):
     queryset = models.SuiviEau.objects.all()
     serializer_class = serializers.SuiviEauSerializer
-    permission_classes = [role_required(
-        Profil.RESPONSABLE_PRODUCTION, Profil.AGENT_PRODUCTION, Profil.ADMIN_SI,
+    permission_classes = [acces(
+        lecture=(Profil.DIRECTION, Profil.RESPONSABLE_QUALITE,),
+        ecriture=(Profil.RESPONSABLE_PRODUCTION, Profil.AGENT_PRODUCTION, Profil.ADMIN_SI,),
     )]
     filterset_fields = ["ordre_fabrication"]
 
@@ -481,8 +564,9 @@ class SuiviEauViewSet(AffectationAgentMixin, viewsets.ModelViewSet):
 class EtapeProductionViewSet(AffectationAgentMixin, viewsets.ModelViewSet):
     queryset = models.EtapeProduction.objects.all()
     serializer_class = serializers.EtapeProductionSerializer
-    permission_classes = [role_required(
-        Profil.RESPONSABLE_PRODUCTION, Profil.AGENT_PRODUCTION, Profil.ADMIN_SI,
+    permission_classes = [acces(
+        lecture=(Profil.DIRECTION, Profil.RESPONSABLE_QUALITE,),
+        ecriture=(Profil.RESPONSABLE_PRODUCTION, Profil.AGENT_PRODUCTION, Profil.ADMIN_SI,),
     )]
     filterset_fields = ["ordre_fabrication", "etape"]
 
@@ -497,14 +581,15 @@ class EtapeProductionViewSet(AffectationAgentMixin, viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         self.verifier_affectation(serializer.validated_data["ordre_fabrication"])
-        serializer.save(agent=self.request.user)
+        serializer.save(agent=self.request.user)   # l'agent de l'étape = celui qui la saisit
 
 
 class PerteProductionViewSet(AffectationAgentMixin, viewsets.ModelViewSet):
     queryset = models.PerteProduction.objects.all()
     serializer_class = serializers.PerteProductionSerializer
-    permission_classes = [role_required(
-        Profil.RESPONSABLE_PRODUCTION, Profil.AGENT_PRODUCTION, Profil.ADMIN_SI,
+    permission_classes = [acces(
+        lecture=(Profil.DIRECTION, Profil.RESPONSABLE_QUALITE,),
+        ecriture=(Profil.RESPONSABLE_PRODUCTION, Profil.AGENT_PRODUCTION, Profil.ADMIN_SI,),
     )]
     filterset_fields = ["ordre_fabrication", "motif"]
 
@@ -519,7 +604,7 @@ class PerteProductionViewSet(AffectationAgentMixin, viewsets.ModelViewSet):
 
 
 @api_view(["GET"])
-@drf_permission_classes([IsAuthenticated])
+@drf_permission_classes([acces(lecture=(Profil.RESPONSABLE_PRODUCTION, Profil.AGENT_PRODUCTION, Profil.DIRECTION, Profil.RESPONSABLE_QUALITE, Profil.ADMIN_SI,))])
 def tableau_de_bord(request):
     """
     GET /api/production/tableau-de-bord/
@@ -533,6 +618,8 @@ def tableau_de_bord(request):
     from .models import OrdreFabrication, StatutOF, BesoinMatierePrevu
 
     of_qs = OrdreFabrication.objects.all()
+    if est_agent(request.user):
+        of_qs = of_qs.filter(agents_affectes=request.user)
     date_filtre = request.query_params.get("date")
     produit_filtre = request.query_params.get("produit")
     equipe_filtre = request.query_params.get("equipe")

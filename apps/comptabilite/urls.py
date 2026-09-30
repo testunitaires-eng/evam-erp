@@ -5,5 +5,8 @@ router = DefaultRouter()
 router.register("anomalies", views.AnomalieDetecteeViewSet, basename="anomaliedetectee")
 router.register("exports", views.ExportComptableViewSet, basename="exportcomptable")
 router.register("clotures", views.ClotureViewSet, basename="cloture")
+router.register("comptes", views.CompteParametreViewSet, basename="compteparametre")
+router.register("seuils-controles", views.ParametreControleViewSet, basename="parametrecontrole")
+router.register("ecritures", views.EcritureComptableViewSet, basename="ecriturecomptable")
 
 urlpatterns = router.urls

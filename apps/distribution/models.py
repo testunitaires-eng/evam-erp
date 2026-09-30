@@ -209,6 +209,14 @@ class BonLivraison(ValidationAvantEnregistrement, models.Model):
     tournee = models.ForeignKey(Tournee, verbose_name="Tournée", on_delete=models.SET_NULL, null=True, blank=True)
     statut = models.CharField("Statut", max_length=25, choices=StatutLivraison.choices, default=StatutLivraison.EN_LIVRAISON)
     signature_client = models.BooleanField("Signé par le client", default=False)
+    date_signature = models.DateTimeField(
+        "Date de remise au client", null=True, blank=True,
+        help_text="Renseignée par le chauffeur (action « Livré »).",
+    )
+    incident_livraison = models.TextField(
+        "Problème signalé", blank=True,
+        help_text="Renseigné par le chauffeur (action « Problème ») : client absent, refus, casse...",
+    )
     confirme_par = models.ForeignKey(
         Utilisateur, verbose_name="Livraison confirmée par (Resp. Distribution)",
         on_delete=models.PROTECT, null=True, blank=True,
@@ -279,6 +287,24 @@ class BonLivraison(ValidationAvantEnregistrement, models.Model):
                 f"Vente au comptant : la facture {facture.numero} n'est pas soldée "
                 f"(reste à payer {facture.solde_restant} FCFA). Encaissez-la avant de confirmer la livraison."
             )
+
+    def marquer_remis_par_chauffeur(self):
+        """Le chauffeur a remis la marchandise et le client a signé. La confirmation finale reste au Responsable Distribution."""
+        from django.utils import timezone
+        if self.statut != StatutLivraison.EN_LIVRAISON:
+            raise ValueError(f"Ce bon de livraison est « {self.get_statut_display()} » : il n'est plus en cours de livraison.")
+        self.signature_client = True
+        self.date_signature = timezone.now()
+        self.save()
+
+    def signaler_probleme(self, motif):
+        if self.statut != StatutLivraison.EN_LIVRAISON:
+            raise ValueError(f"Ce bon de livraison est « {self.get_statut_display()} » : il n'est plus en cours de livraison.")
+        motif = (motif or "").strip()
+        if not motif:
+            raise ValueError("Décrivez le problème (motif obligatoire).")
+        self.incident_livraison = motif
+        self.save()
 
     @transaction.atomic
     def confirmer_livraison(self, utilisateur):

@@ -976,7 +976,16 @@ class Facture(ValidationAvantEnregistrement, models.Model):
             from datetime import timedelta
             from django.utils import timezone
             self.date_echeance = (timezone.now() + timedelta(days=self.client.delai_paiement_jours)).date()
-        super().save(*args, **kwargs)
+        annulation = (
+            self.pk is not None and self.statut == StatutFacture.ANNULEE
+            and valeur_en_base(self, "statut") != StatutFacture.ANNULEE
+        )
+        with transaction.atomic():
+            super().save(*args, **kwargs)
+            if annulation:
+                # Comptabilité : contre-passation de l'écriture de vente.
+                from apps.comptabilite.ecritures import contre_passer
+                contre_passer(self, "Annulation")
 
     @property
     def montant_paye(self):
@@ -1041,6 +1050,9 @@ class Facture(ValidationAvantEnregistrement, models.Model):
                 quantite=ligne_commande.quantite,
                 prix_unitaire_ht=ligne_commande.prix_unitaire,
             )
+        # Comptabilité : écriture de vente (même transaction).
+        from apps.comptabilite.ecritures import ecrire_facture
+        ecrire_facture(self)
 
 
 class LigneFacture(models.Model):
@@ -1171,3 +1183,5 @@ class Avoir(ValidationAvantEnregistrement, models.Model):
         self.date_utilisation = timezone.now()
         self.save()
         facture_cible.mettre_a_jour_statut_paiement()
+        from apps.comptabilite.ecritures import ecrire_avoir_utilise
+        ecrire_avoir_utilise(self)

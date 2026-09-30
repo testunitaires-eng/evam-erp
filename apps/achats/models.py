@@ -151,7 +151,50 @@ class ArticleFournisseur(ValidationAvantEnregistrement, models.Model):
 
 class OrigineBesoin(models.TextChoices):
     AUTO_PRODUCTION = "AUTO_PRODUCTION", "Généré automatiquement par la production"
+    SEUIL_ALERTE = "SEUIL_ALERTE", "Stock passé sous le seuil d'alerte"
     MANUEL = "MANUEL", "Saisi manuellement"
+
+
+def verifier_seuil_alerte(article):
+    """
+    Circuit 3 (achats) : dès que le stock DISPONIBLE d'une matière
+    première (tous dépôts) passe sous son seuil d'alerte, un besoin
+    d'approvisionnement est créé automatiquement, pour la quantité
+    manquante (seuil - disponible). Un seul besoin ouvert par matière :
+    s'il existe déjà, sa quantité est mise à jour. Si le stock repasse
+    au-dessus du seuil avant toute demande d'achat, le besoin est soldé.
+    Appelé après chaque mouvement de stock (apps/stocks/signals.py).
+    """
+    from decimal import Decimal
+    from django.db.models import F as Champ, Sum
+    from apps.stocks.models import StockArticle
+    if article.type_article != "MATIERE_PREMIERE" or not article.stock_alerte:
+        return
+    disponible = StockArticle.objects.filter(article=article).aggregate(
+        total=Sum(Champ("quantite_physique") - Champ("quantite_bloquee") - Champ("quantite_reservee")),
+    )["total"] or Decimal("0")
+    besoin = BesoinApprovisionnement.objects.filter(
+        article=article, origine=OrigineBesoin.SEUIL_ALERTE, satisfait=False,
+    ).first()
+    manque = article.stock_alerte - disponible
+    if manque > 0:
+        if besoin is None:
+            besoin = BesoinApprovisionnement.objects.create(
+                article=article, quantite_besoin=manque, origine=OrigineBesoin.SEUIL_ALERTE,
+            )
+            from apps.core.notifications import notifier
+            from apps.comptes.models import Profil
+            notifier(
+                "Stock sous le seuil d'alerte : besoin d'achat",
+                f"{article.code} - {article.designation} : manque {manque}",
+                document=besoin, profils=[Profil.RESPONSABLE_ACHATS],
+            )
+        elif besoin.quantite_besoin != manque and not besoin.demandes_achat.exists():
+            besoin.quantite_besoin = manque
+            besoin.save()
+    elif besoin is not None and not besoin.demandes_achat.exists():
+        besoin.satisfait = True
+        besoin.save()
 
 
 class BesoinApprovisionnement(ValidationAvantEnregistrement, models.Model):
@@ -176,6 +219,25 @@ class BesoinApprovisionnement(ValidationAvantEnregistrement, models.Model):
 
     def clean(self):
         exiger_positif(self.quantite_besoin, "quantite_besoin", "La quantité nécessaire")
+
+    @transaction.atomic
+    def creer_demande_achat(self, demandeur):
+        """
+        Bouton « Créer une DA » de l'écran Besoins d'achat : la demande
+        reprend l'article et la quantité du besoin (rien à ressaisir) ;
+        le besoin est alors considéré comme pris en charge.
+        """
+        if self.satisfait:
+            raise ValueError("Ce besoin est déjà pris en charge.")
+        if self.demandes_achat.exclude(statut=StatutDemandeAchat.REJETEE).exists():
+            raise ValueError("Une demande d'achat est déjà en cours pour ce besoin.")
+        demande = DemandeAchat.objects.create(
+            besoin=self, article=self.article, quantite_demandee=self.quantite_besoin,
+            motif=f"{self.get_origine_display()} ({self.article.code})", demandeur=demandeur,
+        )
+        self.satisfait = True
+        self.save()
+        return demande
 
 
 class StatutDemandeAchat(models.TextChoices):
@@ -272,6 +334,10 @@ class DemandeAchat(ValidationAvantEnregistrement, models.Model):
         self.approuve_par = utilisateur
         self.date_traitement = timezone.now()
         self.save()
+        # Demande rejetée : le besoin d'origine redevient à traiter.
+        if self.besoin_id and self.besoin.satisfait:
+            self.besoin.satisfait = False
+            self.besoin.save()
 
 
 class StatutCommandeFournisseur(models.TextChoices):
@@ -552,10 +618,13 @@ class LigneReceptionAchat(ValidationAvantEnregistrement, models.Model):
                 depot=depot_par_defaut("Magasin principal"),
                 type_mouvement=TypeMouvement.ENTREE,
                 quantite=self.quantite_recue,
+                cout_unitaire=ligne_commande.prix_unitaire,   # valorisation au prix d'achat
                 motif=f"Réception achat {self.reception_id} - commande {commande.numero}",
                 document_origine=commande.numero,
                 utilisateur=self.reception.receptionne_par,
             )
+            from apps.comptabilite.ecritures import ecrire_reception
+            ecrire_reception(self)
 
 
 class MotifRetourFournisseur(models.TextChoices):

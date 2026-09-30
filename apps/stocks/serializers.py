@@ -35,6 +35,7 @@ class MouvementStockSerializer(ValidationModeleMixin, serializers.ModelSerialize
     class Meta:
         model = models.MouvementStock
         fields = "__all__"
+        read_only_fields = ["valeur"]
         extra_kwargs = {"utilisateur": {"required": False}}
 
 

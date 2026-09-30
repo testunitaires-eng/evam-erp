@@ -278,11 +278,19 @@ class Lot(ValidationAvantEnregistrement, models.Model):
         self.statut = StatutLot.LIBERE
         self.save()
         from apps.stocks.models import MouvementStock, TypeMouvement, depot_par_defaut
+        # Le produit fini entre en stock à son COÛT DE REVIENT réel (OF).
+        cout_unitaire = None
+        if self.ordre_fabrication_id:
+            from apps.couts.models import CoutReel
+            cout_reel, _ = CoutReel.objects.get_or_create(ordre_fabrication=self.ordre_fabrication)
+            cout_reel.calculer()
+            cout_unitaire = cout_reel.cout_unitaire_reel or None
         MouvementStock.objects.create(
             article=self.article,
             depot=depot_par_defaut("Dépôt produits finis"),
             type_mouvement=TypeMouvement.ENTREE,
             quantite=self.quantite,
+            cout_unitaire=cout_unitaire,
             motif=f"Libération qualité du lot {self.numero_lot}",
             document_origine=self.numero_lot,
             utilisateur=utilisateur,

@@ -1240,3 +1240,21 @@ class JournalCompletTests(BaseValidation):
         self.assertEqual([(l["action"], l["utilisateur_nom"]) for l in lignes], [("Création : Caisse", "admin")])
         _, api_caissier = self.ouvrir_caisse()
         self.assertEqual(api_caissier.get("/api/comptes/journal/").status_code, 403)
+
+
+class BesoinsMatieresAgentTests(BaseValidation):
+    def test_agent_lit_les_besoins_de_ses_of_uniquement(self):
+        agent = Utilisateur.objects.create_user("agent", password="x", profil=Profil.AGENT_PRODUCTION)
+        api = APIClient()
+        api.force_authenticate(agent)
+        mon_of = OrdreFabrication.objects.create(article=self.produit, quantite_a_produire=10, responsable=self.admin)
+        OrdreFabrication.objects.create(article=self.produit, quantite_a_produire=5, responsable=self.admin)
+        mon_of.affecter_agents([agent], par=self.admin)
+
+        r = api.get("/api/production/besoins-matieres/")
+        self.assertEqual(r.status_code, 200, r.content)
+        besoins = r.data["results"]
+        self.assertEqual([b["ordre_fabrication"] for b in besoins], [mon_of.id])          # pas l'autre OF
+        self.assertEqual((Decimal(besoins[0]["quantite_theorique"]), besoins[0]["situation"]), (Decimal("20"), "Insuffisant"))
+        self.assertNotIn("cout", " ".join(besoins[0].keys()))                             # aucune donnée financière
+        self.assertEqual(api.get(f"/api/production/besoins-matieres/?ordre_fabrication={mon_of.id}").data["count"], 1)

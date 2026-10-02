@@ -439,9 +439,10 @@ class CompositionEtDemandeMatieresTests(BaseValidation):
         api = APIClient()
         api.force_authenticate(responsable)
         donnees = {"fiche_technique": fiche.id, "matiere": self.matiere.id, "quantite_necessaire": "1"}
-        self.assertEqual(api.post("/api/referentiel/compositions/", donnees, format="json").status_code, 403)
+        self.assertEqual(api.post("/api/referentiel/compositions/", {**donnees, "prix_unitaire": "300"}, format="json").status_code, 403)
         self.assertEqual(api.get("/api/referentiel/compositions/").status_code, 200)
-        self.assertEqual(self.api.post("/api/referentiel/compositions/", donnees, format="json").status_code, 201)
+        self.assertIn("prix_unitaire", self.assert_refus(self.api.post("/api/referentiel/compositions/", donnees, format="json")).data)
+        self.assertEqual(self.api.post("/api/referentiel/compositions/", {**donnees, "prix_unitaire": "300"}, format="json").status_code, 201)
 
     def test_produit_fini_refuse_dans_une_composition(self):
         fiche = FicheTechnique.objects.create(article=self.produit, version=2, cree_par=self.admin)
@@ -540,8 +541,8 @@ class ChoixCompositionTests(BaseValidation):
 
     def test_ajout_groupe_et_infos_reprises_de_la_base(self):
         r = self.api.post(self.base + "ajouter_elements/", {"elements": [
-            {"matiere": self.matiere.id, "quantite_necessaire": "0.5"},
-            {"matiere": self.bouteille.id, "quantite_necessaire": "1"},
+            {"matiere": self.matiere.id, "quantite_necessaire": "0.5", "prix_unitaire": "300"},
+            {"matiere": self.bouteille.id, "quantite_necessaire": "1", "prix_unitaire": "75"},
         ]}, format="json")
         self.assertEqual(r.status_code, 201, r.content)
         lignes = {l["matiere_code"]: (l["matiere_designation"], l["unite_mesure"]) for l in r.data["composition"]}
@@ -1258,3 +1259,56 @@ class BesoinsMatieresAgentTests(BaseValidation):
         self.assertEqual((Decimal(besoins[0]["quantite_theorique"]), besoins[0]["situation"]), (Decimal("20"), "Insuffisant"))
         self.assertNotIn("cout", " ".join(besoins[0].keys()))                             # aucune donnée financière
         self.assertEqual(api.get(f"/api/production/besoins-matieres/?ordre_fabrication={mon_of.id}").data["count"], 1)
+
+
+class ChiffrageMatieresTests(BaseValidation):
+    def setUp(self):
+        super().setUp()
+        self.yaourt = self.nouveau_pf(famille="Yaourt", parfum="Fraise", format="125 g", unite="Carton de 12")
+        self.ferment = Article.objects.create(type_article="MATIERE_PREMIERE", unite_mesure="L")
+        self.pot = Article.objects.create(type_article="PRODUIT_INTERMEDIAIRE", unite_mesure="UNITE")
+        self.fiche = FicheTechnique.objects.create(article=self.yaourt, version=1, cree_par=self.admin)
+        r = self.api.post(f"/api/referentiel/fiches-techniques/{self.fiche.id}/ajouter_elements/", {"elements": [
+            {"matiere": self.ferment.id, "quantite_necessaire": "1", "prix_unitaire": "1000"},     # 1 L de ferment à 1000
+            {"matiere": self.pot.id, "quantite_necessaire": "12", "prix_unitaire": "25"},          # 12 pots à 25
+        ]}, format="json")
+        self.assertEqual(r.status_code, 201, r.content)
+        self.assertEqual(Decimal(str(r.data["cout_matieres_par_unite"])), Decimal("1300"))         # 1000 + 300 par carton
+        self.fiche.valider(self.admin)
+        self.responsable = Utilisateur.objects.create_user("rp", password="x", profil=Profil.RESPONSABLE_PRODUCTION)
+        self.api_rp = APIClient()
+        self.api_rp.force_authenticate(self.responsable)
+
+    def test_of_de_4_cartons_chiffre(self):
+        r = self.api_rp.post("/api/production/ordres-fabrication/", {"article": self.yaourt.id, "quantite_a_produire": "4"}, format="json")
+        self.assertEqual(r.status_code, 201, r.content)
+        of_id = r.data["id"]
+        besoins = {b["matiere"]: b for b in self.api_rp.get(f"/api/production/besoins-matieres/?ordre_fabrication={of_id}").data["results"]}
+        self.assertEqual(Decimal(besoins[self.ferment.id]["montant"]), Decimal("4000.00"))       # 4 x 1 L x 1000
+        self.assertEqual(Decimal(besoins[self.pot.id]["montant"]), Decimal("1200.00"))           # 4 x 12 x 25
+        self.assertEqual(Decimal(self.api_rp.get(f"/api/production/ordres-fabrication/{of_id}/").data["montant_total_matieres"]), Decimal("5200.00"))
+
+        demandes = self.api_rp.post(f"/api/production/ordres-fabrication/{of_id}/demander_matieres/").data
+        self.assertEqual({d["matiere_code"]: Decimal(d["montant"]) for d in demandes},
+                         {self.ferment.code: Decimal("4000.00"), self.pot.code: Decimal("1200.00")})
+
+    def test_prix_mis_a_jour_sans_toucher_aux_of_existants(self):
+        ancien = self.api_rp.post("/api/production/ordres-fabrication/", {"article": self.yaourt.id, "quantite_a_produire": "4"}, format="json").data["id"]
+        ligne = CompositionFicheTechnique.objects.get(fiche_technique=self.fiche, matiere=self.ferment)
+        url = f"/api/referentiel/compositions/{ligne.id}/"
+        self.assertEqual(self.api.patch(url, {"prix_unitaire": "1100"}, format="json").status_code, 200)   # fiche validée : prix seul OK
+        self.assert_refus(self.api.patch(url, {"quantite_necessaire": "2"}, format="json"))              # quantité figée
+        nouveau = self.api_rp.post("/api/production/ordres-fabrication/", {"article": self.yaourt.id, "quantite_a_produire": "4"}, format="json").data["id"]
+        total = lambda of_id: Decimal(self.api_rp.get(f"/api/production/ordres-fabrication/{of_id}/").data["montant_total_matieres"])
+        self.assertEqual((total(ancien), total(nouveau)), (Decimal("5200.00"), Decimal("5600.00")))
+
+    def test_agent_ne_voit_pas_les_montants(self):
+        of_id = self.api_rp.post("/api/production/ordres-fabrication/", {"article": self.yaourt.id, "quantite_a_produire": "4"}, format="json").data["id"]
+        agent = Utilisateur.objects.create_user("agent", password="x", profil=Profil.AGENT_PRODUCTION)
+        OrdreFabrication.objects.get(pk=of_id).affecter_agents([agent], par=self.responsable)
+        api = APIClient()
+        api.force_authenticate(agent)
+        besoin = api.get("/api/production/besoins-matieres/").data["results"][0]
+        self.assertNotIn("montant", besoin)
+        self.assertNotIn("prix_unitaire", besoin)
+        self.assertNotIn("montant_total_matieres", api.get(f"/api/production/ordres-fabrication/{of_id}/").data)

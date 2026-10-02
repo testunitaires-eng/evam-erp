@@ -1420,14 +1420,27 @@ class OrdreFabrication(ValidationAvantEnregistrement, models.Model):
         )
         if fiche is None:
             return
+        from decimal import Decimal
         for ligne in fiche.composition.all():
+            quantite = ligne.quantite_necessaire * Decimal(self.quantite_a_produire)
+            # Chiffrage : quantité à produire x quantité par unité x prix unitaire
+            # de la fiche, FIGÉ dans l'OF (un changement de prix ultérieur ne
+            # modifie pas les OF déjà lancés).
             BesoinMatierePrevu.objects.update_or_create(
                 ordre_fabrication=self,
                 matiere=ligne.matiere,
                 defaults={
-                    "quantite_theorique": ligne.quantite_necessaire * self.quantite_a_produire
+                    "quantite_theorique": quantite,
+                    "prix_unitaire": ligne.prix_unitaire,
+                    "montant": (quantite * ligne.prix_unitaire).quantize(Decimal("0.01")),
                 },
             )
+
+    @property
+    def montant_total_matieres(self):
+        """Montant total des éléments nécessaires à l'OF (somme des besoins chiffrés)."""
+        from django.db.models import Sum
+        return self.besoins_matieres.aggregate(total=Sum("montant"))["total"] or 0
 
     @staticmethod
     def verifier_agents(agents):
@@ -1487,9 +1500,12 @@ class OrdreFabrication(ValidationAvantEnregistrement, models.Model):
                 ordre_fabrication=self, matiere=besoin.matiere, demandeur=demandeur,
                 # quantite_theorique a 4 décimales, la demande 3 : on arrondit
                 # au-dessus pour ne jamais demander moins que nécessaire.
-                quantite_demandee=besoin.quantite_theorique.quantize(Decimal("0.001"), rounding=ROUND_UP),
+                quantite_demandee=quantite,
+                prix_unitaire=besoin.prix_unitaire,
+                montant=(quantite * besoin.prix_unitaire).quantize(Decimal("0.01")),
             )
             for besoin in besoins
+            for quantite in [besoin.quantite_theorique.quantize(Decimal("0.001"), rounding=ROUND_UP)]
         ]
 
     def calculer_consommation_reelle(self):
@@ -1550,6 +1566,11 @@ class BesoinMatierePrevu(models.Model):
     )
     matiere = models.ForeignKey(Article, verbose_name="Matière", on_delete=models.PROTECT)
     quantite_theorique = models.DecimalField("Quantité théorique nécessaire", max_digits=14, decimal_places=4)
+    prix_unitaire = models.DecimalField(
+        "Prix unitaire", max_digits=14, decimal_places=2, default=0,
+        help_text="Prix de la fiche technique au moment de la création de l'OF (figé).",
+    )
+    montant = models.DecimalField("Montant", max_digits=16, decimal_places=2, default=0)
 
     class Meta:
         verbose_name = "Besoin matière prévu"
@@ -1600,6 +1621,11 @@ class DemandeMatiere(ValidationAvantEnregistrement, models.Model):
     )
     matiere = models.ForeignKey(Article, verbose_name="Matière", on_delete=models.PROTECT)
     quantite_demandee = models.DecimalField("Quantité demandée", max_digits=14, decimal_places=3)
+    prix_unitaire = models.DecimalField(
+        "Prix unitaire", max_digits=14, decimal_places=2, default=0,
+        help_text="Repris du besoin chiffré de l'OF.",
+    )
+    montant = models.DecimalField("Montant", max_digits=16, decimal_places=2, default=0)
     quantite_livree = models.DecimalField(
         "Quantité déjà livrée", max_digits=14, decimal_places=3, default=0,
         help_text="Cumul des livraisons (partielles) du magasin : empêche de livrer plus que demandé.",

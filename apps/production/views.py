@@ -401,14 +401,27 @@ class OrdreFabricationViewSet(HistoriqueMixin, viewsets.ModelViewSet):
 
 
 class BesoinMatierePrevuViewSet(viewsets.ReadOnlyModelViewSet):
-    """Lecture seule : calculé automatiquement à la création de l'OF."""
+    """
+    Lecture seule : calculé automatiquement à la création de l'OF.
+    L'Agent Production consulte les besoins de SES OF uniquement (ceux où
+    il est affecté) ; aucune donnée financière n'y figure.
+    """
     queryset = models.BesoinMatierePrevu.objects.all()
     serializer_class = serializers.BesoinMatierePrevuSerializer
     permission_classes = [acces(
-        lecture=(Profil.RESPONSABLE_PRODUCTION, Profil.MAGASINIER, Profil.ADMIN_SI, Profil.DIRECTION,),
+        lecture=(
+            Profil.RESPONSABLE_PRODUCTION, Profil.MAGASINIER, Profil.ADMIN_SI, Profil.DIRECTION,
+            Profil.AGENT_PRODUCTION,
+        ),
         ecriture=(),
     )]
     filterset_fields = ["ordre_fabrication", "matiere"]
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        if est_agent(self.request.user):
+            return queryset.filter(ordre_fabrication__agents_affectes=self.request.user)
+        return queryset
 
     def list(self, request, *args, **kwargs):
         """Ajoute stock_disponible / manquant / situation (§5.5) à chaque ligne, sans les stocker en base."""

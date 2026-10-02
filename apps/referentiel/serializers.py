@@ -127,14 +127,22 @@ class CompositionFicheTechniqueSerializer(ValidationModeleMixin, serializers.Mod
     matiere_designation = serializers.CharField(source="matiere.designation", read_only=True)
     matiere_type = serializers.CharField(source="matiere.type_article", read_only=True)
     unite_mesure = serializers.CharField(source="matiere.unite_mesure", read_only=True)
+    montant_par_unite = serializers.DecimalField(max_digits=16, decimal_places=2, read_only=True)
 
     class Meta:
         model = models.CompositionFicheTechnique
         fields = "__all__"
+        # Chaque élément de la recette doit être chiffré (montant des besoins des OF).
+        extra_kwargs = {"prix_unitaire": {"required": True}}
 
 
 class FicheTechniqueSerializer(ValidationModeleMixin, serializers.ModelSerializer):
     composition = CompositionFicheTechniqueSerializer(many=True, read_only=True)
+    # Coût des matières pour UNE unité du produit (somme des éléments).
+    cout_matieres_par_unite = serializers.SerializerMethodField()
+
+    def get_cout_matieres_par_unite(self, fiche):
+        return sum((ligne.montant_par_unite for ligne in fiche.composition.all()), 0)
 
     class Meta:
         model = models.FicheTechnique

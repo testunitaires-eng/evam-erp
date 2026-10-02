@@ -772,7 +772,7 @@ class FicheTechnique(ValidationAvantEnregistrement, models.Model):
     def ajouter_elements(self, elements):
         """
         Ajoute plusieurs éléments choisis en une fois :
-        elements = [{"matiere": <id article>, "quantite_necessaire": ...}, ...]
+        elements = [{"matiere": <id article>, "quantite_necessaire": ..., "prix_unitaire": ...}, ...]
         Tout ou rien : si un seul élément est invalide (inexistant,
         produit fini, doublon, quantité <= 0, fiche non brouillon...),
         aucun n'est ajouté. Lève ValidationError (message par élément).
@@ -790,9 +790,12 @@ class FicheTechnique(ValidationAvantEnregistrement, models.Model):
                     raise ValidationError(f"Article introuvable (id {element.get('matiere')!r}).")
                 try:
                     quantite = convertir_decimal(element.get("quantite_necessaire"), "La quantité nécessaire")
+                    prix = convertir_decimal(element.get("prix_unitaire"), "Le prix unitaire", strict=False)
                 except ValueError as erreur:
                     raise ValidationError(str(erreur))
-                ligne = CompositionFicheTechnique(fiche_technique=self, matiere=matiere, quantite_necessaire=quantite)
+                ligne = CompositionFicheTechnique(
+                    fiche_technique=self, matiere=matiere, quantite_necessaire=quantite, prix_unitaire=prix,
+                )
                 ligne.save()
                 lignes.append(ligne)
             except ValidationError as erreur:
@@ -844,6 +847,11 @@ class CompositionFicheTechnique(ValidationAvantEnregistrement, models.Model):
         "Quantité nécessaire par unité produite",
         max_digits=12, decimal_places=4,
     )
+    prix_unitaire = models.DecimalField(
+        "Prix unitaire de l'élément", max_digits=14, decimal_places=2, default=0,
+        help_text="Prix d'une unité de la matière (ex : 1 000 FCFA le litre de ferment). Sert à chiffrer "
+                  "les besoins matières de chaque OF (quantité à produire x quantité nécessaire x prix).",
+    )
 
     class Meta:
         verbose_name = "Ligne de composition"
@@ -853,14 +861,39 @@ class CompositionFicheTechnique(ValidationAvantEnregistrement, models.Model):
     def __str__(self):
         return f"{self.fiche_technique} : {self.quantite_necessaire} {self.matiere.unite_mesure} de {self.matiere.designation}"
 
+    @property
+    def montant_par_unite(self):
+        """Coût de cet élément pour UNE unité produite (quantité nécessaire x prix unitaire)."""
+        from decimal import Decimal
+        return (Decimal(self.quantite_necessaire) * Decimal(self.prix_unitaire)).quantize(Decimal("0.01"))
+
+    def seul_le_prix_change(self):
+        """Mise à jour du prix seul : permise même sur une fiche validée (les quantités restent figées)."""
+        if self.pk is None:
+            return False
+        for champ in ("fiche_technique", "matiere", "quantite_necessaire"):
+            attribut = f"{champ}_id" if champ != "quantite_necessaire" else champ
+            if valeur_en_base(self, champ) != getattr(self, attribut):
+                return False
+        return True
+
     def clean(self):
-        """La composition ne se modifie que tant que la fiche est en brouillon."""
+        """
+        La composition (matières, quantités) ne se modifie que tant que la
+        fiche est en brouillon. Le PRIX d'un élément peut être mis à jour
+        sur une fiche brouillon ou validée : il ne s'applique qu'aux OF
+        créés ensuite (les OF existants gardent le prix de leur création).
+        """
         exiger_positif(self.quantite_necessaire, "quantite_necessaire", "La quantité nécessaire")
-        if self.pk:
+        exiger_positif(self.prix_unitaire, "prix_unitaire", "Le prix unitaire", strict=False)
+        mise_a_jour_prix = self.seul_le_prix_change()
+        if mise_a_jour_prix and self.fiche_technique.statut == StatutFicheTechnique.ARCHIVEE:
+            raise ValidationError("Cette fiche technique est archivée : ses prix ne se modifient plus.")
+        if self.pk and not mise_a_jour_prix:
             ancienne_fiche = FicheTechnique.objects.filter(pk=valeur_en_base(self, "fiche_technique")).first()
             if ancienne_fiche and ancienne_fiche.statut != StatutFicheTechnique.BROUILLON:
-                raise ValidationError("Cette fiche technique n'est plus en brouillon : sa composition est figée.")
-        if self.fiche_technique_id:
+                raise ValidationError("Cette fiche technique n'est plus en brouillon : sa composition est figée (seul le prix peut être mis à jour).")
+        if self.fiche_technique_id and not mise_a_jour_prix:
             fiche = self.fiche_technique
             if fiche.statut != StatutFicheTechnique.BROUILLON:
                 raise ValidationError({"fiche_technique": (

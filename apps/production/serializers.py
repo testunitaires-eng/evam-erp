@@ -71,6 +71,23 @@ def nom_utilisateur(utilisateur):
     return utilisateur.get_full_name() or utilisateur.username
 
 
+class SansDonneesFinancieresPourAgentMixin:
+    """
+    L'Agent Production ne voit aucune donnée financière (prix, montants) :
+    ces champs sont retirés de la réponse quand c'est lui qui consulte.
+    """
+    CHAMPS_FINANCIERS = ("prix_unitaire", "montant", "montant_total_matieres")
+
+    def to_representation(self, instance):
+        donnees = super().to_representation(instance)
+        requete = self.context.get("request")
+        utilisateur = getattr(requete, "user", None)
+        if utilisateur is not None and getattr(utilisateur, "profil", None) == "AGENT_PRODUCTION" and not utilisateur.is_superuser:
+            for champ in self.CHAMPS_FINANCIERS:
+                donnees.pop(champ, None)
+        return donnees
+
+
 class SaisiParMixin(serializers.Serializer):
     saisi_par_nom = serializers.SerializerMethodField()
 
@@ -92,7 +109,9 @@ class PlanProductionSerializer(ValidationModeleMixin, serializers.ModelSerialize
         return valeur
 
 
-class OrdreFabricationSerializer(ValidationModeleMixin, serializers.ModelSerializer):
+class OrdreFabricationSerializer(SansDonneesFinancieresPourAgentMixin, ValidationModeleMixin, serializers.ModelSerializer):
+    montant_total_matieres = serializers.DecimalField(max_digits=16, decimal_places=2, read_only=True)
+
     class Meta:
         model = models.OrdreFabrication
         fields = "__all__"
@@ -116,13 +135,13 @@ class OrdreFabricationSerializer(ValidationModeleMixin, serializers.ModelSeriali
         return agents
 
 
-class BesoinMatierePrevuSerializer(ValidationModeleMixin, serializers.ModelSerializer):
+class BesoinMatierePrevuSerializer(SansDonneesFinancieresPourAgentMixin, ValidationModeleMixin, serializers.ModelSerializer):
     class Meta:
         model = models.BesoinMatierePrevu
         fields = "__all__"
 
 
-class DemandeMatiereSerializer(ValidationModeleMixin, serializers.ModelSerializer):
+class DemandeMatiereSerializer(SansDonneesFinancieresPourAgentMixin, ValidationModeleMixin, serializers.ModelSerializer):
     of_numero = serializers.CharField(source="ordre_fabrication.numero", read_only=True)
     matiere_code = serializers.CharField(source="matiere.code", read_only=True)
     matiere_designation = serializers.CharField(source="matiere.designation", read_only=True)
@@ -138,7 +157,10 @@ class DemandeMatiereSerializer(ValidationModeleMixin, serializers.ModelSerialize
         # Les demandes sont générées depuis la composition de l'OF
         # (/ordres-fabrication/{id}/demander_matieres/) : OF, matière et
         # quantité ne se saisissent pas.
-        read_only_fields = ["demandeur", "quantite_livree", "ordre_fabrication", "matiere", "quantite_demandee"]
+        read_only_fields = [
+            "demandeur", "quantite_livree", "ordre_fabrication", "matiere", "quantite_demandee",
+            "prix_unitaire", "montant",
+        ]
 
     def validate_statut(self, valeur):
         actuel = self.instance.statut if self.instance is not None else models.StatutDemandeMatiere.A_PREPARER

@@ -118,7 +118,7 @@ class FicheTechniqueViewSet(HistoriqueMixin, viewsets.ModelViewSet):
     def ajouter_elements(self, request, pk=None):
         """
         POST /api/referentiel/fiches-techniques/{id}/ajouter_elements/
-        Corps : {"elements": [{"matiere": <id>, "quantite_necessaire": "0.5"}, ...]}
+        Corps : {"elements": [{"matiere": <id>, "quantite_necessaire": "0.5", "prix_unitaire": "1000"}, ...]}
         Ajoute en une fois les éléments choisis dans la liste
         elements_disponibles (tout ou rien). Réservé à l'ADMIN_SI.
         """

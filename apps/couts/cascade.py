@@ -50,25 +50,21 @@ def valeur_inducteur(of, inducteur, etape=None):
     reçoit rien de cette charge (pas de valeur inventée).
     """
     from apps.couts.models import CoutMainOeuvre
-    article = of.article
-    quantite = of.quantite_produite_bonne
+    formats = of.quantites_par_format()   # {article: quantité bonne} (un ou plusieurs formats)
+    if inducteur in (Inducteur.BOUTEILLES, Inducteur.PACKS, Inducteur.PALETTES, Inducteur.LITRES_PRODUITS):
+        total, nature = Decimal(0), "CALCULE"
+        for article, quantite in formats.items():
+            valeur, nature_format, _ = valeur_format(article, quantite, inducteur)
+            if valeur is None:
+                return None, None, f"donnée manquante pour {article.code} (contenance ou packs par palette)"
+            total += valeur
+        return total, nature, "quantités produites bonnes de chaque format"
     if inducteur == Inducteur.VOLUME_EAU_M3:
         volume = of.volume_eau()
         if volume["litres"] is None:
             return None, None, "volume d'eau inconnu"
         source = "suivi eau (mesuré)" if volume["statut"] == "MESURE" else "consommation d'eau traitée"
         return Decimal(volume["litres"]) / Decimal(1000), volume["statut"], source
-    if inducteur == Inducteur.BOUTEILLES:
-        return article.en_unites(quantite), "CALCULE", "quantité produite bonne x unités par unité de stock"
-    if inducteur == Inducteur.PACKS:
-        return article.en_packs(quantite), "CALCULE", "unités produites / unités par pack"
-    if inducteur == Inducteur.PALETTES:
-        valeur = article.en_palettes(quantite)
-        return valeur, "CALCULE" if valeur is not None else None, "packs / packs par palette"
-    if inducteur == Inducteur.LITRES_PRODUITS:
-        if article.unite_contenance != "L":
-            return None, None, "contenance en litres inconnue"
-        return article.en_contenance(quantite), "CALCULE", "unités produites x contenance"
     if inducteur in (Inducteur.HEURES_MACHINE, Inducteur.KWH):
         etapes = of.etapes.all()
         if etape is not None:
@@ -145,6 +141,36 @@ def charges_changements_serie(periode):
             charge.save()
 
 
+def valeur_format(article, quantite, inducteur):
+    """Valeur d'un inducteur de volume pour un format : (valeur | None, nature, libellé)."""
+    if inducteur == Inducteur.BOUTEILLES:
+        return article.en_unites(quantite), "CALCULE", "bouteilles / pots"
+    if inducteur == Inducteur.PACKS:
+        return article.en_packs(quantite), "CALCULE", "packs"
+    if inducteur == Inducteur.PALETTES:
+        return article.en_palettes(quantite), "CALCULE", "palettes"
+    if article.unite_contenance == "L" and article.contenance:
+        return article.en_contenance(quantite), "CALCULE", "litres"
+    return None, None, "litres"
+
+
+def cle_entre_formats(formats, inducteur):
+    """
+    Clé de ventilation de la part d'un OF entre ses formats : l'inducteur de
+    la charge s'il se mesure par format (bouteilles, packs, palettes,
+    litres) ; sinon les litres produits (volume réellement traité), à défaut
+    les bouteilles / pots. Retourne ([(article, valeur)], libellé).
+    """
+    if inducteur in (Inducteur.BOUTEILLES, Inducteur.PACKS, Inducteur.PALETTES, Inducteur.LITRES_PRODUITS):
+        parts = [(article, valeur_format(article, quantite, inducteur)[0]) for article, quantite in formats.items()]
+        if all(valeur for _, valeur in parts):
+            return parts, valeur_format(next(iter(formats)), 1, inducteur)[2]
+    litres = [(article, valeur_format(article, quantite, Inducteur.LITRES_PRODUITS)[0]) for article, quantite in formats.items()]
+    if all(valeur for _, valeur in litres):
+        return litres, "litres produits"
+    return [(article, article.en_unites(quantite)) for article, quantite in formats.items()], "bouteilles / pots produits"
+
+
 def ventiler(montant, parts):
     """
     Répartit `montant` selon [(cible, valeur)] au centime près ; l'écart
@@ -176,25 +202,40 @@ def _ligne(charge, niveau, montant, quote_part, parent=None, **champs):
 
 
 def _descendre_au_produit(ligne_of):
-    """OF -> produit / format -> pack -> unité (un OF = un format : la part va entière au produit)."""
+    """
+    OF -> produit / format -> pack -> unité. Un seul format : la part de l'OF
+    va entière au produit. Plusieurs formats : ventilée entre eux selon
+    l'inducteur de la charge (sinon les litres produits), sans double compte.
+    """
     of = ligne_of.ordre_fabrication
-    article = of.article
-    quantite = of.quantite_produite_bonne
-    unites = article.en_unites(quantite)
-    packs = article.en_packs(quantite)
-    return _ligne(
-        ligne_of.charge, NiveauRepartition.PRODUIT, ligne_of.montant, Decimal(1), parent=ligne_of,
-        activite=ligne_of.activite, ordre_fabrication=of, article=article,
-        valeur_cle_totale=ligne_of.valeur_cle_part, valeur_cle_part=ligne_of.valeur_cle_part,
-        quantite_produite=quantite,
-        cout_par_unite=(ligne_of.montant / unites) if unites else None,
-        cout_par_pack=(ligne_of.montant / packs) if packs else None,
-        statut=ligne_of.statut, inducteur=ligne_of.inducteur, unite_cle=ligne_of.unite_cle,
-        justification=(
-            f"{article.code} : {unites.normalize()} unités, {packs.normalize()} packs de {article.unites_par_pack or 1} "
-            f"-> {ligne_of.montant} ramené au pack puis à l'unité."
-        ),
-    )
+    formats = of.quantites_par_format()
+    if len(formats) == 1:
+        repartition, libelle = [(next(iter(formats)), ligne_of.valeur_cle_part or Decimal(1))], None
+        total, ventilation = None, [[repartition[0][0], repartition[0][1], ligne_of.montant]]
+    else:
+        repartition, libelle = cle_entre_formats(formats, ligne_of.inducteur)
+        total, ventilation = ventiler(ligne_of.montant, repartition)
+    lignes = []
+    for article, valeur, montant in ventilation:
+        quantite = formats[article]
+        unites = article.en_unites(quantite)
+        packs = article.en_packs(quantite)
+        lignes.append(_ligne(
+            ligne_of.charge, NiveauRepartition.PRODUIT, montant, (valeur / total) if total else Decimal(1), parent=ligne_of,
+            activite=ligne_of.activite, ordre_fabrication=of, article=article,
+            valeur_cle_totale=total if total else ligne_of.valeur_cle_part, valeur_cle_part=valeur if total else ligne_of.valeur_cle_part,
+            quantite_produite=quantite,
+            cout_par_unite=(montant / unites) if unites else None,
+            cout_par_pack=(montant / packs) if packs else None,
+            statut=ligne_of.statut, inducteur=ligne_of.inducteur,
+            unite_cle=libelle or ligne_of.unite_cle,
+            justification=(
+                (f"OF à plusieurs formats : part ventilée selon les {libelle}. " if libelle else "")
+                + f"{article.code} : {unites.normalize()} unités, {packs.normalize()} packs de {article.unites_par_pack or 1} "
+                f"-> {montant} ramené au pack puis à l'unité."
+            ),
+        ))
+    return lignes
 
 
 def _repartir_production(charge):
@@ -329,10 +370,20 @@ def _repartir_hors_production(charge):
             articles = articles.filter(activite=charge.activite)
         parts = [(article, valeur) for article in articles for valeur in [palettes_jours(article, periode)] if valeur]
         source = "stock quotidien des lieux produits finis / packs par palette"
-    elif inducteur == Inducteur.QUANTITE_LIVREE:
+    elif inducteur in (Inducteur.QUANTITE_LIVREE, Inducteur.PALETTES_LIVREES, Inducteur.LITRES_LIVRES):
+        # Q59 : coût de tournée réparti selon une clé justifiable (unités, palettes ou volume livrés).
         livrees = quantites_livrees(periode, charge.tournee if charge.tournee_id else None)
-        parts = [(article, q) for article, q in livrees.items() if q and (not charge.activite_id or article.activite_id == charge.activite_id)]
-        source = "bons de livraison livrés"
+        parts = []
+        for article, unites in livrees.items():
+            if not unites or (charge.activite_id and article.activite_id != charge.activite_id):
+                continue
+            quantite = unites / article.facteur_unites
+            valeur = (unites if inducteur == Inducteur.QUANTITE_LIVREE
+                      else article.en_palettes(quantite) if inducteur == Inducteur.PALETTES_LIVREES
+                      else article.en_contenance(quantite) if article.unite_contenance == "L" else None)
+            if valeur:
+                parts.append((article, valeur))
+        source = f"bons de livraison livrés ({UNITES_INDUCTEURS[inducteur]})"
     elif inducteur == Inducteur.KM:
         debut, fin = bornes(periode)
         tournees = [charge.tournee] if charge.tournee_id else list(Tournee.objects.filter(date_tournee__gte=debut, date_tournee__lt=fin))
@@ -354,7 +405,8 @@ def _repartir_hors_production(charge):
     total, ventilation = ventiler(charge.montant, parts)
     produites = {}
     for of in ofs_de_la_periode(periode):
-        produites[of.article_id] = produites.get(of.article_id, Decimal(0)) + of.quantite_produite_bonne
+        for article, quantite in of.quantites_par_format().items():
+            produites[article.pk] = produites.get(article.pk, Decimal(0)) + quantite
     for article, valeur, montant in ventilation:
         quantite = produites.get(article.pk)
         unites = article.en_unites(quantite) if quantite else None
@@ -451,13 +503,15 @@ def generer_amortissements(periode, utilisateur=None):
                 continue
         etape = equipement.poste.etape if equipement.poste_id else None
         amont = etape is not None and etape.phase == PhaseEtape.AMONT
+        inducteur = equipement.inducteur_amortissement or (Inducteur.VOLUME_EAU_M3 if amont else Inducteur.HEURES_MACHINE)
+        # Une seule charge par équipement, même s'il réalise plusieurs postes (pas de double compte, Q56).
         nature, _ = NatureCout.objects.get_or_create(
-            libelle=f"Amortissement {etape.libelle if etape else 'équipements'}", etape=etape,
+            libelle=f"Amortissement {etape.libelle if etape else 'équipements'} ({Inducteur(inducteur).label})", etape=etape,
             categorie=CategorieCout.PRODUCTION,
             defaults={
                 "categorie_economique": CategorieEconomique.AMORTISSEMENT, "traitement": Traitement.INDIRECT,
-                "inducteur": Inducteur.VOLUME_EAU_M3 if amont else Inducteur.HEURES_MACHINE,
-                "justification": "Équipement commun : volume d'eau affecté (amont) ou heures d'utilisation.",
+                "inducteur": inducteur,
+                "justification": "Amortissement mensuel imputé selon l'usage réel de l'équipement (inducteur paramétré).",
             },
         )
         source = f"Amortissement {equipement.code}"
@@ -517,6 +571,7 @@ def cout_revient(periode):
             if ligne.charge.source.startswith(SOURCE_CHANGEMENT_SERIE) or ligne.charge.nature.inducteur == Inducteur.TEMPS_CHANGEMENT_SERIE:
                 changement_serie += ligne.montant
         total = cout.cout_total
+        ventilation = cout.ventilation_par_format()
         par_of.append({
             "of": of.numero, "article": article.code, "quantite_produite": quantite, "unites": unites, "packs": packs,
             "matieres": cout.cout_matiere_total, "main_oeuvre": cout.cout_main_oeuvre_total,
@@ -526,13 +581,19 @@ def cout_revient(periode):
             "cout_production": total,
             "cout_par_unite": (total / unites) if unites else None,
             "cout_par_pack": (total / packs) if packs else None,
+            "formats": [
+                {"article": l["article"].code, "quantite": l["quantite"], "unites": l["unites"], "cout": l["cout"],
+                 "cout_par_unite": (l["cout"] / l["unites"]) if l["unites"] else None}
+                for l in ventilation
+            ],
         })
-        donnees = par_article.setdefault(article.pk, {
-            "article": article.code, "designation": article.designation, "unites": Decimal(0), "production": Decimal(0),
-            "stockage": Decimal(0), "distribution": Decimal(0),
-        })
-        donnees["unites"] += unites
-        donnees["production"] += total
+        for l in ventilation:
+            donnees = par_article.setdefault(l["article"].pk, {
+                "article": l["article"].code, "designation": l["article"].designation, "unites": Decimal(0),
+                "production": Decimal(0), "stockage": Decimal(0), "distribution": Decimal(0),
+            })
+            donnees["unites"] += l["unites"]
+            donnees["production"] += l["cout"]
     for ligne in RepartitionCout.objects.filter(charge__periode=periode, niveau=NiveauRepartition.ARTICLE).select_related("article", "charge__nature"):
         donnees = par_article.setdefault(ligne.article_id, {
             "article": ligne.article.code, "designation": ligne.article.designation, "unites": Decimal(0),

@@ -299,3 +299,29 @@ class AvoirSerializer(ValidationModeleMixin, serializers.ModelSerializer):
                 "seule l'annulation (ANNULE) peut être demandée ici."
             )
         return valeur
+
+
+class LigneDevisSerializer(ValidationModeleMixin, serializers.ModelSerializer):
+    article_code = serializers.CharField(source="article.code", read_only=True)
+    article_designation = serializers.CharField(source="article.designation", read_only=True)
+    montant_ht = serializers.DecimalField(max_digits=16, decimal_places=2, read_only=True)
+
+    class Meta:
+        model = models.LigneDevis
+        fields = "__all__"
+
+
+class DevisSerializer(ValidationModeleMixin, serializers.ModelSerializer):
+    lignes = LigneDevisSerializer(many=True, read_only=True)
+    client_nom = serializers.CharField(source="client.nom", read_only=True)
+    totaux = serializers.SerializerMethodField()
+    commandes = serializers.SlugRelatedField(many=True, read_only=True, slug_field="numero")
+
+    class Meta:
+        model = models.Devis
+        fields = "__all__"
+        read_only_fields = ["statut", "cree_par", "date_envoi", "date_reponse", "motif_refus"]
+        extra_kwargs = {"cree_par": {"required": False}}
+
+    def get_totaux(self, devis):
+        return devis.totaux()

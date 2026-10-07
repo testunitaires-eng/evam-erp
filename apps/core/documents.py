@@ -62,6 +62,8 @@ def facture(facture, utilisateur=None):
     else:
         totaux.append(("Net à payer TTC (FCFA)", montant(facture.montant_total)))
     document.avec_totaux(totaux, en_lettres_de=facture.montant_total, libelle_lettres="Arrêtée la présente facture à la somme de")
+    if facture.sfec_statut == "CERTIFIEE":
+        document.avec_certification(facture)
     document.avec_texte(document.entreprise.conditions_paiement)
     return document.avec_signatures("Le client", f"Pour {document.entreprise.raison_sociale}")
 
@@ -268,3 +270,26 @@ def etiquette_palettes(palettes, utilisateur=None):
         page.showPage()
     page.save()
     return tampon.getvalue()
+
+
+
+def devis(devis, utilisateur=None):
+    """Devis remis au client : lignes au tarif, totaux estimés, validité, signature « bon pour accord »."""
+    client = devis.client
+    document = DocumentPDF("DEVIS", devis.numero, devis.date_creation, utilisateur,
+                           filigrane={"REFUSE": "REFUSÉ", "EXPIRE": "EXPIRÉ"}.get(devis.statut))
+    document.avec_tiers(
+        "Client", [client.nom, client.adresse, client.telephone and f"Tél. {client.telephone}",
+                   client.ifu and f"IFU {client.ifu}", f"Code client : {client.code}"],
+        "Conditions", [f"Valable jusqu'au : {date_fr(devis.date_validite)}", f"Vente : {devis.get_type_commande_display()}",
+                       f"Statut : {devis.get_statut_display()}"],
+    )
+    lignes = [[l.article.code, l.article.designation, nombre(l.quantite), montant(l.prix_unitaire), montant(l.montant_ht)]
+              for l in devis.lignes.select_related("article")]
+    document.avec_lignes(["Code", "Désignation", "Qté", "P.U. HT", "Montant HT"], lignes, [27, None, 18, 28, 30], colonnes_nombres=(2, 3, 4))
+    totaux = devis.totaux()
+    document.avec_totaux([("Total HT", montant(totaux["ht"])), ("Taxes (TVA, accises...)", montant(totaux["taxes"])),
+                          ("Total TTC (FCFA)", montant(totaux["ttc"]))], en_lettres_de=totaux["ttc"],
+                         libelle_lettres="Arrêté le présent devis à la somme de")
+    document.avec_texte(devis.conditions)
+    return document.avec_signatures("Bon pour accord - le client (date, signature)", f"Pour {document.entreprise.raison_sociale}")

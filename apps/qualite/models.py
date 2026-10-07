@@ -223,8 +223,8 @@ class Lot(ValidationAvantEnregistrement, models.Model):
             of = self.ordre_fabrication
             if of.statut == "ANNULE":
                 raise ValidationError({"ordre_fabrication": f"L'OF {of.numero} est annulé : il ne peut pas produire de lot."})
-            if self.article_id and of.article_id != self.article_id:
-                raise ValidationError({"article": f"L'article du lot doit être celui de l'OF {of.numero}."})
+            if self.article_id and self.article_id not in {article.pk for article, _ in of.formats_prevus()}:
+                raise ValidationError({"article": f"L'article du lot doit être l'un des formats de l'OF {of.numero}."})
         ancien_statut = valeur_en_base(self, "statut")
         if ancien_statut not in (None, StatutLot.EN_ATTENTE):
             for champ in ("article", "ordre_fabrication"):
@@ -316,7 +316,7 @@ class Lot(ValidationAvantEnregistrement, models.Model):
             from apps.couts.models import CoutReel
             cout_reel, _ = CoutReel.objects.get_or_create(ordre_fabrication=self.ordre_fabrication)
             cout_reel.calculer()
-            cout_unitaire = cout_reel.cout_unitaire_reel or None
+            cout_unitaire = cout_reel.cout_unitaire_pour(self.article) or None   # coût de SON format
         MouvementStock.objects.create(
             article=self.article,
             depot=self.lieu_stock,
@@ -465,6 +465,17 @@ class Instrument(ValidationAvantEnregistrement, models.Model):
     """Appareil de mesure (pH-mètre, réfractomètre, thermomètre...) et son étalonnage."""
     code = models.CharField("Code", max_length=30, unique=True, editable=False)
     designation = models.CharField("Désignation", max_length=100)
+    type_instrument = models.CharField(
+        "Type", max_length=60, blank=True,
+        help_text="Ex : pH-mètre, réfractomètre, thermomètre / sonde, conductimètre, balance, débitmètre, couplemètre, "
+                  "pied à coulisse / jauge, testeur d'étanchéité, matériel de laboratoire.",
+    )
+    grandeur_mesuree = models.CharField("Mesure", max_length=60, blank=True, help_text="Ex : pH, °Brix, température, couple.")
+    unite = models.CharField("Unité", max_length=30, blank=True)
+    activite = models.ForeignKey(
+        "industriel.Activite", verbose_name="Activité", on_delete=models.PROTECT, null=True, blank=True,
+        related_name="instruments", help_text="Vide = commun à toutes les activités.",
+    )
     numero_serie = models.CharField("N° appareil / série", max_length=60, blank=True)
     laboratoire = models.CharField("Utilisé", max_length=10, choices=Laboratoire.choices, default=Laboratoire.LIGNE)
     date_dernier_etalonnage = models.DateField("Dernier étalonnage / vérification", null=True, blank=True)
@@ -510,6 +521,51 @@ class Instrument(ValidationAvantEnregistrement, models.Model):
         return echeance is not None and echeance >= timezone.localdate()
 
 
+class ModeleControle(ValidationAvantEnregistrement, models.Model):
+    """
+    Bibliothèque de contrôles réutilisables (Q43) : paramètre, instrument,
+    méthode, échantillonnage... enregistrés une fois ; un point du plan
+    créé depuis un modèle reprend ces valeurs (modifiables) sans tout
+    resélectionner.
+    """
+    code = models.CharField("Code", max_length=30, unique=True, editable=False)
+    designation = models.CharField("Désignation", max_length=150)
+    parametre = models.ForeignKey(ParametreQualite, verbose_name="Paramètre", on_delete=models.PROTECT, related_name="modeles")
+    instrument = models.ForeignKey(Instrument, verbose_name="Instrument", on_delete=models.PROTECT, null=True, blank=True, related_name="modeles")
+    methode = models.CharField("Méthode", max_length=200, blank=True)
+    laboratoire = models.CharField("Réalisé", max_length=10, choices=Laboratoire.choices, default=Laboratoire.LIGNE)
+    type_echantillon = models.CharField("Type d'échantillon", max_length=100, blank=True)
+    quantite_echantillon = models.CharField("Quantité d'échantillon", max_length=50, blank=True)
+    nombre_echantillons = models.PositiveIntegerField("Nombre d'échantillons", default=1)
+    obligatoire = models.BooleanField("Obligatoire par défaut", default=False)
+    bloquant = models.BooleanField("Bloquant par défaut", default=False)
+    actions_si_non_conforme = models.TextField("Actions en cas de non-conformité", blank=True)
+    actif = models.BooleanField("Actif", default=True)
+
+    class Meta:
+        verbose_name = "Modèle de contrôle (bibliothèque)"
+        verbose_name_plural = "Bibliothèque de contrôles"
+        ordering = ["designation"]
+
+    def __str__(self):
+        return f"{self.code} - {self.designation}"
+
+    CHAMPS_REPRIS = ("parametre", "instrument", "methode", "laboratoire", "type_echantillon", "quantite_echantillon",
+                     "nombre_echantillons", "obligatoire", "bloquant", "actions_si_non_conforme")
+
+    def save(self, *args, **kwargs):
+        if not self.code:
+            from apps.core.models import generer_code_unique
+            self.code = generer_code_unique(ModeleControle, "MOD", largeur=3)
+        super().save(*args, **kwargs)
+
+    def clean(self):
+        if not (self.designation or "").strip():
+            raise ValidationError({"designation": "La désignation est obligatoire."})
+        if self.nombre_echantillons == 0:
+            raise ValidationError({"nombre_echantillons": "Au moins un échantillon."})
+
+
 class Declencheur(models.TextChoices):
     RECEPTION = "RECEPTION", "À la réception (lot matière)"
     DEMARRAGE = "DEMARRAGE", "Au démarrage de l'OF"
@@ -539,8 +595,12 @@ class PointControle(ValidationAvantEnregistrement, models.Model):
     et avec quelle conséquence (bloquant ou non, actions en cas de NC).
     """
     code = models.CharField("Code du contrôle", max_length=30, unique=True, editable=False)
-    designation = models.CharField("Désignation", max_length=150)
-    parametre = models.ForeignKey(ParametreQualite, verbose_name="Paramètre contrôlé", on_delete=models.PROTECT, related_name="points")
+    designation = models.CharField("Désignation", max_length=150, blank=True)
+    modele = models.ForeignKey(
+        ModeleControle, verbose_name="Créé depuis le modèle", on_delete=models.PROTECT, null=True, blank=True, related_name="points",
+        help_text="Les valeurs du modèle (paramètre, instrument, méthode, échantillon...) sont reprises à la création.",
+    )
+    parametre = models.ForeignKey(ParametreQualite, verbose_name="Paramètre contrôlé", on_delete=models.PROTECT, related_name="points", null=True, blank=True)
     # Où / pour quoi
     activite = models.ForeignKey(
         "industriel.Activite", verbose_name="Activité", on_delete=models.PROTECT, null=True, blank=True,
@@ -566,6 +626,10 @@ class PointControle(ValidationAvantEnregistrement, models.Model):
     bloquant = models.BooleanField(
         "Contrôle bloquant", default=False,
         help_text="Un résultat non conforme bloque le lot et empêche la clôture de l'OF tant que la NC n'est pas traitée.",
+    )
+    obligatoire = models.BooleanField(
+        "Contrôle obligatoire", default=False,
+        help_text="Q44 : tant qu'il n'est pas réalisé, le lot ne peut pas être libéré (ni l'OF clôturé).",
     )
     # Quand
     declencheur = models.CharField("Fréquence / déclenchement", max_length=20, choices=Declencheur.choices)
@@ -609,8 +673,27 @@ class PointControle(ValidationAvantEnregistrement, models.Model):
             self.code = generer_code_unique(PointControle, prefixe, largeur=3)
         super().save(*args, **kwargs)
 
+    def appliquer_modele(self):
+        """Reprend les valeurs du modèle de la bibliothèque pour les champs non renseignés."""
+        if not self.modele_id or self.pk:
+            return
+        modele = self.modele
+        for champ in ModeleControle.CHAMPS_REPRIS:
+            attribut = f"{champ}_id" if champ in ("parametre", "instrument") else champ
+            actuel = getattr(self, attribut)
+            defaut = self._meta.get_field(champ).default if champ not in ("parametre", "instrument") else None
+            if actuel in (None, "", defaut) and getattr(modele, attribut) not in (None, ""):
+                setattr(self, attribut, getattr(modele, attribut))
+        if not self.designation:
+            self.designation = modele.designation
+
     def clean(self):
         from apps.core.validation import exiger_ordre_dates
+        self.appliquer_modele()
+        if not self.parametre_id:
+            raise ValidationError({"parametre": "Choisissez le paramètre contrôlé (ou un modèle de la bibliothèque)."})
+        if not (self.designation or "").strip():
+            self.designation = self.parametre.libelle
         if self.declencheur == Declencheur.PERIODIQUE and not self.frequence_minutes:
             raise ValidationError({"frequence_minutes": "Indiquez la fréquence (en minutes) d'un contrôle périodique."})
         if self.declencheur == Declencheur.PAR_QUANTITE and not (self.frequence_quantite and self.frequence_quantite > 0):
@@ -1100,7 +1183,7 @@ def points_applicables(of, declencheurs):
     points = PointControle.objects.filter(
         statut=StatutPointControle.ACTIF, declencheur__in=declencheurs, activite=activite,
     ).filter(
-        Q(article__isnull=True) | Q(article_id=of.article_id),
+        Q(article__isnull=True) | Q(article_id__in=[article.pk for article, _ in of.formats_prevus()]),
         Q(fiche_technique__isnull=True) | Q(fiche_technique_id=of.fiche_technique_id),
         Q(date_debut__isnull=True) | Q(date_debut__lte=aujourd_hui),
         Q(date_fin__isnull=True) | Q(date_fin__gte=aujourd_hui),
@@ -1172,10 +1255,11 @@ def generer_controles_reception(lot_matiere):
 
 def _blocages(resultats, non_conformites):
     messages = []
-    en_attente = resultats.filter(point__bloquant=True, statut__in=STATUTS_EN_ATTENTE)
+    from django.db.models import Q as _Q
+    en_attente = resultats.filter(_Q(point__bloquant=True) | _Q(point__obligatoire=True), statut__in=STATUTS_EN_ATTENTE)
     if en_attente.exists():
         messages.append(
-            f"{en_attente.count()} contrôle(s) bloquant(s) non réalisé(s) ("
+            f"{en_attente.count()} contrôle(s) bloquant(s) ou obligatoire(s) non réalisé(s) ("
             + ", ".join(en_attente.values_list("numero", flat=True)[:5]) + ")"
         )
     ouvertes = non_conformites.filter(bloquante=True).exclude(statut=StatutNC.CLOTUREE)

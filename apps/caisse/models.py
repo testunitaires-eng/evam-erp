@@ -353,6 +353,8 @@ class SessionCaisse(ValidationAvantEnregistrement, models.Model):
             EcartCaisse.objects.create(session_caisse=self, justification=justification)
             from apps.comptabilite.anomalies import controler_ecart_caisse
             controler_ecart_caisse(self)
+        from apps.comptabilite.ecritures import ecrire_synthese_caisse
+        ecrire_synthese_caisse(self)
 
 class ModePaiement(models.TextChoices):
     ESPECES = "ESPECES", "Espèces"

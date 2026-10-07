@@ -1138,6 +1138,7 @@ class StatutPlanProduction(models.TextChoices):
 class PlanProduction(ValidationAvantEnregistrement, models.Model):
     """Le programme / prévision de production (§5.3), avant conversion en OF."""
     article = models.ForeignKey(Article, verbose_name="Article à produire", on_delete=models.PROTECT)
+    ligne = models.ForeignKey("industriel.Ligne", verbose_name="Ligne prévue", on_delete=models.PROTECT, null=True, blank=True, related_name="+")
     date_prevue = models.DateField("Date prévue")
     quantite_prevue = models.DecimalField("Quantité prévue", max_digits=12, decimal_places=3)
     priorite = models.CharField("Priorité", max_length=10, choices=Priorite.choices, default=Priorite.NORMALE)
@@ -1192,7 +1193,7 @@ class PlanProduction(ValidationAvantEnregistrement, models.Model):
         if self.statut == StatutPlanProduction.ANNULEE:
             raise ValueError("Cette prévision est annulée : elle ne peut pas être convertie en OF.")
         of = OrdreFabrication.objects.create(
-            plan_production=self, article=self.article,
+            plan_production=self, article=self.article, ligne=self.ligne, date_prevue=self.date_prevue,
             quantite_a_produire=self.quantite_prevue, responsable=responsable,
         )
         if agents:
@@ -1260,6 +1261,14 @@ class OrdreFabrication(ValidationAvantEnregistrement, models.Model):
         null=True, blank=True, related_name="ordres_fabrication", editable=False,
     )
     date_prevue = models.DateField("Date prévue", null=True, blank=True)
+    date_debut_prevue = models.DateTimeField(
+        "Début planifié", null=True, blank=True,
+        help_text="Planning par ligne : deux OF ne se chevauchent pas sur une même ligne.",
+    )
+    date_fin_prevue = models.DateTimeField(
+        "Fin planifiée", null=True, blank=True,
+        help_text="Calculée depuis la cadence de la ligne si elle est connue et que la fin n'est pas saisie.",
+    )
     statut = models.CharField(
         "Statut", max_length=30, choices=StatutOF.choices, default=StatutOF.BROUILLON
     )
@@ -1306,7 +1315,8 @@ class OrdreFabrication(ValidationAvantEnregistrement, models.Model):
             valeur_en_base(self, "quantite_a_produire") != self.quantite_a_produire
             or valeur_en_base(self, "article") != self.article_id
         )
-        if self.statut == StatutOF.BROUILLON and self.article_id and (
+        avant_production = (StatutOF.BROUILLON, StatutOF.A_PREPARER, StatutOF.MATIERES_EN_PREPARATION, StatutOF.PRET)
+        if self.statut in avant_production and self.article_id and (
             (creation and self.circuit_id is None)
             or (not creation and (recalcul or valeur_en_base(self, "ligne") != self.ligne_id))
         ):
@@ -1373,9 +1383,80 @@ class OrdreFabrication(ValidationAvantEnregistrement, models.Model):
                 raise ValidationError({"article": "L'article d'un OF ne peut plus être changé après le brouillon."})
             if valeur_en_base(self, "quantite_a_produire") != self.quantite_a_produire:
                 raise ValidationError({"quantite_a_produire": "La quantité d'un OF ne peut plus être changée après le brouillon."})
-            for champ in ("ligne", "circuit"):
-                if valeur_en_base(self, champ) != getattr(self, f"{champ}_id"):
-                    raise ValidationError({champ: "La ligne et le circuit d'un OF ne changent plus après le brouillon."})
+            if ancien_statut not in (StatutOF.A_PREPARER, StatutOF.MATIERES_EN_PREPARATION, StatutOF.PRET) \
+                    or self.statut not in (StatutOF.A_PREPARER, StatutOF.MATIERES_EN_PREPARATION, StatutOF.PRET, StatutOF.EN_PRODUCTION, StatutOF.ANNULE):
+                for champ in ("ligne", "circuit"):
+                    if valeur_en_base(self, champ) != getattr(self, f"{champ}_id"):
+                        raise ValidationError({champ: "La ligne et le circuit d'un OF ne changent plus une fois la production démarrée."})
+            elif valeur_en_base(self, "ligne") != self.ligne_id and self.reservations.exclude(depot=self.depot_matieres).exists():
+                raise ValidationError({"ligne": (
+                    "Les matières de cet OF sont réservées dans le magasin d'une autre usine : "
+                    "choisissez une ligne de la même usine."
+                )})
+        self.controler_planning()
+
+    def controler_planning(self):
+        """
+        Planning par ligne (Q32) : fin après début, fin calculée depuis la
+        cadence de la ligne, et pas de chevauchement avec un autre OF actif
+        sur la même ligne (une ligne ne produit qu'un OF à la fois).
+        """
+        from datetime import timedelta
+        if self.date_debut_prevue and not self.date_fin_prevue and self.ligne_id and self.ligne.cadence_nominale:
+            heures = self.unites_a_produire() / self.ligne.cadence_nominale
+            self.date_fin_prevue = self.date_debut_prevue + timedelta(hours=float(heures))
+        if self.date_debut_prevue and self.date_fin_prevue and self.date_fin_prevue <= self.date_debut_prevue:
+            raise ValidationError({"date_fin_prevue": "La fin planifiée doit être après le début."})
+        if self.ligne_id and self.date_debut_prevue and self.date_fin_prevue and self.statut not in (StatutOF.CLOTURE, StatutOF.ANNULE):
+            conflit = OrdreFabrication.objects.filter(
+                ligne_id=self.ligne_id, date_debut_prevue__lt=self.date_fin_prevue, date_fin_prevue__gt=self.date_debut_prevue,
+            ).exclude(pk=self.pk).exclude(statut__in=(StatutOF.CLOTURE, StatutOF.ANNULE)).first()
+            if conflit:
+                raise ValidationError({"date_debut_prevue": (
+                    f"La ligne {self.ligne.code} est déjà planifiée pour l'OF {conflit.numero} "
+                    f"(du {conflit.date_debut_prevue:%d/%m %H:%M} au {conflit.date_fin_prevue:%d/%m %H:%M})."
+                )})
+
+    def unites_a_produire(self):
+        """Bouteilles / pots à produire, tous formats de l'OF confondus (base de la durée planifiée)."""
+        from decimal import Decimal
+        return sum((article.en_unites(quantite) for article, quantite in self.formats_prevus()), Decimal(0))
+
+    # --- Formats de l'OF (Q27 : un OF peut produire plusieurs formats) ---
+    def formats_prevus(self):
+        """[(article, quantité à produire)] : format principal puis formats supplémentaires."""
+        if not self.article_id:
+            return []
+        formats = [(self.article, self.quantite_a_produire)]
+        if self.pk:
+            formats += [(f.article, f.quantite_a_produire) for f in self.formats_supplementaires.select_related("article")]
+        return formats
+
+    @property
+    def est_multi_format(self):
+        return bool(self.pk) and self.formats_supplementaires.exists()
+
+    def quantites_par_format(self):
+        """
+        {article: quantité bonne} : lots non « non conformes » par format ;
+        à défaut de lot, la quantité prévue du format.
+        """
+        from decimal import Decimal
+        from django.db.models import Sum
+        produites = {
+            ligne["article"]: ligne["total"]
+            for ligne in self.lots.exclude(statut="NON_CONFORME").values("article").annotate(total=Sum("quantite"))
+        } if self.pk else {}
+        return {article: Decimal(produites.get(article.pk) or quantite) for article, quantite in self.formats_prevus()}
+
+    def ligne_proposee(self):
+        """Seule ligne active compatible avec tous les formats (proposée automatiquement), sinon None."""
+        from apps.industriel.models import Ligne
+        if not self.article_id or not self.article.activite_id:
+            return None
+        lignes = [l for l in Ligne.objects.filter(activite_id=self.article.activite_id, actif=True)
+                  if all(l.accepte(article) for article, _ in self.formats_prevus())]
+        return lignes[0] if len(lignes) == 1 else None
 
     def controler_ligne_et_circuit(self):
         """
@@ -1390,8 +1471,9 @@ class OrdreFabrication(ValidationAvantEnregistrement, models.Model):
             ligne = self.ligne
             if not ligne.actif:
                 raise ValidationError({"ligne": f"La ligne {ligne.code} est inactive."})
-            if not ligne.accepte(self.article):
-                raise ValidationError({"ligne": f"La ligne {ligne.code} n'est pas compatible avec {self.article.code}."})
+            incompatibles = [article.code for article, _ in self.formats_prevus() if not ligne.accepte(article)]
+            if incompatibles:
+                raise ValidationError({"ligne": f"La ligne {ligne.code} n'est pas compatible avec " + ", ".join(incompatibles) + "."})
         if self.circuit_id:
             circuit = self.circuit
             if circuit.statut != "VALIDE" and valeur_en_base(self, "circuit") != self.circuit_id:
@@ -1424,10 +1506,8 @@ class OrdreFabrication(ValidationAvantEnregistrement, models.Model):
 
     @property
     def quantite_produite_bonne(self):
-        """Quantité réellement produite et bonne : lots non « non conformes », à défaut la quantité prévue."""
-        from django.db.models import Sum
-        total = self.lots.exclude(statut="NON_CONFORME").aggregate(total=Sum("quantite"))["total"]
-        return total or self.quantite_a_produire
+        """Quantité réellement produite et bonne du format principal (lots non « non conformes »), à défaut la quantité prévue."""
+        return self.quantites_par_format().get(self.article, self.quantite_a_produire) if self.article_id else 0
 
     def etapes_prevues(self):
         """Étapes du circuit de l'OF, dans l'ordre (vide sans circuit)."""
@@ -1520,6 +1600,7 @@ class OrdreFabrication(ValidationAvantEnregistrement, models.Model):
 
         if nouveau_statut == StatutOF.A_PREPARER:
             from apps.production.models import ParametreProduction
+            self.exiger_ligne_au_lancement()
             manques = self.verifier_stock_pour_lancement()
             if manques and ParametreProduction.courant().bloquer_lancement_stock_insuffisant:
                 raise ValueError(
@@ -1540,6 +1621,10 @@ class OrdreFabrication(ValidationAvantEnregistrement, models.Model):
 
         self.statut = nouveau_statut
         self.save()
+        if nouveau_statut == StatutOF.A_PREPARER:
+            ReservationMatiere.reserver_pour(self)
+        if nouveau_statut == StatutOF.CLOTURE:
+            ReservationMatiere.liberer_pour(self)
         if nouveau_statut == StatutOF.EN_PRODUCTION:
             from apps.qualite.models import generer_controles
             generer_controles(self, declencheurs=("DEMARRAGE", "CHAQUE_OF", "PERIODIQUE"))
@@ -1564,6 +1649,26 @@ class OrdreFabrication(ValidationAvantEnregistrement, models.Model):
         self.statut = StatutOF.ANNULE
         self.motif_annulation = motif
         self.save()
+        ReservationMatiere.liberer_pour(self)
+
+    def exiger_ligne_au_lancement(self):
+        """
+        Q28 : la ligne est choisie au lancement réel de l'OF (compatibilité
+        vérifiée). Si une seule ligne active convient, elle est retenue
+        automatiquement. Tant qu'aucune ligne n'est paramétrée pour
+        l'activité (socle en cours de saisie), le lancement reste possible.
+        """
+        from apps.industriel.models import Ligne
+        if self.ligne_id or not self.article.activite_id:
+            return
+        if not Ligne.objects.filter(activite_id=self.article.activite_id, actif=True).exists():
+            return
+        proposee = self.ligne_proposee()
+        if proposee is None:
+            raise ValueError(f"Choisissez la ligne de production de l'OF {self.numero} avant son lancement.")
+        self.ligne = proposee
+        from apps.industriel.models import circuit_pour
+        self.circuit = circuit_pour(self.article, proposee) or self.circuit
 
     def _calculer_besoins_matieres(self):
         """
@@ -1582,8 +1687,13 @@ class OrdreFabrication(ValidationAvantEnregistrement, models.Model):
         if self.fiche_technique_id != fiche.pk:
             self.fiche_technique = fiche
             OrdreFabrication.objects.filter(pk=self.pk).update(fiche_technique=fiche)
+        besoins = list(fiche.besoins_pour(self.article, self.quantite_a_produire))
+        for format_sup in self.formats_supplementaires.select_related("article"):
+            fiche_format = format_sup.article.fiche_technique_validee
+            if fiche_format is not None:
+                besoins += fiche_format.besoins_pour(format_sup.article, format_sup.quantite_a_produire)
         cumul = {}
-        for ligne, quantite in fiche.besoins_pour(self.article, self.quantite_a_produire):
+        for ligne, quantite in besoins:
             # Chiffrage : besoin x prix unitaire de la fiche, FIGÉ dans l'OF (un
             # changement de prix ultérieur ne modifie pas les OF déjà lancés).
             precedent = cumul.get(ligne.matiere_id)
@@ -1598,6 +1708,11 @@ class OrdreFabrication(ValidationAvantEnregistrement, models.Model):
                     "montant": (quantite * ligne.prix_unitaire).quantize(Decimal("0.01")),
                 },
             )
+
+    def recalculer_besoins(self):
+        """Besoins recalculés (ajout / retrait d'un format tant que l'OF est en brouillon)."""
+        self.besoins_matieres.all().delete()
+        self._calculer_besoins_matieres()
 
     @property
     def montant_total_matieres(self):
@@ -2065,6 +2180,7 @@ class SortieMatiere(SaisieSurOFMixin, ValidationAvantEnregistrement, models.Mode
                 self._creer_mouvement_sortie()
 
     def _stock_suffisant(self, depot):
+        ReservationMatiere.consommer(self.ordre_fabrication, self.matiere, depot, self.quantite_sortie)
         from apps.stocks.models import StockArticle
         stock = StockArticle.objects.filter(article_id=self.matiere_id, depot=depot).first()
         return stock is not None and stock.quantite_disponible >= self.quantite_sortie
@@ -2373,6 +2489,12 @@ class EtapeProduction(SaisieSurOFMixin, ValidationAvantEnregistrement, models.Mo
             raise ValidationError({"quantite_produite": "La quantité produite ne peut pas dépasser la quantité entrée."})
         if self.energie_mesuree and self.energie_kwh is None:
             raise ValidationError({"energie_kwh": "Indiquez les kWh relevés sur le compteur."})
+        manquants = [
+            regle.get_champ_display() for regle in DonneeObligatoireEtape.objects.filter(etape__code=self.etape, obligatoire=True)
+            if getattr(self, regle.champ) is None   # 0 est une valeur valide, distincte de « non renseigné » (Q33)
+        ]
+        if manquants:
+            raise ValidationError({"etape": f"Données obligatoires à l'étape {self.etape} non renseignées : " + ", ".join(manquants) + " (0 est accepté)."})
         from apps.industriel.models import EtapeStandard
         etape = EtapeStandard.objects.filter(code=self.etape, actif=True).first()
         if etape is None:
@@ -2386,7 +2508,7 @@ class EtapeProduction(SaisieSurOFMixin, ValidationAvantEnregistrement, models.Mo
             if of and of.ligne_id and self.poste.ligne_id != of.ligne_id:
                 raise ValidationError({"poste": f"Le poste {self.poste.code} n'est pas sur la ligne de l'OF."})
         if self.equipement_id:
-            if self.poste_id and self.equipement.poste_id and self.equipement.poste_id != self.poste_id:
+            if self.poste_id and self.equipement.poste_id and not self.equipement.realise(self.poste):
                 raise ValidationError({"equipement": f"La machine {self.equipement.code} n'est pas affectée à ce poste."})
             if of and of.activite and self.equipement.activite_id and self.equipement.activite_id != of.activite.pk:
                 raise ValidationError({"equipement": f"La machine {self.equipement.code} est dédiée à une autre activité."})
@@ -2470,6 +2592,11 @@ class PerteProduction(SaisieSurOFMixin, ValidationAvantEnregistrement, models.Mo
     )
     motif = models.CharField("Motif", max_length=30, choices=MotifPerte.choices)
     nature = models.CharField("Nature de la perte", max_length=30, choices=NaturePerte.choices, default=NaturePerte.AUTRE)
+    type_quantite = models.CharField(
+        "Quantité", max_length=10, default="REELLE",
+        choices=[("REELLE", "Réelle (comptée)"), ("ESTIMEE", "Estimée")],
+        help_text="Q34 : distinguer les pertes réellement comptées des pertes estimées.",
+    )
     etape_code = models.CharField("Étape (code)", max_length=30, blank=True, help_text="Ex : SOUFFLAGE, REMPLISSAGE.")
     matiere = models.ForeignKey(
         Article, verbose_name="Matière / emballage perdu", on_delete=models.PROTECT, null=True, blank=True,
@@ -2604,6 +2731,10 @@ class ParametreProduction(models.Model):
     controle_qualite_bloque_cloture = models.BooleanField(
         "Bloquer la clôture si des contrôles bloquants manquent ou sont non conformes", default=True,
     )
+    heures_ouvrees_par_jour = models.DecimalField(
+        "Heures de production par jour et par ligne", max_digits=4, decimal_places=1, default=8,
+        help_text="Capacité journalière d'une ligne pour le planning (ex : 8, 16 en 2 équipes, 24).",
+    )
 
     class Meta:
         verbose_name = "Paramètres de production"
@@ -2678,3 +2809,148 @@ class EvenementProduction(SaisieSurOFMixin, ValidationAvantEnregistrement, model
                     self.ordre_fabrication, declencheurs=(DECLENCHEURS_EVENEMENT[self.type_evenement],),
                     equipement=self.equipement,
                 )
+
+
+
+class FormatOF(ValidationAvantEnregistrement, models.Model):
+    """
+    Format supplémentaire d'un OF (Q27 : Eau 1 L et Eau 1,5 L dans le même
+    OF). Le format principal reste sur l'OF ; chaque format a sa quantité,
+    ses besoins (sa recette), ses lots et sa part des coûts.
+    """
+    ordre_fabrication = models.ForeignKey(OrdreFabrication, verbose_name="OF", on_delete=models.CASCADE, related_name="formats_supplementaires")
+    article = models.ForeignKey(Article, verbose_name="Format", on_delete=models.PROTECT, related_name="+")
+    quantite_a_produire = models.DecimalField("Quantité à produire", max_digits=12, decimal_places=3)
+
+    class Meta:
+        verbose_name = "Format supplémentaire d'OF"
+        verbose_name_plural = "Formats supplémentaires d'OF"
+        unique_together = ("ordre_fabrication", "article")
+
+    def __str__(self):
+        return f"{self.ordre_fabrication.numero} + {self.quantite_a_produire} {self.article.code}"
+
+    def clean(self):
+        exiger_positif(self.quantite_a_produire, "quantite_a_produire", "La quantité à produire")
+        of = OrdreFabrication.objects.filter(pk=valeur_en_base(self, "ordre_fabrication") or self.ordre_fabrication_id).first()
+        if of is None:
+            return
+        if of.statut != StatutOF.BROUILLON:
+            raise ValidationError("Les formats d'un OF se modifient tant qu'il est en brouillon.")
+        if self.article_id:
+            article = self.article
+            if article.pk == of.article_id:
+                raise ValidationError({"article": f"{article.code} est déjà le format principal de l'OF."})
+            if article.type_article != "PRODUIT_FINI":
+                raise ValidationError({"article": "Un format d'OF est un produit fini."})
+            if article.activite_id != of.article.activite_id:
+                raise ValidationError({"article": f"{article.code} n'est pas de la même activité que l'OF."})
+            fiche = article.fiche_technique_validee
+            if fiche is None or not fiche.composition.exists():
+                raise ValidationError({"article": f"Aucune recette validée pour {article.code}."})
+            if of.ligne_id and not of.ligne.accepte(article):
+                raise ValidationError({"article": f"La ligne {of.ligne.code} n'est pas compatible avec {article.code}."})
+
+    def save(self, *args, **kwargs):
+        with transaction.atomic():
+            super().save(*args, **kwargs)
+            self.ordre_fabrication.recalculer_besoins()
+
+    def delete(self, *args, **kwargs):
+        of = self.ordre_fabrication
+        if of.statut != StatutOF.BROUILLON:
+            raise ValidationError("Les formats d'un OF se modifient tant qu'il est en brouillon.")
+        with transaction.atomic():
+            resultat = super().delete(*args, **kwargs)
+            of.recalculer_besoins()
+        return resultat
+
+
+class ReservationMatiere(models.Model):
+    """
+    Réservation des matières d'un OF au lancement (Q30) : la quantité est
+    retirée du disponible (stock « réservé ») pour qu'un autre OF ne la
+    prenne pas. Les sorties de l'OF consomment sa réservation ; le reste
+    est libéré à la clôture ou à l'annulation.
+    """
+    ordre_fabrication = models.ForeignKey(OrdreFabrication, verbose_name="OF", on_delete=models.CASCADE, related_name="reservations")
+    matiere = models.ForeignKey(Article, verbose_name="Matière", on_delete=models.PROTECT, related_name="+")
+    depot = models.ForeignKey("stocks.Depot", verbose_name="Magasin", on_delete=models.PROTECT, related_name="+")
+    quantite_reservee = models.DecimalField("Quantité réservée", max_digits=14, decimal_places=4)
+    quantite_restante = models.DecimalField("Reste réservé", max_digits=14, decimal_places=4)
+    date = models.DateTimeField("Réservé le", auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Réservation de matière"
+        verbose_name_plural = "Réservations de matières"
+        unique_together = ("ordre_fabrication", "matiere", "depot")
+
+    def __str__(self):
+        return f"{self.ordre_fabrication.numero} : {self.quantite_restante} {self.matiere.code} réservé"
+
+    @staticmethod
+    def _ajuster_stock(matiere, depot, delta):
+        from apps.stocks.models import StockArticle
+        stock, _ = StockArticle.objects.select_for_update().get_or_create(article=matiere, depot=depot)
+        stock.quantite_reservee = max(stock.quantite_reservee + delta, 0)
+        stock.save()
+
+    @classmethod
+    def reserver_pour(cls, of):
+        """Réserve chaque besoin (dans la limite du disponible si le blocage est désactivé)."""
+        from apps.stocks.models import StockArticle
+        depot = of.depot_matieres
+        for besoin in of.besoins_matieres.select_related("matiere"):
+            stock = StockArticle.objects.select_for_update().filter(article=besoin.matiere, depot=depot).first()
+            disponible = stock.quantite_disponible if stock else 0
+            quantite = min(besoin.quantite_theorique, max(disponible, 0))
+            if quantite <= 0:
+                continue
+            cls.objects.create(ordre_fabrication=of, matiere=besoin.matiere, depot=depot,
+                               quantite_reservee=quantite, quantite_restante=quantite)
+            cls._ajuster_stock(besoin.matiere, depot, quantite)
+
+    @classmethod
+    def consommer(cls, of, matiere, depot, quantite):
+        """Avant une sortie de l'OF : sa réservation redevient disponible pour cette sortie."""
+        reservation = cls.objects.select_for_update().filter(ordre_fabrication=of, matiere=matiere, depot=depot).first()
+        if reservation is None or reservation.quantite_restante <= 0:
+            return
+        liberee = min(reservation.quantite_restante, quantite)
+        reservation.quantite_restante -= liberee
+        reservation.save(update_fields=["quantite_restante"])
+        cls._ajuster_stock(matiere, depot, -liberee)
+
+    @classmethod
+    def liberer_pour(cls, of):
+        for reservation in cls.objects.select_for_update().filter(ordre_fabrication=of, quantite_restante__gt=0):
+            cls._ajuster_stock(reservation.matiere, reservation.depot, -reservation.quantite_restante)
+            reservation.quantite_restante = 0
+            reservation.save(update_fields=["quantite_restante"])
+
+
+
+class DonneeObligatoireEtape(models.Model):
+    """
+    Q33 : liste des données réelles à saisir par étape, obligatoires ou
+    facultatives (validée avec les techniciens). Une donnée obligatoire
+    accepte 0, mais pas « non renseigné ».
+    """
+    CHAMPS = [
+        ("quantite_entree", "Quantité entrée"), ("quantite_produite", "Quantité produite"),
+        ("quantite_rejetee", "Quantité rejetée"), ("date_debut", "Heure de début"), ("date_fin", "Heure de fin"),
+        ("duree_arret_min", "Arrêts (minutes)"), ("heures_machine", "Heures machine"), ("energie_kwh", "Énergie (kWh)"),
+        ("poste", "Poste"), ("equipement", "Machine"),
+    ]
+    etape = models.ForeignKey("industriel.EtapeStandard", verbose_name="Étape", on_delete=models.CASCADE, related_name="donnees_saisie")
+    champ = models.CharField("Donnée", max_length=30, choices=CHAMPS)
+    obligatoire = models.BooleanField("Obligatoire", default=True)
+
+    class Meta:
+        verbose_name = "Donnée à saisir par étape"
+        verbose_name_plural = "Données à saisir par étape"
+        unique_together = ("etape", "champ")
+        ordering = ["etape__ordre_reference", "champ"]
+
+    def __str__(self):
+        return f"{self.etape.code} : {self.get_champ_display()} ({'obligatoire' if self.obligatoire else 'facultative'})"

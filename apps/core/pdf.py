@@ -310,6 +310,28 @@ class DocumentPDF:
             self.elements += [Paragraph(f"{libelle_lettres} : <b>{montant_en_lettres(en_lettres_de)}</b>.", STYLE), Spacer(1, 4 * mm)]
         return self
 
+    def avec_certification(self, facture):
+        """Bloc de facture normalisée : code MECeF, compteurs, NIM, date et QR code."""
+        from reportlab.graphics.barcode.qr import QrCodeWidget
+        from reportlab.graphics.shapes import Drawing
+        texte = [
+            Paragraph("<b>Facture normalisée (SFEC)</b>", STYLE),
+            Paragraph(f"Code MECeF : <b>{facture.sfec_code}</b>", STYLE),
+            Paragraph(f"Compteurs : {facture.sfec_compteurs}  -  NIM : {facture.sfec_nim}", STYLE_PETIT),
+            Paragraph(f"Certifiée le {date_fr(facture.sfec_date)}", STYLE_PETIT),
+        ]
+        qr = ""
+        if facture.sfec_qr:
+            widget = QrCodeWidget(facture.sfec_qr)
+            x1, y1, x2, y2 = widget.getBounds()
+            taille = 26 * mm
+            qr = Drawing(taille, taille, transform=[taille / (x2 - x1), 0, 0, taille / (y2 - y1), 0, 0])
+            qr.add(widget)
+        bloc = Table([[qr, texte]], colWidths=[30 * mm, None])
+        bloc.setStyle(TableStyle([("BOX", (0, 0), (-1, -1), 0.6, self.couleur), ("VALIGN", (0, 0), (-1, -1), "MIDDLE")]))
+        self.elements += [bloc, Spacer(1, 4 * mm)]
+        return self
+
     def avec_texte(self, texte, style=STYLE):
         if texte:
             for ligne in str(texte).splitlines():

@@ -81,6 +81,14 @@ class TypeExport(models.TextChoices):
     JOURNAL = "JOURNAL", "Journal comptable"
 
 
+class FormatExport(models.TextChoices):
+    """Le logiciel comptable cible n'est pas encore choisi (Q65) : export générique, Sage en option."""
+    CSV_GENERIQUE = "CSV_GENERIQUE", "CSV générique (UTF-8, dates ISO, point décimal)"
+    XLSX = "XLSX", "Excel (.xlsx)"
+    JSON = "JSON", "JSON"
+    SAGE_CSV = "SAGE_CSV", "CSV Sage 100"
+
+
 class ExportComptable(ValidationAvantEnregistrement, models.Model):
     """
     Export comptable vers Sage 100. Dans cette version, l'export est
@@ -89,6 +97,7 @@ class ExportComptable(ValidationAvantEnregistrement, models.Model):
     à trancher avec le client (§14.2).
     """
     type_export = models.CharField("Type d'export", max_length=20, choices=TypeExport.choices)
+    format_fichier = models.CharField("Format du fichier", max_length=15, choices=FormatExport.choices, default=FormatExport.SAGE_CSV)
     periode_debut = models.DateField("Début de période")
     periode_fin = models.DateField("Fin de période")
     fichier = models.FileField("Fichier généré", upload_to="exports_comptables/", null=True, blank=True)
@@ -299,3 +308,69 @@ class ParametreControle(models.Model):
         from decimal import Decimal
         parametre = cls.objects.filter(cle=cle).first()
         return parametre.valeur if parametre else Decimal(CONTROLES_PAR_DEFAUT[cle][0])
+
+
+
+class SensCompte(models.TextChoices):
+    VENTE = "VENTE", "Ventes (produits finis)"
+    ACHAT = "ACHAT", "Achats (articles approvisionnés)"
+
+
+class RegleCompte(ValidationAvantEnregistrement, models.Model):
+    """
+    Correspondance Article / Activité / Catégorie / Format -> compte
+    (Q63), paramétrable et non codée en dur. La règle la plus précise
+    l'emporte : article > format + unité de vente > format > activité >
+    catégorie. Exemples : ventes Eau -> 7020, Jus -> 7021, Yaourt -> 7023,
+    puis un sous-compte par format commercial (Eau 70 cl Pack P12...).
+    """
+    sens = models.CharField("Sens", max_length=10, choices=SensCompte.choices)
+    compte = models.CharField("Numéro de compte", max_length=20)
+    libelle = models.CharField("Libellé", max_length=150, blank=True)
+    article = models.ForeignKey("referentiel.Article", verbose_name="Article", on_delete=models.CASCADE, null=True, blank=True, related_name="+")
+    activite = models.ForeignKey("industriel.Activite", verbose_name="Activité", on_delete=models.PROTECT, null=True, blank=True, related_name="+")
+    type_article = models.CharField("Catégorie d'article", max_length=30, blank=True)
+    format = models.ForeignKey("referentiel.FormatArticle", verbose_name="Format", on_delete=models.PROTECT, null=True, blank=True, related_name="+")
+    unite_vente = models.ForeignKey("referentiel.UniteVenteArticle", verbose_name="Unité de vente", on_delete=models.PROTECT, null=True, blank=True, related_name="+")
+    actif = models.BooleanField("Actif", default=True)
+
+    class Meta:
+        verbose_name = "Règle de compte (ventes / achats)"
+        verbose_name_plural = "Règles de comptes (ventes / achats)"
+        ordering = ["sens", "compte"]
+
+    def __str__(self):
+        return f"{self.get_sens_display()} -> {self.compte} {self.libelle}"
+
+    CRITERES = (("article", 16), ("unite_vente", 4), ("format", 8), ("activite", 2), ("type_article", 1))
+
+    def clean(self):
+        import re
+        if not re.fullmatch(r"\d{2,20}", self.compte or ""):
+            raise ValidationError({"compte": "Numéro de compte : chiffres uniquement (ex : 7020, 702011)."})
+        if self.sens == SensCompte.VENTE and not self.compte.startswith("70"):
+            raise ValidationError({"compte": "Les ventes de produits finis vont en classe 70 (702x)."})
+        if self.sens == SensCompte.ACHAT and not self.compte.startswith("6"):
+            raise ValidationError({"compte": "Les achats vont en classe 6."})
+        if not any(getattr(self, champ) for champ, _ in self.CRITERES):
+            raise ValidationError("Précisez au moins un critère (article, activité, catégorie, format ou unité de vente).")
+
+    def correspond(self, article):
+        for champ, _ in self.CRITERES:
+            valeur = getattr(self, f"{champ}_id" if champ != "type_article" else champ)
+            if valeur and valeur != getattr(article, f"{champ}_id" if champ != "type_article" else champ):
+                return False
+        return True
+
+    @property
+    def precision(self):
+        return sum(poids for champ, poids in self.CRITERES
+                   if getattr(self, f"{champ}_id" if champ != "type_article" else champ))
+
+    @classmethod
+    def compte_pour(cls, article, sens):
+        """Compte de la règle la plus précise qui correspond, ou None."""
+        regles = [r for r in cls.objects.filter(sens=sens, actif=True) if r.correspond(article)]
+        if not regles:
+            return None
+        return max(regles, key=lambda r: (r.precision, r.pk)).compte

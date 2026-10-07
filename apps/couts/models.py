@@ -174,7 +174,7 @@ class CoutReel(models.Model):
         )
 
     @property
-    def quantite_produite(self):
+    def quantite_produite(self):  # format principal
         """
         Quantité réellement produite et bonne : somme des lots de l'OF
         (hors lots non conformes, qui sont une perte). À défaut de lot,
@@ -206,8 +206,63 @@ class CoutReel(models.Model):
 
     @property
     def cout_unitaire_reel(self):
-        quantite = self.quantite_produite
-        return self.cout_total / quantite if quantite else 0
+        """Coût unitaire du format principal (OF à plusieurs formats : voir ventilation_par_format)."""
+        return self.cout_unitaire_pour(self.ordre_fabrication.article)
+
+    def cout_unitaire_pour(self, article):
+        for ligne in self.ventilation_par_format():
+            if ligne["article"].pk == article.pk:
+                return ligne["cout_unitaire"]
+        return 0
+
+    def ventilation_par_format(self):
+        """
+        Coût réel de l'OF par format (Q27 : quantités, consommations et coûts
+        ventilables par format) :
+        - charges de la cascade : déjà ventilées par format ;
+        - matières : au prorata de la valeur théorique des besoins de chaque
+          format (sa recette x sa quantité) ;
+        - main-d'œuvre, énergie, amortissement : au prorata des litres
+          produits (à défaut, des bouteilles / pots).
+        Un seul format : tout le coût lui revient.
+        """
+        from decimal import Decimal
+        from apps.couts.cascade import cle_entre_formats, ventiler
+        of = self.ordre_fabrication
+        formats = of.quantites_par_format()
+
+        def ligne(article, cout):
+            quantite = formats[article]
+            return {
+                "article": article, "quantite": quantite, "unites": article.en_unites(quantite), "cout": cout,
+                "cout_unitaire": (cout / quantite) if quantite else 0,
+            }
+
+        if len(formats) == 1:
+            article = next(iter(formats))
+            return [ligne(article, self.cout_total)]
+        couts = {article: Decimal(0) for article in formats}
+        par_pk = {article.pk: article for article in formats}
+        for repartition in RepartitionCout.objects.filter(
+            ordre_fabrication=of, niveau=NiveauRepartition.PRODUIT, charge__nature__categorie=CategorieCout.PRODUCTION,
+        ):
+            if repartition.article_id in par_pk:
+                couts[par_pk[repartition.article_id]] += repartition.montant
+        poids_matieres = []
+        for article, quantite in of.formats_prevus():
+            fiche = article.fiche_technique_validee
+            valeur = sum((besoin * l.prix_unitaire for l, besoin in fiche.besoins_pour(article, quantite)), Decimal(0)) if fiche else Decimal(0)
+            poids_matieres.append((article, valeur))
+        if not all(valeur > 0 for _, valeur in poids_matieres):
+            poids_matieres, _ = cle_entre_formats(formats, None)
+        if self.cout_matiere_total:
+            for article, _, montant in ventiler(self.cout_matiere_total, poids_matieres)[1]:
+                couts[article] += montant
+        autres = self.cout_main_oeuvre_total + self.cout_energie_total + self.cout_amortissement_total
+        if autres:
+            for article, _, montant in ventiler(autres, cle_entre_formats(formats, None)[0])[1]:
+                couts[article] += montant
+        return [ligne(article, cout) for article, cout in couts.items()]
 
     @property
     def ecart_vs_standard(self):
@@ -344,6 +399,8 @@ class Inducteur(models.TextChoices):
     PALETTES_JOURS = "PALETTES_JOURS", "Palettes-jours (stockage)"
     KM = "KM", "Kilomètres (tournées)"
     QUANTITE_LIVREE = "QUANTITE_LIVREE", "Quantité livrée"
+    PALETTES_LIVREES = "PALETTES_LIVREES", "Palettes livrées"
+    LITRES_LIVRES = "LITRES_LIVRES", "Volume livré (litres)"
     AUCUN = "AUCUN", "Aucun (charge directe uniquement)"
 
 
@@ -353,6 +410,7 @@ UNITES_INDUCTEURS = {
     Inducteur.HEURES_MO: "h", Inducteur.KWH: "kWh", Inducteur.ANALYSES_PONDEREES: "analyses pondérées",
     Inducteur.TEMPS_CHANGEMENT_SERIE: "min",
     Inducteur.PALETTES_JOURS: "palettes-jours", Inducteur.KM: "km", Inducteur.QUANTITE_LIVREE: "unités livrées",
+    Inducteur.PALETTES_LIVREES: "palettes livrées", Inducteur.LITRES_LIVRES: "litres livrés",
     Inducteur.AUCUN: "",
 }
 
@@ -422,12 +480,16 @@ class NatureCout(ValidationAvantEnregistrement, models.Model):
         if self.traitement == Traitement.INDIRECT and self.inducteur == Inducteur.AUCUN \
                 and self.categorie != CategorieCout.HORS_COUT:
             raise ValidationError({"inducteur": "Une charge indirecte se répartit avec un inducteur (pas de clé arbitraire)."})
-        if self.categorie == CategorieCout.PRODUCTION and self.inducteur in (Inducteur.PALETTES_JOURS, Inducteur.KM, Inducteur.QUANTITE_LIVREE):
+        if self.categorie == CategorieCout.PRODUCTION and self.inducteur in (
+            Inducteur.PALETTES_JOURS, Inducteur.KM, Inducteur.QUANTITE_LIVREE, Inducteur.PALETTES_LIVREES, Inducteur.LITRES_LIVRES,
+        ):
             raise ValidationError({"inducteur": "Cet inducteur sert au stockage ou à la distribution, pas au coût de production."})
         if self.categorie == CategorieCout.STOCKAGE and self.inducteur not in (Inducteur.PALETTES_JOURS, Inducteur.QUANTITE_LIVREE, Inducteur.AUCUN):
             raise ValidationError({"inducteur": "Le stockage se répartit en palettes-jours (ou quantité livrée)."})
-        if self.categorie == CategorieCout.DISTRIBUTION and self.inducteur not in (Inducteur.KM, Inducteur.QUANTITE_LIVREE, Inducteur.AUCUN):
-            raise ValidationError({"inducteur": "La distribution se répartit au kilomètre ou à la quantité livrée."})
+        if self.categorie == CategorieCout.DISTRIBUTION and self.inducteur not in (
+            Inducteur.KM, Inducteur.QUANTITE_LIVREE, Inducteur.PALETTES_LIVREES, Inducteur.LITRES_LIVRES, Inducteur.AUCUN,
+        ):
+            raise ValidationError({"inducteur": "La distribution se répartit au km, à la quantité, aux palettes ou au volume livrés."})
         if self.etape_id and self.etape.hors_cout_production and self.categorie == CategorieCout.PRODUCTION:
             raise ValidationError({"etape": f"L'étape {self.etape.libelle} est hors coût de production."})
 

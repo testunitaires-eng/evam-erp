@@ -114,6 +114,19 @@ class OrdreFabricationSerializer(SansDonneesFinancieresPourAgentMixin, Validatio
     activite_code = serializers.SerializerMethodField()
     usine_code = serializers.SerializerMethodField()
     ligne_code = serializers.CharField(source="ligne.code", read_only=True, default=None)
+    formats_supplementaires = serializers.SerializerMethodField()
+    ligne_proposee = serializers.SerializerMethodField()
+
+    def get_formats_supplementaires(self, of):
+        return FormatOFSerializer(of.formats_supplementaires.all(), many=True).data
+
+    def get_ligne_proposee(self, of):
+        """Ligne retenue automatiquement au lancement si elle est la seule compatible."""
+        vue = self.context.get("view")
+        if of.ligne_id or of.statut != "BROUILLON" or getattr(vue, "action", None) != "retrieve":
+            return None   # calculé sur la fiche de l'OF seulement (pas dans la liste)
+        ligne = of.ligne_proposee()
+        return ligne.code if ligne else None
     circuit_code = serializers.CharField(source="circuit.code", read_only=True, default=None)
     etapes_prevues = serializers.SerializerMethodField()
 
@@ -162,6 +175,23 @@ class OrdreFabricationSerializer(SansDonneesFinancieresPourAgentMixin, Validatio
         except DjangoValidationError as erreur:
             raise serializers.ValidationError(erreur.message_dict["agents_affectes"])
         return agents
+
+
+class FormatOFSerializer(ValidationModeleMixin, serializers.ModelSerializer):
+    article_code = serializers.CharField(source="article.code", read_only=True)
+
+    class Meta:
+        model = models.FormatOF
+        fields = "__all__"
+
+
+class ReservationMatiereSerializer(serializers.ModelSerializer):
+    matiere_code = serializers.CharField(source="matiere.code", read_only=True)
+    depot_nom = serializers.CharField(source="depot.nom", read_only=True)
+
+    class Meta:
+        model = models.ReservationMatiere
+        fields = "__all__"
 
 
 class BesoinMatierePrevuSerializer(SansDonneesFinancieresPourAgentMixin, ValidationModeleMixin, serializers.ModelSerializer):
@@ -300,3 +330,11 @@ class EvenementProductionSerializer(ValidationModeleMixin, SaisiParMixin, serial
         model = models.EvenementProduction
         fields = "__all__"
         read_only_fields = ["saisi_par"]
+
+
+class DonneeObligatoireEtapeSerializer(serializers.ModelSerializer):
+    etape_code = serializers.CharField(source="etape.code", read_only=True)
+
+    class Meta:
+        model = models.DonneeObligatoireEtape
+        fields = "__all__"

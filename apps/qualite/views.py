@@ -205,6 +205,15 @@ class InstrumentViewSet(viewsets.ModelViewSet):
         return Response(self.get_serializer(instruments, many=True).data)
 
 
+class ModeleControleViewSet(viewsets.ModelViewSet):
+    """Bibliothèque de contrôles réutilisables (paramètre, instrument, méthode, échantillon...)."""
+    queryset = models.ModeleControle.objects.select_related("parametre", "instrument")
+    serializer_class = serializers.ModeleControleSerializer
+    permission_classes = [PARAMETRAGE_QUALITE]
+    filterset_fields = ["parametre", "instrument", "laboratoire", "actif"]
+    search_fields = ["code", "designation"]
+
+
 class PointControleViewSet(viewsets.ModelViewSet):
     """Plan de contrôle : ce qui doit être contrôlé, où, quand, comment et avec quels critères."""
     queryset = models.PointControle.objects.select_related("parametre", "activite", "article", "etape")

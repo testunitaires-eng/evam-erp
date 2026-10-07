@@ -143,3 +143,11 @@ class NonConformiteSerializer(ValidationModeleMixin, serializers.ModelSerializer
         model = models.NonConformite
         fields = "__all__"
         read_only_fields = ["statut", "decision", "ouverte_par", "cloturee_par", "date_cloture"]
+
+
+class ModeleControleSerializer(ValidationModeleMixin, serializers.ModelSerializer):
+    parametre_libelle = serializers.CharField(source="parametre.libelle", read_only=True)
+
+    class Meta:
+        model = models.ModeleControle
+        fields = "__all__"

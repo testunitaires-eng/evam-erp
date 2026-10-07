@@ -142,6 +142,12 @@ class ParametreEntreprise(models.Model):
     conditions_paiement = models.TextField("Conditions de paiement (factures)", blank=True)
     mentions_pied_de_page = models.TextField("Autres mentions de pied de page", blank=True)
     couleur = models.CharField("Couleur des documents", max_length=7, default="#0A6676", help_text="Code hexadécimal, ex : #0A6676.")
+    sfec_actif = models.BooleanField(
+        "Certification SFEC active", default=False,
+        help_text="À activer quand la société et son accès SFEC sont en place (le jeton reste dans la variable SFEC_JETON).",
+    )
+    sfec_url = models.CharField("Adresse du service SFEC", max_length=255, blank=True)
+    sfec_nim = models.CharField("NIM (n° de la machine / du point de facturation)", max_length=40, blank=True)
     logo = models.BinaryField("Logo", null=True, blank=True, editable=False)
     logo_type = models.CharField("Type du logo", max_length=30, blank=True, editable=False)
 

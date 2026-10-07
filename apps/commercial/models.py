@@ -495,13 +495,29 @@ class Client(ValidationAvantEnregistrement, models.Model):
         du client (utilise Facture.solde_restant, qui tient déjà
         compte des encaissements et paiements partiels).
         """
+        return self.encours_hors(None)
+
+    def encours_hors(self, commande_exclue):
+        """
+        Encours = soldes des factures non annulées + commandes sous contrat
+        en cours non encore facturées (facturées après livraison) : la
+        marchandise livrée à crédit compte dès la commande.
+        """
         from decimal import Decimal
         total = Decimal("0")
         for facture in self.facture_set.exclude(statut=StatutFacture.ANNULEE):
             total += facture.solde_restant
+        en_cours = self.commandes.filter(
+            type_commande=TypeCommande.CONTRAT,
+            statut__in=(StatutCommande.VALIDEE, StatutCommande.EN_PREPARATION, StatutCommande.LIVREE),
+        ).exclude(facture__isnull=False)
+        if commande_exclue is not None and commande_exclue.pk:
+            en_cours = en_cours.exclude(pk=commande_exclue.pk)
+        for commande in en_cours:
+            total += commande.montant_total
         return total
 
-    def verifier_peut_commander(self, montant_commande=None):
+    def verifier_peut_commander(self, montant_commande=None, commande=None):
         """
         Lève ValidationError si le client ne peut pas passer/faire
         progresser une commande. Point d'entrée UNIQUE de la règle
@@ -518,11 +534,12 @@ class Client(ValidationAvantEnregistrement, models.Model):
             )
 
         montant_commande = Decimal(str(montant_commande or 0))
-        futur_encours = self.encours_actuel + montant_commande
+        encours = self.encours_hors(commande)
+        futur_encours = encours + montant_commande
         if futur_encours > self.encours_autorise:
             raise ValidationError(
                 f"Encours autorisé dépassé pour « {self.nom} » : "
-                f"encours actuel {self.encours_actuel} FCFA + commande {montant_commande} FCFA "
+                f"encours actuel {encours} FCFA + commande {montant_commande} FCFA "
                 f"dépasse le plafond de {self.encours_autorise} FCFA."
             )
 
@@ -547,6 +564,21 @@ class ContratClient(ValidationAvantEnregistrement, models.Model):
     date_fin = models.DateField("Date de fin", null=True, blank=True)
     conditions = models.TextField("Conditions particulières", blank=True)
 
+    @property
+    def est_actif(self):
+        from django.utils import timezone
+        aujourd_hui = timezone.localdate()
+        return self.date_debut <= aujourd_hui and (self.date_fin is None or self.date_fin >= aujourd_hui)
+
+    @classmethod
+    def actif_pour(cls, client):
+        from django.db.models import Q
+        from django.utils import timezone
+        aujourd_hui = timezone.localdate()
+        return cls.objects.filter(client=client, date_debut__lte=aujourd_hui).filter(
+            Q(date_fin__isnull=True) | Q(date_fin__gte=aujourd_hui),
+        ).order_by("-date_debut").first()
+
     class Meta:
         verbose_name = "Contrat client"
         verbose_name_plural = "Contrats clients"
@@ -566,6 +598,10 @@ class Tarif(ValidationAvantEnregistrement, models.Model):
         null=True, blank=True,
         help_text="Laisser vide pour un tarif public standard.",
     )
+    contrat = models.ForeignKey(
+        ContratClient, verbose_name="Contrat", on_delete=models.CASCADE, null=True, blank=True, related_name="tarifs",
+        help_text="Tarif négocié dans un contrat (prioritaire sur le tarif client et le tarif public).",
+    )
     prix_unitaire = models.DecimalField("Prix unitaire", max_digits=14, decimal_places=2)
     date_debut_validite = models.DateField("Valide à partir du")
     date_fin_validite = models.DateField("Valide jusqu'au", null=True, blank=True)
@@ -584,6 +620,36 @@ class Tarif(ValidationAvantEnregistrement, models.Model):
             self.date_debut_validite, self.date_fin_validite, "date_fin_validite",
             "la date de début de validité", "La date de fin de validité",
         )
+        if self.contrat_id:
+            if self.client_id and self.client_id != self.contrat.client_id:
+                raise ValidationError({"contrat": "Ce contrat appartient à un autre client."})
+            self.client_id = self.contrat.client_id
+        if self.article_id and self.article.type_article != "PRODUIT_FINI":
+            raise ValidationError({"article": "On ne tarifie à la vente que des produits finis."})
+
+    @classmethod
+    def applicable(cls, article, client=None, date=None):
+        """
+        Tarif en vigueur pour cet article et ce client : tarif du contrat
+        actif du client, sinon tarif propre au client, sinon tarif public.
+        À niveau égal, le plus récent l'emporte. None si aucun tarif.
+        """
+        from django.db.models import Q
+        from django.utils import timezone
+        date = date or timezone.localdate()
+        en_vigueur = cls.objects.filter(article=article, date_debut_validite__lte=date).filter(
+            Q(date_fin_validite__isnull=True) | Q(date_fin_validite__gte=date),
+        ).order_by("-date_debut_validite", "-pk")
+        if client is not None:
+            contrat = ContratClient.actif_pour(client)
+            if contrat is not None:
+                tarif = en_vigueur.filter(contrat=contrat).first()
+                if tarif:
+                    return tarif
+            tarif = en_vigueur.filter(client=client, contrat__isnull=True).first()
+            if tarif:
+                return tarif
+        return en_vigueur.filter(client__isnull=True, contrat__isnull=True).first()
 
 
 class TypeCommande(models.TextChoices):
@@ -614,6 +680,10 @@ class Commande(ValidationAvantEnregistrement, models.Model):
         "Statut", max_length=20, choices=StatutCommande.choices, default=StatutCommande.BROUILLON
     )
     cree_par = models.ForeignKey(Utilisateur, verbose_name="Créée par", on_delete=models.PROTECT)
+    devis = models.ForeignKey(
+        "Devis", verbose_name="Devis d'origine", on_delete=models.PROTECT, null=True, blank=True,
+        related_name="commandes", editable=False,
+    )
     date_commande = models.DateTimeField("Date de commande", auto_now_add=True)
 
     class Meta:
@@ -667,6 +737,9 @@ class Commande(ValidationAvantEnregistrement, models.Model):
             )
         if ancien_statut is None and self.statut != StatutCommande.BROUILLON:
             raise ValidationError({"statut": "Une commande est toujours créée en brouillon, puis validée une fois ses lignes saisies."})
+        if ancien_statut is None and self.type_commande == TypeCommande.CONTRAT and self.client_id \
+                and ContratClient.actif_pour(self.client) is None:
+            raise ValidationError({"type_commande": f"« {self.client.nom} » n'a pas de contrat en vigueur : vente au comptant uniquement."})
         verifier_transition(ancien_statut, self.statut, self.TRANSITIONS, "statut de commande")
 
         if ancien_statut not in (None, StatutCommande.BROUILLON):
@@ -687,13 +760,22 @@ class Commande(ValidationAvantEnregistrement, models.Model):
 
         if self.client_id and self.est_modifiable and not self.a_une_facture():
             montant = self.montant_total if self.pk else 0
-            self.client.verifier_peut_commander(montant_commande=montant)
+            self.client.verifier_peut_commander(montant_commande=montant, commande=self)
 
     def verifier_suppression(self):
         if self.statut != StatutCommande.BROUILLON:
             raise ValidationError(
                 "Seule une commande en brouillon peut être supprimée ; sinon, annulez-la."
             )
+
+    def avancer_vers(self, statut):
+        """Fait suivre le statut au circuit (préparation, livraison, facturation), étape par étape."""
+        ordre = [StatutCommande.VALIDEE, StatutCommande.EN_PREPARATION, StatutCommande.LIVREE, StatutCommande.FACTUREE]
+        if self.statut not in ordre or ordre.index(self.statut) >= ordre.index(statut):
+            return
+        for suivant in ordre[ordre.index(self.statut) + 1: ordre.index(statut) + 1]:
+            self.statut = suivant
+            self.save()
 
     @property
     def montant_total(self):
@@ -706,7 +788,20 @@ class LigneCommande(ValidationAvantEnregistrement, models.Model):
     commande = models.ForeignKey(Commande, verbose_name="Commande", on_delete=models.CASCADE, related_name="lignes")
     article = models.ForeignKey(Article, verbose_name="Article", on_delete=models.PROTECT)
     quantite = models.DecimalField("Quantité", max_digits=12, decimal_places=3)
-    prix_unitaire = models.DecimalField("Prix unitaire", max_digits=14, decimal_places=2)
+    prix_unitaire = models.DecimalField(
+        "Prix unitaire", max_digits=14, decimal_places=2, blank=True,
+        help_text="Repris automatiquement du tarif en vigueur (contrat, client ou public) : le prix est imposé.",
+    )
+    tarif = models.ForeignKey(Tarif, verbose_name="Tarif appliqué", on_delete=models.PROTECT, null=True, blank=True, editable=False, related_name="+")
+    prix_tarif = models.DecimalField("Prix du tarif", max_digits=14, decimal_places=2, null=True, blank=True, editable=False)
+    motif_derogation = models.CharField(
+        "Motif de la dérogation de prix", max_length=255, blank=True,
+        help_text="Obligatoire si le prix diffère du tarif (client sous contrat uniquement).",
+    )
+    derogation_autorisee_par = models.ForeignKey(
+        Utilisateur, verbose_name="Dérogation autorisée par", on_delete=models.PROTECT, null=True, blank=True,
+        editable=False, related_name="derogations_prix",
+    )
 
     class Meta:
         verbose_name = "Ligne de commande"
@@ -726,9 +821,11 @@ class LigneCommande(ValidationAvantEnregistrement, models.Model):
         dépassement, erreur 500 mais ligne conservée).
         """
         exiger_positif(self.quantite, "quantite", "La quantité")
-        exiger_positif(self.prix_unitaire, "prix_unitaire", "Le prix unitaire")
         if self.article_id and not self.article.actif:
             raise ValidationError({"article": f"L'article {self.article.code} est inactif : il ne peut pas être commandé."})
+        if self.article_id and self.commande_id:
+            appliquer_tarif(self, self.commande.client, self.commande.type_commande)
+        exiger_positif(self.prix_unitaire, "prix_unitaire", "Le prix unitaire")
 
         if self.pk:
             ancienne_commande = Commande.objects.filter(pk=valeur_en_base(self, "commande")).first()
@@ -751,7 +848,7 @@ class LigneCommande(ValidationAvantEnregistrement, models.Model):
         if self.quantite is not None and self.prix_unitaire is not None:
             autres_lignes = commande.lignes.exclude(pk=self.pk) if self.pk else commande.lignes.all()
             montant_estime = sum((l.montant_ligne for l in autres_lignes), start=0) + self.montant_ligne
-            commande.client.verifier_peut_commander(montant_commande=montant_estime)
+            commande.client.verifier_peut_commander(montant_commande=montant_estime, commande=commande)
 
     def verifier_suppression(self):
         commande = self.commande
@@ -895,6 +992,17 @@ class Facture(ValidationAvantEnregistrement, models.Model):
         "Date d'échéance", null=True, blank=True,
         help_text="Calculée automatiquement à la création (date d'émission + délai de paiement du client).",
     )
+    # --- Facture normalisée SFEC (Q67) : prêt pour une connexion ultérieure ---
+    sfec_statut = models.CharField(
+        "Certification SFEC", max_length=12, default="EN_ATTENTE", editable=False,
+        choices=[("EN_ATTENTE", "Non certifiée"), ("CERTIFIEE", "Certifiée"), ("ERREUR", "Erreur de certification")],
+    )
+    sfec_code = models.CharField("Code de certification (MECeF)", max_length=80, blank=True, editable=False)
+    sfec_qr = models.TextField("Contenu du QR code", blank=True, editable=False)
+    sfec_compteurs = models.CharField("Compteurs SFEC", max_length=80, blank=True, editable=False)
+    sfec_nim = models.CharField("NIM (n° machine)", max_length=40, blank=True, editable=False)
+    sfec_date = models.DateTimeField("Certifiée le", null=True, blank=True, editable=False)
+    sfec_message = models.TextField("Dernier message SFEC", blank=True, editable=False)
 
     class Meta:
         verbose_name = "Facture"
@@ -922,6 +1030,12 @@ class Facture(ValidationAvantEnregistrement, models.Model):
         if self.pk is None:
             if self.commande_id:
                 commande = self.commande
+                if commande.type_commande == TypeCommande.CONTRAT and commande.statut != StatutCommande.LIVREE:
+                    raise ValidationError({"commande": (
+                        f"Client sous contrat : la commande {commande.numero} est facturée après la livraison "
+                        "et la confirmation de réception (statut actuel : "
+                        f"{commande.get_statut_display().lower()})."
+                    )})
                 if commande.statut not in (
                     StatutCommande.VALIDEE, StatutCommande.EN_PREPARATION, StatutCommande.LIVREE,
                 ):
@@ -1186,3 +1300,251 @@ class Avoir(ValidationAvantEnregistrement, models.Model):
         facture_cible.mettre_a_jour_statut_paiement()
         from apps.comptabilite.ecritures import ecrire_avoir_utilise
         ecrire_avoir_utilise(self)
+
+
+
+PROFILS_DEROGATION_PRIX = ("DIRECTION", "COMPTABILITE_DAF", "ADMIN_SI")
+
+
+def appliquer_tarif(ligne, client, type_commande):
+    """
+    Tarif imposé (questionnaire, Q73) :
+    - le prix vient du tarif en vigueur (contrat > client > public) ;
+    - vente au comptant (caisse) : aucun autre prix possible ;
+    - client sous contrat : un prix différent n'est accepté qu'avec un
+      motif et l'autorisation de la Direction ou de la DAF (tracée).
+    Sert aux lignes de commande et de devis.
+    """
+    tarif = Tarif.applicable(ligne.article, client)
+    if tarif is None:
+        raise ValidationError({"article": (
+            f"Aucun tarif en vigueur pour {ligne.article.code} (contrat, client ou tarif public) : "
+            "paramétrez-le avant de le vendre."
+        )})
+    ligne.tarif, ligne.prix_tarif = tarif, tarif.prix_unitaire
+    if ligne.prix_unitaire in (None, ""):
+        ligne.prix_unitaire = tarif.prix_unitaire
+    if ligne.prix_unitaire == tarif.prix_unitaire:
+        ligne.motif_derogation, ligne.derogation_autorisee_par = "", None
+        return
+    if type_commande != TypeCommande.CONTRAT:
+        raise ValidationError({"prix_unitaire": (
+            f"Le tarif est imposé : {tarif.prix_unitaire} FCFA pour {ligne.article.code}."
+        )})
+    if not (ligne.motif_derogation or "").strip():
+        raise ValidationError({"motif_derogation": (
+            f"Prix différent du tarif ({tarif.prix_unitaire} FCFA) : indiquez le motif de la dérogation."
+        )})
+    autorise = ligne.derogation_autorisee_par
+    if autorise is None or not (autorise.is_superuser or autorise.profil in PROFILS_DEROGATION_PRIX):
+        raise ValidationError({"prix_unitaire": (
+            f"Prix différent du tarif ({tarif.prix_unitaire} FCFA) : seule la Direction ou la DAF peut l'autoriser."
+        )})
+
+
+class StatutDevis(models.TextChoices):
+    BROUILLON = "BROUILLON", "Brouillon"
+    ENVOYE = "ENVOYE", "Envoyé au client"
+    ACCEPTE = "ACCEPTE", "Accepté"
+    PARTIELLEMENT_ACCEPTE = "PARTIELLEMENT_ACCEPTE", "Accepté partiellement"
+    REFUSE = "REFUSE", "Refusé"
+    EXPIRE = "EXPIRE", "Expiré"
+
+
+STATUTS_DEVIS_FIGES = (StatutDevis.ACCEPTE, StatutDevis.PARTIELLEMENT_ACCEPTE, StatutDevis.REFUSE, StatutDevis.EXPIRE)
+
+
+class Devis(ValidationAvantEnregistrement, models.Model):
+    """
+    Devis (questionnaire, Q68) : Devis -> validation client -> commande ->
+    livraison -> facturation. Modifiable en brouillon (ou après envoi, en
+    le repassant en brouillon), accepté en totalité ou en partie, refusé,
+    ou expiré à sa date de validité. La commande créée garde le lien.
+    """
+    numero = models.CharField("N° devis", max_length=30, unique=True, editable=False)
+    client = models.ForeignKey(Client, verbose_name="Client", on_delete=models.PROTECT, related_name="devis")
+    type_commande = models.CharField("Type de vente", max_length=15, choices=TypeCommande.choices, default=TypeCommande.COMPTANT)
+    date_validite = models.DateField("Valable jusqu'au")
+    statut = models.CharField("Statut", max_length=25, choices=StatutDevis.choices, default=StatutDevis.BROUILLON)
+    conditions = models.TextField("Conditions / remarques", blank=True)
+    motif_refus = models.TextField("Motif du refus", blank=True)
+    cree_par = models.ForeignKey(Utilisateur, verbose_name="Établi par", on_delete=models.PROTECT, related_name="devis_crees")
+    date_creation = models.DateTimeField("Date", auto_now_add=True)
+    date_envoi = models.DateTimeField("Envoyé le", null=True, blank=True)
+    date_reponse = models.DateTimeField("Réponse du client le", null=True, blank=True)
+
+    class Meta:
+        verbose_name = "Devis"
+        verbose_name_plural = "Devis"
+        ordering = ["-date_creation"]
+
+    def __str__(self):
+        return f"{self.numero} - {self.client.nom} ({self.get_statut_display()})"
+
+    TRANSITIONS = {
+        StatutDevis.BROUILLON: {StatutDevis.ENVOYE},
+        StatutDevis.ENVOYE: {StatutDevis.BROUILLON, StatutDevis.ACCEPTE, StatutDevis.PARTIELLEMENT_ACCEPTE,
+                             StatutDevis.REFUSE, StatutDevis.EXPIRE},
+    }
+
+    def save(self, *args, **kwargs):
+        if not self.numero:
+            self.numero = generer_numero("DEV")
+        super().save(*args, **kwargs)
+
+    def clean(self):
+        ancien = valeur_en_base(self, "statut")
+        if ancien in STATUTS_DEVIS_FIGES:
+            raise ValidationError(f"Le devis {self.numero} est {dict(StatutDevis.choices)[ancien].lower()} : il est figé.")
+        verifier_transition(ancien, self.statut, self.TRANSITIONS, "statut du devis", initial=StatutDevis.BROUILLON)
+        if ancien is None and self.date_validite and self.date_validite < self._aujourd_hui():
+            raise ValidationError({"date_validite": "La date de validité ne peut pas être passée."})
+        if self.client_id and self.client.bloque and self.statut in (StatutDevis.BROUILLON, StatutDevis.ENVOYE):
+            raise ValidationError({"client": f"Le client « {self.client.nom} » est bloqué."})
+        if self.type_commande == TypeCommande.CONTRAT and self.client_id and ContratClient.actif_pour(self.client) is None:
+            raise ValidationError({"type_commande": f"« {self.client.nom} » n'a pas de contrat en vigueur."})
+        if ancien not in (None, StatutDevis.BROUILLON):
+            for champ in ("client", "type_commande"):
+                attribut = f"{champ}_id" if champ == "client" else champ
+                if valeur_en_base(self, champ) != getattr(self, attribut) and self.statut != StatutDevis.BROUILLON:
+                    raise ValidationError({champ: "Repassez le devis en brouillon pour le modifier."})
+
+    def verifier_suppression(self):
+        if self.statut != StatutDevis.BROUILLON:
+            raise ValidationError("Seul un devis en brouillon peut être supprimé.")
+
+    @staticmethod
+    def _aujourd_hui():
+        from django.utils import timezone
+        return timezone.localdate()
+
+    @property
+    def est_expire(self):
+        return self.statut == StatutDevis.ENVOYE and self.date_validite < self._aujourd_hui()
+
+    def expirer_si_depasse(self):
+        if self.est_expire:
+            self.statut = StatutDevis.EXPIRE
+            self.save()
+        return self.statut == StatutDevis.EXPIRE
+
+    @property
+    def montant_ht(self):
+        return sum((ligne.montant_ht for ligne in self.lignes.all()), start=0)
+
+    def totaux(self):
+        """HT, taxes (TVA, accise, centimes selon le code fiscal) et TTC estimés."""
+        from decimal import Decimal
+        ht = taxes = Decimal(0)
+        for ligne in self.lignes.select_related("article__code_fiscal"):
+            ht += ligne.montant_ht
+            if ligne.article.code_fiscal_id:
+                calcul = ligne.article.code_fiscal.calculer_taxes(ligne.montant_ht)
+                taxes += calcul["montant_ttc"] - calcul["montant_ht"]
+        return {"ht": ht, "taxes": taxes, "ttc": ht + taxes}
+
+    def envoyer(self):
+        from django.utils import timezone
+        if self.statut != StatutDevis.BROUILLON:
+            raise ValueError("Seul un devis en brouillon peut être envoyé.")
+        if not self.lignes.exists():
+            raise ValueError("Un devis sans ligne ne peut pas être envoyé.")
+        self.statut = StatutDevis.ENVOYE
+        self.date_envoi = timezone.now()
+        self.save()
+
+    def reviser(self):
+        """Envoyé -> Brouillon (modification demandée par le client)."""
+        if self.statut != StatutDevis.ENVOYE:
+            raise ValueError("Seul un devis envoyé peut être repassé en brouillon.")
+        self.statut = StatutDevis.BROUILLON
+        self.save()
+
+    def refuser(self, motif=""):
+        from django.utils import timezone
+        if self.statut != StatutDevis.ENVOYE:
+            raise ValueError("Seul un devis envoyé peut être refusé.")
+        self.statut, self.motif_refus, self.date_reponse = StatutDevis.REFUSE, motif, timezone.now()
+        self.save()
+
+    @transaction.atomic
+    def accepter(self, utilisateur, quantites=None):
+        """
+        Acceptation par le client : crée la commande (brouillon, liée au
+        devis) avec les lignes acceptées. `quantites` = {id ligne: quantité}
+        pour une acceptation partielle (0 = ligne refusée) ; sans précision,
+        tout est accepté. Les prix du devis sont repris (tarif imposé
+        revérifié sur la commande).
+        """
+        from decimal import Decimal, InvalidOperation
+        from django.utils import timezone
+        if self.expirer_si_depasse():
+            raise ValueError(f"Le devis {self.numero} a expiré le {self.date_validite:%d/%m/%Y}.")
+        if self.statut != StatutDevis.ENVOYE:
+            raise ValueError("Seul un devis envoyé au client peut être accepté.")
+        quantites = {str(cle): valeur for cle, valeur in (quantites or {}).items()}
+        commande = Commande.objects.create(client=self.client, type_commande=self.type_commande, cree_par=utilisateur, devis=self)
+        partiel = False
+        for ligne in self.lignes.select_related("article"):
+            try:
+                quantite = Decimal(str(quantites.get(str(ligne.pk), ligne.quantite)))
+            except InvalidOperation:
+                raise ValueError(f"Quantité acceptée invalide pour {ligne.article.code}.")
+            if quantite < 0 or quantite > ligne.quantite:
+                raise ValueError(f"{ligne.article.code} : la quantité acceptée doit être comprise entre 0 et {ligne.quantite}.")
+            ligne.quantite_acceptee = quantite
+            ligne.save(update_fields=["quantite_acceptee"])
+            if quantite < ligne.quantite:
+                partiel = True
+            if quantite > 0:
+                LigneCommande.objects.create(
+                    commande=commande, article=ligne.article, quantite=quantite, prix_unitaire=ligne.prix_unitaire,
+                    motif_derogation=ligne.motif_derogation, derogation_autorisee_par=ligne.derogation_autorisee_par,
+                )
+        if not commande.lignes.exists():
+            raise ValueError("Aucune ligne acceptée : utilisez « refuser ».")
+        self.statut = StatutDevis.PARTIELLEMENT_ACCEPTE if partiel else StatutDevis.ACCEPTE
+        self.date_reponse = timezone.now()
+        self.save()
+        return commande
+
+
+class LigneDevis(ValidationAvantEnregistrement, models.Model):
+    devis = models.ForeignKey(Devis, verbose_name="Devis", on_delete=models.CASCADE, related_name="lignes")
+    article = models.ForeignKey(Article, verbose_name="Article", on_delete=models.PROTECT)
+    quantite = models.DecimalField("Quantité", max_digits=12, decimal_places=3)
+    prix_unitaire = models.DecimalField("Prix unitaire HT", max_digits=14, decimal_places=2, blank=True)
+    tarif = models.ForeignKey(Tarif, verbose_name="Tarif appliqué", on_delete=models.PROTECT, null=True, blank=True, editable=False, related_name="+")
+    prix_tarif = models.DecimalField("Prix du tarif", max_digits=14, decimal_places=2, null=True, blank=True, editable=False)
+    motif_derogation = models.CharField("Motif de la dérogation de prix", max_length=255, blank=True)
+    derogation_autorisee_par = models.ForeignKey(
+        Utilisateur, verbose_name="Dérogation autorisée par", on_delete=models.PROTECT, null=True, blank=True,
+        editable=False, related_name="+",
+    )
+    quantite_acceptee = models.DecimalField("Quantité acceptée", max_digits=12, decimal_places=3, null=True, blank=True, editable=False)
+
+    class Meta:
+        verbose_name = "Ligne de devis"
+        verbose_name_plural = "Lignes de devis"
+
+    def __str__(self):
+        return f"{self.devis.numero} : {self.quantite} {self.article.code}"
+
+    @property
+    def montant_ht(self):
+        return (self.quantite or 0) * (self.prix_unitaire or 0)
+
+    def clean(self):
+        exiger_positif(self.quantite, "quantite", "La quantité")
+        devis = Devis.objects.filter(pk=valeur_en_base(self, "devis") or self.devis_id).first()
+        if devis is not None and devis.statut != StatutDevis.BROUILLON:
+            raise ValidationError("Ce devis n'est plus en brouillon : repassez-le en brouillon pour le modifier.")
+        if self.article_id and not self.article.actif:
+            raise ValidationError({"article": f"L'article {self.article.code} est inactif."})
+        if self.article_id and self.devis_id:
+            appliquer_tarif(self, self.devis.client, self.devis.type_commande)
+        exiger_positif(self.prix_unitaire, "prix_unitaire", "Le prix unitaire")
+
+    def verifier_suppression(self):
+        if self.devis.statut != StatutDevis.BROUILLON:
+            raise ValidationError("Ce devis n'est plus en brouillon : ses lignes sont figées.")

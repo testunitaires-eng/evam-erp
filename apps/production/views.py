@@ -265,7 +265,7 @@ class OrdreFabricationViewSet(HistoriqueMixin, viewsets.ModelViewSet):
     queryset = models.OrdreFabrication.objects.select_related(
         "article__activite", "ligne__usine", "circuit", "responsable",
     ).prefetch_related(
-        "agents_affectes", "etapes",
+        "agents_affectes", "etapes", "formats_supplementaires__article",
         "circuit__etapes__etape", "circuit__etapes__poste", "circuit__etapes__equipement",
     ).annotate(montant_besoins_annote=Sum("besoins_matieres__montant"))
     serializer_class = serializers.OrdreFabricationSerializer
@@ -796,3 +796,102 @@ class EvenementProductionViewSet(AffectationAgentMixin, viewsets.ModelViewSet):
         ecriture=(Profil.RESPONSABLE_PRODUCTION, Profil.AGENT_PRODUCTION, Profil.ADMIN_SI,),
     )]
     filterset_fields = ["ordre_fabrication", "type_evenement", "equipement"]
+
+
+class FormatOFViewSet(viewsets.ModelViewSet):
+    """Formats supplémentaires d'un OF (modifiables tant que l'OF est en brouillon ; besoins recalculés)."""
+    queryset = models.FormatOF.objects.select_related("article", "ordre_fabrication")
+    serializer_class = serializers.FormatOFSerializer
+    permission_classes = [acces(
+        lecture=(Profil.AGENT_PRODUCTION, Profil.DIRECTION, Profil.RESPONSABLE_QUALITE, Profil.COMPTABILITE_DAF,),
+        ecriture=(Profil.RESPONSABLE_PRODUCTION, Profil.ADMIN_SI,),
+    )]
+    filterset_fields = ["ordre_fabrication", "article"]
+
+
+class ReservationMatiereViewSet(viewsets.ReadOnlyModelViewSet):
+    """Matières réservées par les OF lancés (libérées à la sortie, à la clôture ou à l'annulation)."""
+    queryset = models.ReservationMatiere.objects.select_related("matiere", "depot", "ordre_fabrication")
+    serializer_class = serializers.ReservationMatiereSerializer
+    permission_classes = [acces(lecture=(
+        Profil.RESPONSABLE_PRODUCTION, Profil.MAGASINIER, Profil.DIRECTION, Profil.RESPONSABLE_ACHATS, Profil.ADMIN_SI,
+    ))]
+    filterset_fields = ["ordre_fabrication", "matiere", "depot"]
+
+
+@api_view(["GET"])
+@drf_permission_classes([acces(lecture=(Profil.RESPONSABLE_PRODUCTION, Profil.DIRECTION, Profil.MAGASINIER, Profil.RESPONSABLE_QUALITE, Profil.ADMIN_SI,))])
+def planning(request):
+    """
+    GET /api/production/planning/?du=AAAA-MM-JJ&au=AAAA-MM-JJ&ligne=<id>
+    Planning par ligne (Q32) : OF planifiés, heures planifiées par jour
+    face à la capacité (heures de production par jour), surcharges, et OF
+    non encore planifiés.
+    """
+    from datetime import date, datetime, time, timedelta
+    from decimal import Decimal
+    from django.utils import timezone
+    from apps.industriel.models import Ligne
+    try:
+        du = date.fromisoformat(request.query_params.get("du") or timezone.localdate().isoformat())
+        au = date.fromisoformat(request.query_params.get("au") or (du + timedelta(days=6)).isoformat())
+    except ValueError:
+        return Response({"erreur": "Dates au format AAAA-MM-JJ."}, status=400)
+    if au < du or (au - du).days > 92:
+        return Response({"erreur": "Période invalide (93 jours au plus)."}, status=400)
+    capacite = models.ParametreProduction.courant().heures_ouvrees_par_jour
+    debut = timezone.make_aware(datetime.combine(du, time.min))
+    fin = timezone.make_aware(datetime.combine(au + timedelta(days=1), time.min))
+    lignes = Ligne.objects.filter(actif=True).select_related("usine", "activite")
+    if request.query_params.get("ligne"):
+        lignes = lignes.filter(pk=request.query_params["ligne"])
+    actifs = models.OrdreFabrication.objects.exclude(statut__in=(models.StatutOF.CLOTURE, models.StatutOF.ANNULE))
+    resultat = []
+    for ligne in lignes:
+        ofs = list(actifs.filter(ligne=ligne, date_debut_prevue__lt=fin, date_fin_prevue__gt=debut)
+                   .select_related("article").order_by("date_debut_prevue"))
+        jours = []
+        jour = du
+        while jour <= au:
+            debut_jour = timezone.make_aware(datetime.combine(jour, time.min))
+            fin_jour = debut_jour + timedelta(days=1)
+            heures = Decimal(0)
+            for of in ofs:
+                chevauchement = min(of.date_fin_prevue, fin_jour) - max(of.date_debut_prevue, debut_jour)
+                if chevauchement.total_seconds() > 0:
+                    heures += Decimal(chevauchement.total_seconds()) / Decimal(3600)
+            charge = min(heures, Decimal(24))
+            jours.append({"date": jour, "heures_planifiees": round(charge, 2), "capacite_heures": capacite,
+                          "taux_charge": round(charge / capacite * 100, 1) if capacite else None,
+                          "surcharge": charge > capacite})
+            jour += timedelta(days=1)
+        resultat.append({
+            "ligne": ligne.code, "designation": ligne.designation, "usine": ligne.usine.code, "activite": ligne.activite.code,
+            "cadence": ligne.cadence_nominale, "unite_cadence": ligne.unite_cadence,
+            "ordres_fabrication": [
+                {"id": of.pk, "numero": of.numero, "article": of.article.code, "quantite": of.quantite_a_produire,
+                 "statut": of.get_statut_display(), "debut": of.date_debut_prevue, "fin": of.date_fin_prevue}
+                for of in ofs
+            ],
+            "jours": jours,
+        })
+    non_planifies = actifs.filter(date_debut_prevue__isnull=True).select_related("article", "ligne")
+    return Response({
+        "du": du, "au": au, "lignes": resultat,
+        "of_non_planifies": [
+            {"id": of.pk, "numero": of.numero, "article": of.article.code, "quantite": of.quantite_a_produire,
+             "ligne": of.ligne.code if of.ligne_id else None, "statut": of.get_statut_display()}
+            for of in non_planifies
+        ],
+    })
+
+
+class DonneeObligatoireEtapeViewSet(viewsets.ModelViewSet):
+    """Q33 : données à saisir par étape, obligatoires ou facultatives (paramétrage avec les techniciens)."""
+    queryset = models.DonneeObligatoireEtape.objects.select_related("etape")
+    serializer_class = serializers.DonneeObligatoireEtapeSerializer
+    permission_classes = [acces(
+        lecture=(Profil.AGENT_PRODUCTION, Profil.RESPONSABLE_QUALITE, Profil.DIRECTION,),
+        ecriture=(Profil.RESPONSABLE_PRODUCTION, Profil.ADMIN_SI,),
+    )]
+    filterset_fields = ["etape", "obligatoire"]

@@ -30,6 +30,7 @@ router.register("suivis-eau", views.SuiviEauViewSet, basename="suivieau")
 router.register("etapes", views.EtapeProductionViewSet, basename="etapeproduction")
 router.register("pertes", views.PerteProductionViewSet, basename="perteproduction")
 router.register("changements-serie", views.ChangementSerieViewSet, basename="changementserie")
+router.register("evenements", views.EvenementProductionViewSet, basename="evenementproduction")
 router.register("parametres", views.ParametreProductionViewSet, basename="parametreproduction")
 
 urlpatterns = [

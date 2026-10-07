@@ -63,7 +63,6 @@ class LotViewSet(HistoriqueMixin, viewsets.ModelViewSet):
         """
         from django.db.models import Q
         from apps.production.models import ConsommationLotMatiere
-        from apps.stocks.models import LigneTransfert
         lot = self.get_object()
         of = lot.ordre_fabrication
         consommations = ConsommationLotMatiere.objects.filter(sortie__ordre_fabrication=of).select_related(
@@ -92,11 +91,64 @@ class LotViewSet(HistoriqueMixin, viewsets.ModelViewSet):
                 models.NonConformite.objects.filter(Q(lot=lot) | Q(ordre_fabrication=of) if of else Q(lot=lot)), many=True,
             ).data,
             "transferts": [
-                {"bon": l.transfert.numero, "vers": l.transfert.depot_destination.nom, "quantite": l.quantite,
-                 "statut": l.transfert.get_statut_display()}
-                for l in LigneTransfert.objects.filter(lot=lot).select_related("transfert__depot_destination")
+                {"bon": m.ligne_transfert.transfert.numero, "vers": m.ligne_transfert.transfert.depot_destination.nom,
+                 "quantite": -m.quantite, "statut": m.ligne_transfert.transfert.get_statut_display()}
+                for m in lot.mouvements_lot.filter(ligne_transfert__isnull=False, quantite__lt=0)
+                .select_related("ligne_transfert__transfert__depot_destination")
             ],
+            "stock_restant": [{"lieu": depot.nom, "quantite": quantite} for depot, quantite in lot.stock_par_lieu().items()],
+            "clients": clients_du_lot(lot),
+            "palettes": [{"numero": p.numero, "quantite": p.quantite, "statut": p.get_statut_display(),
+                          "lieu": p.depot.nom, "emplacement": p.emplacement.code if p.emplacement_id else None}
+                         for p in lot.palettes.select_related("depot", "emplacement")],
         })
+
+    @action(detail=True, methods=["get"])
+    def rappel(self, request, pk=None):
+        """
+        GET /api/qualite/lots/{id}/rappel/
+        Rappel de lot : clients livrés (avec contacts et quantités), stock
+        restant à bloquer par lieu, palettes concernées.
+        """
+        lot = self.get_object()
+        return Response({
+            "lot": lot.numero_lot, "article": lot.article.code, "statut": lot.get_statut_display(),
+            "quantite_produite": lot.quantite,
+            "clients": clients_du_lot(lot),
+            "stock_restant": [{"lieu": depot.nom, "quantite": quantite} for depot, quantite in lot.stock_par_lieu().items()],
+            "palettes_en_stock": list(lot.palettes.filter(statut="EN_STOCK").values_list("numero", flat=True)),
+        })
+
+    @action(detail=True, methods=["post"])
+    def palettiser(self, request, pk=None):
+        """
+        POST /api/qualite/lots/{id}/palettiser/  {"quantite_par_palette": 640} (facultatif)
+        Constitue les palettes du lot libéré (packs par palette du produit par défaut).
+        Réservé au Magasinier, à la Qualité et à l'Admin SI.
+        """
+        from apps.stocks.models import Palette
+        from apps.stocks.serializers import PaletteSerializer
+        if request.user.profil not in (Profil.MAGASINIER, Profil.RESPONSABLE_QUALITE, Profil.ADMIN_SI) and not request.user.is_superuser:
+            return Response({"erreur": "Seuls le Magasinier et la Qualité constituent les palettes."}, status=403)
+        lot = self.get_object()
+        try:
+            palettes = Palette.constituer(lot, request.user, request.data.get("quantite_par_palette") or None)
+        except ValueError as erreur:
+            return Response({"erreur": str(erreur)}, status=400)
+        return Response(PaletteSerializer(palettes, many=True).data, status=201)
+
+    @action(detail=True, methods=["get"])
+    def etiquettes_palettes(self, request, pk=None):
+        """GET /api/qualite/lots/{id}/etiquettes_palettes/ : toutes les étiquettes du lot (PDF)."""
+        from django.http import HttpResponse
+        from apps.core.documents import etiquette_palettes
+        lot = self.get_object()
+        palettes = list(lot.palettes.select_related("lot__article", "depot", "emplacement"))
+        if not palettes:
+            return Response({"erreur": "Ce lot n'est pas encore palettisé."}, status=400)
+        reponse = HttpResponse(etiquette_palettes(palettes, request.user), content_type="application/pdf")
+        reponse["Content-Disposition"] = f'inline; filename="palettes-{lot.numero_lot}.pdf"'
+        return reponse
 
 
 class ControleQualiteViewSet(viewsets.ModelViewSet):
@@ -265,6 +317,44 @@ class ResultatControleViewSet(viewsets.ModelViewSet):
             return
         raise PermissionDenied("Votre profil ne saisit pas ce contrôle.")
 
+    @action(detail=False, methods=["get"])
+    def export(self, request):
+        """
+        GET .../controles-realises/export/?type=xlsx|pdf + les filtres de la liste
+        (période, activité, OF, lot, ligne, étape, statut, bloquant...).
+        """
+        from decimal import Decimal
+        from apps.core.exports import classeur, tableau_pdf
+        from apps.core.pdf import date_fr, nombre, telecharger
+        resultats = self.filter_queryset(self.get_queryset()).select_related(
+            "point__parametre", "ordre_fabrication", "lot", "lot_matiere", "article", "ligne", "etape", "equipement",
+            "operateur", "instrument",
+        )[:5000]
+        entetes = ["N°", "Prévu le", "Réalisé le", "Contrôle", "Paramètre", "Valeur", "Unité", "Critère", "Statut",
+                   "Bloquant", "OF", "Lot", "Article", "Ligne", "Étape", "Machine", "Opérateur", "Instrument", "Reprise", "Commentaire"]
+        serializer = serializers.ResultatControleSerializer()
+        lignes = [[
+            r.numero, r.date_prevue, r.date_realisation, r.point.designation, r.point.parametre.libelle,
+            r.valeur if r.valeur is not None else (r.resultat_qualitatif or None), r.point.parametre.unite,
+            serializer.get_critere(r), r.get_statut_display(), "Oui" if r.point.bloquant else "Non",
+            r.ordre_fabrication.numero if r.ordre_fabrication_id else (r.lot_matiere.numero if r.lot_matiere_id else None),
+            r.lot.numero_lot if r.lot_id else None, r.article.code if r.article_id else None,
+            r.ligne.code if r.ligne_id else None, r.etape.libelle if r.etape_id else None,
+            r.equipement.code if r.equipement_id else None,
+            (r.operateur.get_full_name() or r.operateur.username) if r.operateur_id else None,
+            r.instrument.code if r.instrument_id else None, "Oui" if r.est_reprise else "Non", r.commentaire,
+        ] for r in resultats]
+        if request.query_params.get("type") == "pdf":
+            courtes = [[l[0], date_fr(l[2] or l[1]), l[3], nombre(l[5]) if isinstance(l[5], Decimal) else (l[5] or ""),
+                        l[7] or "", l[8], l[10] or "", l[12] or ""] for l in lignes]
+            document = tableau_pdf(
+                "CONTRÔLES QUALITÉ", timezone_maintenant_texte(), ["N°", "Date", "Contrôle", "Valeur", "Critère", "Statut", "OF / lot", "Article"],
+                courtes, [22, 24, None, 18, 30, 22, 22, 20], request.user, colonnes_nombres=(3,),
+                texte_avant=f"{len(courtes)} contrôle(s) selon les filtres appliqués.",
+            )
+            return document.reponse("controles-qualite", telecharger(request))
+        return classeur([("Contrôles qualité", entetes, lignes)], "controles-qualite")
+
     @action(detail=True, methods=["post"])
     def enregistrer(self, request, pk=None):
         """
@@ -363,7 +453,7 @@ class NonConformiteViewSet(HistoriqueMixin, viewsets.ModelViewSet):
 
 class PieceJointeQualiteViewSet(viewsets.ModelViewSet):
     """Photos et documents (multipart : champ « fichier ») joints à un contrôle ou une NC."""
-    queryset = models.PieceJointeQualite.objects.all()
+    queryset = models.PieceJointeQualite.objects.defer("contenu")
     serializer_class = serializers.PieceJointeQualiteSerializer
     parser_classes = [MultiPartParser, FormParser, JSONParser]
     permission_classes = [acces(
@@ -375,6 +465,15 @@ class PieceJointeQualiteViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         serializer.save(ajoute_par=self.request.user)
+
+    @action(detail=True, methods=["get"])
+    def fichier(self, request, pk=None):
+        """GET .../pieces-jointes/{id}/fichier/ : le fichier lui-même (mêmes droits que la pièce jointe)."""
+        from django.http import HttpResponse
+        piece = self.get_object()
+        reponse = HttpResponse(bytes(piece.contenu), content_type=piece.type_contenu)
+        reponse["Content-Disposition"] = f'inline; filename="{piece.nom_fichier}"'
+        return reponse
 
 
 @api_view(["GET"])
@@ -411,7 +510,7 @@ def indicateurs_qualite(request):
         ]
 
     en_retard = models.ResultatControle.objects.filter(statut__in=models.STATUTS_EN_ATTENTE, date_prevue__lt=timezone.now())
-    return Response({
+    donnees = {
         "controles_realises": total,
         "conformes": conformes,
         "taux_conformite": round(100 * conformes / total, 2) if total else None,
@@ -429,4 +528,68 @@ def indicateurs_qualite(request):
         "controles_en_retard": en_retard.count(),
         "controles_en_retard_bloquants": en_retard.filter(point__bloquant=True).count(),
         "instruments_a_etalonner": [i.code for i in models.Instrument.objects.filter(actif=True) if not i.etalonnage_valide],
-    })
+    }
+    if request.query_params.get("type") in ("xlsx", "pdf"):
+        return _exporter_indicateurs(request, donnees)
+    return Response(donnees)
+
+
+def timezone_maintenant_texte():
+    from django.utils import timezone
+    return timezone.localtime().strftime("%Y-%m-%d")
+
+
+def _exporter_indicateurs(request, donnees):
+    """?type=xlsx (une feuille par axe) ou ?type=pdf (synthèse imprimable)."""
+    from apps.core.exports import classeur
+    from apps.core.pdf import DocumentPDF, nombre, telecharger
+    from django.utils import timezone
+    axes = [("Par produit", "par_produit"), ("Par étape", "par_etape"), ("Par ligne", "par_ligne"),
+            ("Par machine", "par_machine"), ("Par paramètre", "par_parametre")]
+    entetes = ["", "Contrôles", "Non conformes", "Taux de conformité (%)"]
+    synthese = [
+        ["Contrôles réalisés", donnees["controles_realises"]], ["Conformes", donnees["conformes"]],
+        ["Taux de conformité (%)", donnees["taux_conformite"]],
+        ["Non-conformités", donnees["non_conformites"]["total"]], ["NC ouvertes", donnees["non_conformites"]["ouvertes"]],
+        ["NC bloquantes ouvertes", donnees["non_conformites"]["bloquantes_ouvertes"]],
+        ["Contrôles en retard", donnees["controles_en_retard"]],
+        ["dont bloquants", donnees["controles_en_retard_bloquants"]],
+        ["Instruments à étalonner", ", ".join(donnees["instruments_a_etalonner"]) or "aucun"],
+    ]
+    periode = " - ".join(x for x in (request.query_params.get("du"), request.query_params.get("au")) if x) or "toutes dates"
+    if request.query_params.get("type") == "xlsx":
+        feuilles = [("Synthèse", ["Indicateur", "Valeur"], synthese)]
+        feuilles += [(titre, ["Axe"] + entetes[1:], [[l["cle"], l["controles"], l["non_conformes"], l["taux_conformite"]] for l in donnees[cle]])
+                     for titre, cle in axes]
+        return classeur(feuilles, "indicateurs-qualite")
+    document = DocumentPDF("INDICATEURS QUALITÉ", periode, timezone.now(), request.user)
+    document.avec_lignes(["Indicateur", "Valeur"], [[l[0], nombre(l[1]) if isinstance(l[1], (int, float)) else (l[1] if l[1] is not None else "-")] for l in synthese],
+                         [None, 50], colonnes_nombres=(1,))
+    for titre, cle in axes:
+        if donnees[cle]:
+            document.avec_texte(f"<b>{titre}</b>")
+            document.avec_lignes(["Axe"] + entetes[1:], [[l["cle"], l["controles"], l["non_conformes"], nombre(l["taux_conformite"])] for l in donnees[cle]],
+                                 [None, 28, 32, 42], colonnes_nombres=(1, 2, 3))
+    return document.reponse("indicateurs-qualite", telecharger(request))
+
+
+
+def clients_du_lot(lot):
+    """Traçabilité aval : chaque client livré de ce lot (commande, BL, quantité, contact)."""
+    clients = {}
+    for mouvement in lot.mouvements_lot.filter(ligne_commande__isnull=False).select_related(
+        "ligne_commande__commande__client",
+    ):
+        commande = mouvement.ligne_commande.commande
+        client = commande.client
+        bon = getattr(commande, "bon_livraison", None)
+        ligne = clients.setdefault(client.pk, {
+            "client": client.nom, "code": client.code, "telephone": client.telephone, "adresse": client.adresse,
+            "quantite": 0, "livraisons": [],
+        })
+        ligne["quantite"] += -mouvement.quantite
+        ligne["livraisons"].append({
+            "commande": commande.numero, "bon_livraison": bon.numero if bon else None,
+            "date": mouvement.date, "quantite": -mouvement.quantite,
+        })
+    return list(clients.values())

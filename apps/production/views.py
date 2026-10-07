@@ -156,6 +156,7 @@ demandes de matières, demandes complémentaires, suivi de production,
 suivi spécifique de l'eau.
 """
 
+from django.db.models import Sum
 from rest_framework import viewsets
 from apps.core.views import HistoriqueMixin
 from rest_framework.decorators import action, api_view, permission_classes as drf_permission_classes
@@ -259,12 +260,20 @@ class PlanProductionViewSet(HistoriqueMixin, viewsets.ModelViewSet):
 #     filterset_fields = ["article", "statut"]
 
 class OrdreFabricationViewSet(HistoriqueMixin, viewsets.ModelViewSet):
-    queryset = models.OrdreFabrication.objects.all()
+    # Préchargement : la liste des OF (étapes prévues, agents, contexte) se
+    # charge en un nombre fixe de requêtes, quel que soit le nombre d'OF.
+    queryset = models.OrdreFabrication.objects.select_related(
+        "article__activite", "ligne__usine", "circuit", "responsable",
+    ).prefetch_related(
+        "agents_affectes", "etapes",
+        "circuit__etapes__etape", "circuit__etapes__poste", "circuit__etapes__equipement",
+    ).annotate(montant_besoins_annote=Sum("besoins_matieres__montant"))
     serializer_class = serializers.OrdreFabricationSerializer
     # L'Agent Production consulte ses OF (lecture seule, filtrés ci-dessous) ;
     # seuls le Responsable Production et l'Admin SI les gèrent.
+    # La DAF lit les OF pour leur rattacher une charge directe (coûts en cascade).
     permission_classes = [acces(
-        lecture=(Profil.AGENT_PRODUCTION, Profil.DIRECTION, Profil.RESPONSABLE_QUALITE,),
+        lecture=(Profil.AGENT_PRODUCTION, Profil.DIRECTION, Profil.RESPONSABLE_QUALITE, Profil.COMPTABILITE_DAF,),
         ecriture=(Profil.RESPONSABLE_PRODUCTION, Profil.ADMIN_SI,),
     )]
     filterset_fields = ["article", "statut", "ligne", "circuit"]
@@ -383,6 +392,18 @@ class OrdreFabricationViewSet(HistoriqueMixin, viewsets.ModelViewSet):
             "blocage_actif": models.ParametreProduction.courant().bloquer_lancement_stock_insuffisant,
             "manques": manques,
         })
+
+    @action(detail=True, methods=["get"])
+    def blocages_qualite(self, request, pk=None):
+        """
+        GET .../ordres-fabrication/{id}/blocages_qualite/
+        Ce qui empêche la clôture : contrôles bloquants non réalisés et
+        non-conformités bloquantes ouvertes (liste vide = clôture possible).
+        """
+        from apps.qualite.models import blocages_qualite_of
+        of = self.get_object()
+        blocages = blocages_qualite_of(of)
+        return Response({"of": of.numero, "cloture_possible": not blocages, "blocages": blocages})
 
     @action(detail=True, methods=["get"])
     def bon_de_sortie(self, request, pk=None):
@@ -764,3 +785,14 @@ class ParametreProductionViewSet(viewsets.GenericViewSet):
         serializer.is_valid(raise_exception=True)
         serializer.save()
         return Response(serializer.data)
+
+
+class EvenementProductionViewSet(AffectationAgentMixin, viewsets.ModelViewSet):
+    """Cuve préparée, nettoyage / désinfection, arrêt puis redémarrage : déclenchent les contrôles prévus au plan."""
+    queryset = models.EvenementProduction.objects.select_related("ordre_fabrication", "equipement")
+    serializer_class = serializers.EvenementProductionSerializer
+    permission_classes = [acces(
+        lecture=(Profil.DIRECTION, Profil.RESPONSABLE_QUALITE,),
+        ecriture=(Profil.RESPONSABLE_PRODUCTION, Profil.AGENT_PRODUCTION, Profil.ADMIN_SI,),
+    )]
+    filterset_fields = ["ordre_fabrication", "type_evenement", "equipement"]

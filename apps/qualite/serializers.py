@@ -58,10 +58,35 @@ class PointControleSerializer(ValidationModeleMixin, serializers.ModelSerializer
 
 
 class PieceJointeQualiteSerializer(ValidationModeleMixin, serializers.ModelSerializer):
+    """Envoi en multipart (champ « fichier ») ; la réponse donne l'adresse protégée « url »."""
+    fichier = serializers.FileField(write_only=True)
+    url = serializers.SerializerMethodField()
+
     class Meta:
         model = models.PieceJointeQualite
-        fields = "__all__"
-        read_only_fields = ["ajoute_par"]
+        exclude = ["contenu"]
+        read_only_fields = ["ajoute_par", "nom_fichier", "type_contenu", "taille"]
+
+    def get_url(self, piece):
+        return f"/api/qualite/pieces-jointes/{piece.pk}/fichier/"
+
+    def validate_fichier(self, fichier):
+        type_contenu = (getattr(fichier, "content_type", "") or "").lower()
+        if type_contenu not in models.TYPES_PIECES_JOINTES:
+            raise serializers.ValidationError("Formats acceptés : photo (PNG, JPEG, WEBP) ou PDF.")
+        if fichier.size > models.TAILLE_MAX_PIECE_JOINTE:
+            raise serializers.ValidationError("Le fichier ne doit pas dépasser 10 Mo.")
+        return fichier
+
+    def validate(self, attrs):
+        fichier = attrs.pop("fichier", None)
+        attrs = super().validate(attrs)
+        if fichier is not None:
+            attrs.update(
+                contenu=fichier.read(), nom_fichier=fichier.name[:200],
+                type_contenu=fichier.content_type.lower(), taille=fichier.size,
+            )
+        return attrs
 
 
 class ResultatControleSerializer(ValidationModeleMixin, serializers.ModelSerializer):

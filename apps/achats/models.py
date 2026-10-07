@@ -452,6 +452,11 @@ class LigneCommandeFournisseur(ValidationAvantEnregistrement, models.Model):
         related_name="lignes",
     )
     article = models.ForeignKey(Article, verbose_name="Article", on_delete=models.PROTECT)
+    unite = models.CharField(
+        "Unité de commande", max_length=10, blank=True, default="",
+        help_text="Unité d'achat (ex : SAC). Vide = unité d'achat de l'article, sinon son unité de stock. "
+                  "Quantités et prix de la ligne sont dans cette unité ; le stock est converti à la réception.",
+    )
     quantite_commandee = models.DecimalField("Quantité commandée", max_digits=14, decimal_places=3)
     prix_unitaire = models.DecimalField("Prix unitaire", max_digits=14, decimal_places=2)
     quantite_recue = models.DecimalField("Quantité reçue", max_digits=14, decimal_places=3, default=0)
@@ -471,8 +476,31 @@ class LigneCommandeFournisseur(ValidationAvantEnregistrement, models.Model):
     def reste_a_recevoir(self):
         return self.quantite_commandee - self.quantite_recue
 
+    @property
+    def facteur_stock(self):
+        """Nombre d'unités de stock dans une unité de commande (1 sac = 25 kg -> 25)."""
+        from decimal import Decimal
+        if not self.unite or self.unite == self.article.unite_mesure:
+            return Decimal(1)
+        from apps.referentiel.models import ConversionUnite
+        return ConversionUnite.facteur_entre(self.unite, self.article.unite_mesure, self.article)
+
+    def en_unite_de_stock(self, quantite):
+        return quantite * self.facteur_stock
+
     def clean(self):
         """Les lignes ne se saisissent/modifient que tant que la commande est en brouillon."""
+        if not self.unite and self.article_id:
+            self.unite = self.article.unite_achat or self.article.unite_mesure
+        if self.unite and self.article_id and self.unite != self.article.unite_mesure:
+            from apps.referentiel.models import ConversionUnite, UniteMesure
+            if self.unite not in UniteMesure.values:
+                raise ValidationError({"unite": f"Unité « {self.unite} » inconnue."})
+            if ConversionUnite.facteur_entre(self.unite, self.article.unite_mesure, self.article) is None:
+                raise ValidationError({"unite": (
+                    f"Aucune conversion de {self.unite} vers {self.article.unite_mesure} pour {self.article.code} : "
+                    "paramétrez-la (référentiel > conversions) avant de commander dans cette unité."
+                )})
         exiger_positif(self.quantite_commandee, "quantite_commandee", "La quantité commandée")
         exiger_positif(self.prix_unitaire, "prix_unitaire", "Le prix unitaire")
         if self.pk:
@@ -481,6 +509,7 @@ class LigneCommandeFournisseur(ValidationAvantEnregistrement, models.Model):
                 # Seule la mise à jour de quantite_recue par une réception est permise.
                 if (valeur_en_base(self, "commande") != self.commande_id
                         or valeur_en_base(self, "article") != self.article_id
+                        or valeur_en_base(self, "unite") not in ("", self.unite)
                         or valeur_en_base(self, "quantite_commandee") != self.quantite_commandee
                         or valeur_en_base(self, "prix_unitaire") != self.prix_unitaire):
                     raise ValidationError(
@@ -618,7 +647,7 @@ class LigneReceptionAchat(ValidationAvantEnregistrement, models.Model):
             article=article, depot=depot, lot_fournisseur=self.lot_fournisseur,
             fournisseur=commande.fournisseur, ligne_reception=self,
             date_reception=timezone.localdate(), date_peremption=self.date_peremption,
-            quantite_initiale=self.quantite_recue, statut=StatutLotMatiere.LIBERE,
+            quantite_initiale=self.quantite_recue * self.ligne_commande.facteur_stock, statut=StatutLotMatiere.LIBERE,
         )
         lot.save()
         if statut != StatutLotMatiere.LIBERE:
@@ -653,13 +682,16 @@ class LigneReceptionAchat(ValidationAvantEnregistrement, models.Model):
             commande.save()
 
             depot = self.reception.depot or depot_par_defaut("Magasin principal")
+            # Ligne en unité d'achat (sacs...) -> stock en unité de stock (kg...).
+            facteur = ligne_commande.facteur_stock
             MouvementStock.objects.create(
                 article=ligne_commande.article,
                 depot=depot,
                 type_mouvement=TypeMouvement.ENTREE,
-                quantite=self.quantite_recue,
-                cout_unitaire=ligne_commande.prix_unitaire,   # valorisation au prix d'achat
-                motif=f"Réception achat {self.reception_id} - commande {commande.numero}",
+                quantite=self.quantite_recue * facteur,
+                cout_unitaire=ligne_commande.prix_unitaire / facteur,   # prix d'achat ramené à l'unité de stock
+                motif=f"Réception achat {self.reception_id} - commande {commande.numero}"
+                      + (f" ({self.quantite_recue} {ligne_commande.unite})" if facteur != 1 else ""),
                 document_origine=commande.numero,
                 utilisateur=self.reception.receptionne_par,
             )
@@ -683,7 +715,10 @@ class RetourFournisseur(ValidationAvantEnregistrement, models.Model):
         related_name="retours",
     )
     article = models.ForeignKey(Article, verbose_name="Article retourné", on_delete=models.PROTECT)
-    quantite_retournee = models.DecimalField("Quantité retournée", max_digits=14, decimal_places=3)
+    quantite_retournee = models.DecimalField(
+        "Quantité retournée", max_digits=14, decimal_places=3,
+        help_text="Dans l'unité de la commande (ex : sacs), comme la quantité reçue.",
+    )
     motif = models.CharField("Motif", max_length=25, choices=MotifRetourFournisseur.choices)
     observations = models.TextField("Observations", blank=True)
     traite_par = models.ForeignKey(Utilisateur, verbose_name="Traité par", on_delete=models.PROTECT)
@@ -732,7 +767,9 @@ class RetourFournisseur(ValidationAvantEnregistrement, models.Model):
             super().save(*args, **kwargs)
             if creation:
                 from apps.stocks.models import LotMatiere
-                reste = self.quantite_retournee
+                ligne_commande = self.reception.commande.lignes.filter(article_id=self.article_id).first()
+                facteur = ligne_commande.facteur_stock if ligne_commande else 1
+                reste = self.quantite_retournee * facteur
                 for lot in LotMatiere.objects.select_for_update().filter(
                     ligne_reception__reception_id=self.reception_id, article_id=self.article_id, quantite_restante__gt=0,
                 ).order_by("pk"):
@@ -745,7 +782,7 @@ class RetourFournisseur(ValidationAvantEnregistrement, models.Model):
                     article=self.article,
                     depot=self.reception.depot or depot_par_defaut("Magasin principal"),
                     type_mouvement=TypeMouvement.SORTIE,
-                    quantite=self.quantite_retournee,
+                    quantite=self.quantite_retournee * facteur,
                     motif=f"Retour fournisseur ({self.get_motif_display()}) - commande {self.reception.commande.numero}",
                     document_origine=self.reception.commande.numero,
                     utilisateur=self.traite_par,

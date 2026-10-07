@@ -125,16 +125,19 @@ class OrdreFabricationSerializer(SansDonneesFinancieresPourAgentMixin, Validatio
 
     def get_etapes_prevues(self, of):
         """Étapes du circuit avec l'avancement saisi (quantités produites à l'étape)."""
-        from django.db.models import Sum
+        saisies_par_etape = {}
+        for saisie in of.etapes.all():   # préchargé : aucune requête par étape
+            saisies_par_etape.setdefault(saisie.etape, []).append(saisie)
         resultat = []
         for etape in of.etapes_prevues():
-            saisies = of.etapes.filter(etape=etape.etape.code)
+            saisies = saisies_par_etape.get(etape.etape.code, [])
+            quantites = [s.quantite_produite for s in saisies if s.quantite_produite is not None]
             resultat.append({
                 "ordre": etape.ordre, "code": etape.etape.code, "libelle": etape.etape.libelle,
                 "obligatoire": etape.obligatoire, "poste": etape.poste.code if etape.poste_id else None,
                 "machine": etape.equipement.code if etape.equipement_id else None,
-                "saisies": saisies.count(),
-                "quantite_produite": saisies.aggregate(t=Sum("quantite_produite"))["t"],
+                "saisies": len(saisies),
+                "quantite_produite": sum(quantites) if quantites else None,
             })
         return resultat
 
@@ -288,3 +291,12 @@ class ParametreProductionSerializer(serializers.ModelSerializer):
     class Meta:
         model = models.ParametreProduction
         exclude = ["id"]
+
+
+class EvenementProductionSerializer(ValidationModeleMixin, SaisiParMixin, serializers.ModelSerializer):
+    of_numero = serializers.CharField(source="ordre_fabrication.numero", read_only=True)
+
+    class Meta:
+        model = models.EvenementProduction
+        fields = "__all__"
+        read_only_fields = ["saisi_par"]

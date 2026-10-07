@@ -262,7 +262,9 @@ class TransfertTests(BaseValidation):
         self.assertEqual(StockArticle.objects.get(article=self.produit, depot=self.source).quantite_physique, 50)
 
 
-class QualiteModuleTests(BaseValidation):
+class QualiteBase(BaseValidation):
+    """Mise en place commune : un contrôle pH bloquant au plan, un OF Eau en production."""
+
     def setUp(self):
         super().setUp()
         self.ph = ParametreQualite.objects.get(libelle="pH")
@@ -282,6 +284,9 @@ class QualiteModuleTests(BaseValidation):
     def avancer_jusqu_au_controle(self):
         self.of.passer_statut_suivant()
         self.of.passer_statut_suivant()
+
+
+class QualiteModuleTests(QualiteBase):
 
     def test_activation_sans_critere_refusee(self):
         r = self.assert_refus(self.api.post("/api/qualite/plan-controle/", {
@@ -424,3 +429,60 @@ class CoutsCascadeTests(BaseValidation):
         eau = {ligne["activite"]: ligne for ligne in self.api.get("/api/couts/cascade/eau-traitee/", {"periode": self.periode}).data}
         self.assertEqual(eau["EAU"]["cout_par_m3"], Decimal("1000"))      # 6 000 pour 6 m³
         self.assertTrue(self.api.get("/api/couts/cascade/controle/", {"periode": self.periode}).data["conforme"])
+
+
+class RecommandationsFrontendTests(QualiteBase):
+    """Pièces jointes en base, endpoint blocages, lecture DAF, liste des OF sans requêtes en cascade."""
+
+    def test_piece_jointe_conservee_en_base_et_protegee(self):
+        from django.core.files.uploadedfile import SimpleUploadedFile
+        from rest_framework.test import APIClient
+        from apps.comptes.models import Profil, Utilisateur
+        controle = ResultatControle.objects.get(point=self.point, ordre_fabrication=self.of)
+        r = self.api.post("/api/qualite/pieces-jointes/", {
+            "resultat": controle.id, "description": "Bulletin d'analyse",
+            "fichier": SimpleUploadedFile("bulletin.pdf", b"%PDF-1.4 test", content_type="application/pdf"),
+        }, format="multipart")
+        self.assertEqual(r.status_code, 201, r.content)
+        self.assertEqual(r.data["nom_fichier"], "bulletin.pdf")
+        fichier = self.api.get(r.data["url"])
+        self.assertEqual(fichier["Content-Type"], "application/pdf")
+        self.assertEqual(fichier.content, b"%PDF-1.4 test")
+        refus = self.api.post("/api/qualite/pieces-jointes/", {
+            "resultat": controle.id, "fichier": SimpleUploadedFile("virus.exe", b"MZ", content_type="application/x-msdownload"),
+        }, format="multipart")
+        self.assertEqual(refus.status_code, 400)
+        commercial = APIClient()
+        commercial.force_authenticate(Utilisateur.objects.create_user("com", password="x", profil=Profil.COMMERCIAL))
+        self.assertEqual(commercial.get(r.data["url"]).status_code, 403)
+
+    def test_endpoint_blocages_qualite(self):
+        r = self.api.get(f"/api/production/ordres-fabrication/{self.of.id}/blocages_qualite/")
+        self.assertFalse(r.data["cloture_possible"])
+        self.assertIn("bloquant", r.data["blocages"][0])
+        controle = ResultatControle.objects.get(point=self.point, ordre_fabrication=self.of)
+        self.api.post(f"/api/qualite/controles-realises/{controle.id}/enregistrer/", {"valeur": "7"}, format="json")
+        self.assertTrue(self.api.get(f"/api/production/ordres-fabrication/{self.of.id}/blocages_qualite/").data["cloture_possible"])
+
+    def test_daf_lit_les_of_et_les_tournees(self):
+        from rest_framework.test import APIClient
+        from apps.comptes.models import Profil, Utilisateur
+        daf = APIClient()
+        daf.force_authenticate(Utilisateur.objects.create_user("daf", password="x", profil=Profil.COMPTABILITE_DAF))
+        self.assertEqual(daf.get("/api/production/ordres-fabrication/").status_code, 200)
+        self.assertEqual(daf.get("/api/distribution/tournees/").status_code, 200)
+        self.assertEqual(daf.post("/api/production/ordres-fabrication/", {"article": self.produit.id, "quantite_a_produire": 1}, format="json").status_code, 403)
+
+    def test_liste_des_of_en_nombre_de_requetes_constant(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        def compter():
+            with CaptureQueriesContext(connection) as requetes:
+                self.assertEqual(self.api.get("/api/production/ordres-fabrication/").status_code, 200)
+            return len(requetes)
+
+        avant = compter()
+        for _ in range(4):
+            OrdreFabrication.objects.create(article=self.produit, quantite_a_produire=5, responsable=self.admin)
+        self.assertEqual(compter(), avant)

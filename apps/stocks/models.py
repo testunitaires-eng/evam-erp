@@ -723,6 +723,13 @@ class TransfertStock(ValidationAvantEnregistrement, models.Model):
         for ligne in lignes:
             if not self.depot_destination.accepte(ligne.article):
                 raise ValueError(f"{ligne.article.code} n'est pas autorisé dans « {self.depot_destination.nom} ».")
+            disponible = StockArticle.objects.filter(article=ligne.article, depot=self.depot_source).first()
+            lots_a_sortir = ligne.article.type_article == "PRODUIT_FINI" and disponible is not None \
+                and disponible.quantite_disponible >= ligne.quantite
+            if lots_a_sortir:
+                # Lots transférés : celui imposé (ou de la palette), sinon les plus proches de leur DLC.
+                sortir_lots(ligne.article, self.depot_source, ligne.quantite, f"Transfert vers {self.depot_destination.nom}",
+                            self.numero, lot_impose=ligne.lot, ligne_transfert=ligne)
             mouvement = MouvementStock.objects.create(
                 article=ligne.article, depot=self.depot_source, type_mouvement=TypeMouvement.SORTIE,
                 quantite=ligne.quantite, motif=f"Transfert vers {self.depot_destination.nom}",
@@ -730,6 +737,8 @@ class TransfertStock(ValidationAvantEnregistrement, models.Model):
             )
             ligne.cout_unitaire = mouvement.cout_unitaire
             ligne.save(update_fields=["cout_unitaire"])
+            if ligne.palette_id:
+                Palette.objects.filter(pk=ligne.palette_id).update(statut=StatutPalette.EN_TRANSIT, emplacement=None)
 
     @transaction.atomic
     def receptionner(self, utilisateur):
@@ -747,6 +756,13 @@ class TransfertStock(ValidationAvantEnregistrement, models.Model):
                 quantite=ligne.quantite, cout_unitaire=ligne.cout_unitaire,
                 motif=f"Transfert depuis {self.depot_source.nom}", document_origine=self.numero, utilisateur=utilisateur,
             )
+            for sortie in ligne.mouvements_lot.filter(quantite__lt=0):
+                MouvementLot.objects.create(
+                    lot_id=sortie.lot_id, depot=self.depot_destination, quantite=-sortie.quantite,
+                    motif=f"Transfert depuis {self.depot_source.nom}", document_origine=self.numero, ligne_transfert=ligne,
+                )
+            if ligne.palette_id:
+                Palette.objects.filter(pk=ligne.palette_id).update(statut=StatutPalette.EN_STOCK, depot=self.depot_destination)
 
     def annuler(self):
         if self.statut != StatutTransfert.BROUILLON:
@@ -759,6 +775,10 @@ class LigneTransfert(ValidationAvantEnregistrement, models.Model):
     transfert = models.ForeignKey(TransfertStock, verbose_name="Transfert", on_delete=models.CASCADE, related_name="lignes")
     article = models.ForeignKey(Article, verbose_name="Article", on_delete=models.PROTECT)
     lot = models.ForeignKey("qualite.Lot", verbose_name="Lot", on_delete=models.PROTECT, null=True, blank=True)
+    palette = models.ForeignKey(
+        "Palette", verbose_name="Palette", on_delete=models.PROTECT, null=True, blank=True, related_name="lignes_transfert",
+        help_text="Transfert d'une palette entière : article, lot et quantité sont repris de la palette.",
+    )
     quantite = models.DecimalField("Quantité", max_digits=14, decimal_places=3)
     cout_unitaire = models.DecimalField("Coût unitaire (à l'expédition)", max_digits=14, decimal_places=4, null=True, blank=True, editable=False)
 
@@ -770,6 +790,13 @@ class LigneTransfert(ValidationAvantEnregistrement, models.Model):
         return f"{self.transfert.numero} : {self.quantite} {self.article.code}"
 
     def clean(self):
+        if self.palette_id:
+            palette = self.palette
+            if palette.statut != StatutPalette.EN_STOCK:
+                raise ValidationError({"palette": f"La palette {palette.numero} n'est pas en stock."})
+            if self.transfert_id and palette.depot_id != self.transfert.depot_source_id:
+                raise ValidationError({"palette": f"La palette {palette.numero} n'est pas au lieu source du transfert."})
+            self.lot_id, self.article_id, self.quantite = palette.lot_id, palette.lot.article_id, palette.quantite
         exiger_positif(self.quantite, "quantite", "La quantité")
         transfert = TransfertStock.objects.filter(pk=valeur_en_base(self, "transfert") or self.transfert_id).first()
         if transfert and transfert.statut != StatutTransfert.BROUILLON:
@@ -779,9 +806,12 @@ class LigneTransfert(ValidationAvantEnregistrement, models.Model):
                 raise ValidationError({"lot": "Ce lot ne correspond pas à l'article."})
             if self.lot.statut != "LIBERE":
                 raise ValidationError({"lot": f"Le lot {self.lot.numero_lot} n'est pas libéré : il ne peut pas être transféré."})
-        if self.transfert_id and self.article_id and TransfertStock.objects.filter(pk=self.transfert_id).exists() \
-                and LigneTransfert.objects.filter(transfert_id=self.transfert_id, article_id=self.article_id, lot_id=self.lot_id).exclude(pk=self.pk).exists():
-            raise ValidationError({"article": "Cet article (et ce lot) figure déjà dans le transfert."})
+        if self.transfert_id and self.article_id and TransfertStock.objects.filter(pk=self.transfert_id).exists():
+            autres = LigneTransfert.objects.filter(transfert_id=self.transfert_id).exclude(pk=self.pk)
+            if self.palette_id and autres.filter(palette_id=self.palette_id).exists():
+                raise ValidationError({"palette": "Cette palette figure déjà dans le transfert."})
+            if not self.palette_id and autres.filter(article_id=self.article_id, lot_id=self.lot_id, palette__isnull=True).exists():
+                raise ValidationError({"article": "Cet article (et ce lot) figure déjà dans le transfert."})
 
     def verifier_suppression(self):
         if self.transfert.statut != StatutTransfert.BROUILLON:
@@ -976,3 +1006,203 @@ class LotMatiere(ValidationAvantEnregistrement, models.Model):
                     f"et {max(sans_lot, 0)} hors lot au « {depot.nom} » ; sortie de {quantite} impossible."
                 )})
         return allocation
+
+
+# =====================================================================
+# Stock par lot de produit fini, palettes et emplacements
+# (schéma Jus : « stockage par lot, gestion des emplacements,
+# traçabilité » ; rappel de lot jusqu'au client).
+# =====================================================================
+
+class MouvementLot(models.Model):
+    """
+    Quantité d'un lot de produit fini entrée (+) ou sortie (-) d'un lieu :
+    libération, transfert, vente. Le solde par (lot, lieu) donne le stock
+    du lot ; une sortie pour vente garde la ligne de commande, donc le
+    client (traçabilité aval pour un rappel).
+    """
+    lot = models.ForeignKey("qualite.Lot", verbose_name="Lot", on_delete=models.PROTECT, related_name="mouvements_lot")
+    depot = models.ForeignKey(Depot, verbose_name="Lieu", on_delete=models.PROTECT, related_name="mouvements_lot")
+    quantite = models.DecimalField("Quantité (+ entrée / - sortie)", max_digits=14, decimal_places=3)
+    motif = models.CharField("Motif", max_length=200)
+    document_origine = models.CharField("Document", max_length=100, blank=True)
+    ligne_commande = models.ForeignKey(
+        "commercial.LigneCommande", verbose_name="Vente (ligne de commande)", on_delete=models.PROTECT,
+        null=True, blank=True, related_name="lots_livres",
+    )
+    ligne_transfert = models.ForeignKey("LigneTransfert", verbose_name="Transfert", on_delete=models.PROTECT, null=True, blank=True, related_name="mouvements_lot")
+    date = models.DateTimeField("Date", auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Mouvement de lot (produit fini)"
+        verbose_name_plural = "Mouvements de lots (produits finis)"
+        ordering = ["date", "pk"]
+
+    def __str__(self):
+        return f"{self.lot.numero_lot} {self.quantite:+} @ {self.depot.nom}"
+
+
+def solde_lot(lot, depot):
+    from django.db.models import Sum
+    return MouvementLot.objects.filter(lot=lot, depot=depot).aggregate(t=Sum("quantite"))["t"] or 0
+
+
+def allouer_lots_produits_finis(article, depot, quantite, lot_impose=None):
+    """
+    Lots de produit fini à sortir pour `quantite` : [(lot, quantité)].
+    Les lots libérés les plus proches de leur date de péremption sortent
+    d'abord, puis les plus anciens. La part non couverte ne peut venir que
+    du stock sans lot (stock antérieur au suivi par lot) ; sinon refus.
+    """
+    from decimal import Decimal
+    from django.db.models import Sum
+    from apps.qualite.models import Lot
+    quantite = Decimal(quantite)
+    soldes = (
+        MouvementLot.objects.filter(depot=depot, lot__article=article)
+        .values("lot").annotate(solde=Sum("quantite")).filter(solde__gt=0)
+    )
+    solde_par_lot = {ligne["lot"]: ligne["solde"] for ligne in soldes}
+    if lot_impose is not None:
+        disponible = solde_par_lot.get(lot_impose.pk, 0)
+        if lot_impose.statut != "LIBERE":
+            raise ValidationError({"lot": f"Le lot {lot_impose.numero_lot} n'est pas libéré."})
+        if disponible < quantite:
+            raise ValidationError({"lot": f"Il ne reste que {disponible} du lot {lot_impose.numero_lot} au « {depot.nom} »."})
+        return [(lot_impose, quantite)]
+    lots = Lot.objects.filter(pk__in=solde_par_lot, statut="LIBERE").order_by(
+        models.F("date_peremption").asc(nulls_last=True), "date_production", "pk",
+    )
+    allocation, reste = [], quantite
+    for lot in lots:
+        if reste <= 0:
+            break
+        prise = min(solde_par_lot[lot.pk], reste)
+        allocation.append((lot, prise))
+        reste -= prise
+    if reste > 0:
+        stock = StockArticle.objects.filter(article=article, depot=depot).first()
+        physique = stock.quantite_physique if stock else 0
+        sans_lot = physique - sum(solde_par_lot.values(), Decimal(0))
+        if reste > sans_lot:
+            raise ValidationError({"quantite": (
+                f"{article.code} : {quantite - reste} disponible dans des lots libérés et {max(sans_lot, 0)} hors lot "
+                f"au « {depot.nom} » : sortie de {quantite} impossible (les lots bloqués ne sortent pas)."
+            )})
+    return allocation
+
+
+def sortir_lots(article, depot, quantite, motif, document, lot_impose=None, **lien):
+    """Alloue puis enregistre la sortie des lots (après contrôle du stock par le mouvement de stock)."""
+    allocation = allouer_lots_produits_finis(article, depot, quantite, lot_impose=lot_impose)
+    return [
+        MouvementLot.objects.create(lot=lot, depot=depot, quantite=-prise, motif=motif, document_origine=document, **lien)
+        for lot, prise in allocation
+    ]
+
+
+class Emplacement(ValidationAvantEnregistrement, models.Model):
+    """Emplacement de stockage dans un lieu (allée, rack, niveau...)."""
+    code = models.CharField("Code", max_length=40, unique=True, editable=False)
+    depot = models.ForeignKey(Depot, verbose_name="Lieu", on_delete=models.PROTECT, related_name="emplacements")
+    designation = models.CharField("Désignation", max_length=100, help_text="Ex : Allée A - Rack 2 - Niveau 1.")
+    capacite_palettes = models.PositiveIntegerField("Capacité (palettes)", null=True, blank=True)
+    actif = models.BooleanField("Actif", default=True)
+
+    class Meta:
+        verbose_name = "Emplacement"
+        verbose_name_plural = "Emplacements"
+        ordering = ["depot", "code"]
+
+    def __str__(self):
+        return f"{self.code} - {self.designation}"
+
+    def save(self, *args, **kwargs):
+        if not self.code:
+            from apps.core.models import generer_code_unique
+            self.code = generer_code_unique(Emplacement, f"{self.depot.code or 'LIEU'}-E", largeur=3)
+        super().save(*args, **kwargs)
+
+    def clean(self):
+        if not (self.designation or "").strip():
+            raise ValidationError({"designation": "La désignation de l'emplacement est obligatoire."})
+        if self.pk and valeur_en_base(self, "depot") != self.depot_id and self.palettes.exists():
+            raise ValidationError({"depot": "Cet emplacement contient des palettes : son lieu ne change pas."})
+
+    @property
+    def palettes_en_stock(self):
+        return self.palettes.filter(statut=StatutPalette.EN_STOCK).count()
+
+
+class StatutPalette(models.TextChoices):
+    EN_STOCK = "EN_STOCK", "En stock"
+    EN_TRANSIT = "EN_TRANSIT", "En transit"
+    EXPEDIEE = "EXPEDIEE", "Expédiée / vendue"
+
+
+class Palette(ValidationAvantEnregistrement, models.Model):
+    """Palette identifiée (n° unique, étiquette avec code-barres), rattachée à son lot de produit fini."""
+    numero = models.CharField("N° palette", max_length=30, unique=True, editable=False)
+    lot = models.ForeignKey("qualite.Lot", verbose_name="Lot", on_delete=models.PROTECT, related_name="palettes")
+    depot = models.ForeignKey(Depot, verbose_name="Lieu", on_delete=models.PROTECT, related_name="palettes")
+    emplacement = models.ForeignKey(Emplacement, verbose_name="Emplacement", on_delete=models.PROTECT, null=True, blank=True, related_name="palettes")
+    quantite = models.DecimalField("Quantité (unité de stock)", max_digits=14, decimal_places=3)
+    statut = models.CharField("Statut", max_length=12, choices=StatutPalette.choices, default=StatutPalette.EN_STOCK)
+    cree_par = models.ForeignKey(Utilisateur, verbose_name="Constituée par", on_delete=models.PROTECT, null=True, blank=True, related_name="+")
+    date_creation = models.DateTimeField("Constituée le", auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Palette"
+        verbose_name_plural = "Palettes"
+        ordering = ["-date_creation", "numero"]
+
+    def __str__(self):
+        return f"{self.numero} - {self.lot.numero_lot} ({self.quantite})"
+
+    def save(self, *args, **kwargs):
+        if not self.numero:
+            self.numero = generer_numero("PAL", largeur=8)
+        super().save(*args, **kwargs)
+
+    def clean(self):
+        exiger_positif(self.quantite, "quantite", "La quantité de la palette")
+        if self.emplacement_id and self.depot_id and self.emplacement.depot_id != self.depot_id:
+            raise ValidationError({"emplacement": f"L'emplacement {self.emplacement.code} n'est pas dans « {self.depot.nom} »."})
+        if self.emplacement_id and not self.emplacement.actif:
+            raise ValidationError({"emplacement": f"L'emplacement {self.emplacement.code} est inactif."})
+        if self.emplacement_id and self.emplacement.capacite_palettes and valeur_en_base(self, "emplacement") != self.emplacement_id \
+                and self.emplacement.palettes_en_stock >= self.emplacement.capacite_palettes:
+            raise ValidationError({"emplacement": f"L'emplacement {self.emplacement.code} est plein ({self.emplacement.capacite_palettes} palettes)."})
+
+    @property
+    def article(self):
+        return self.lot.article
+
+    @classmethod
+    @transaction.atomic
+    def constituer(cls, lot, utilisateur, quantite_par_palette=None):
+        """
+        Découpe un lot libéré en palettes : quantité par palette =
+        packs par palette du produit (ou valeur fournie) ; la dernière peut
+        être incomplète. Une seule fois par lot.
+        """
+        from decimal import Decimal, ROUND_DOWN
+        if lot.statut != "LIBERE":
+            raise ValueError("Seul un lot libéré (entré en stock) est palettisé.")
+        if lot.palettes.exists():
+            raise ValueError(f"Le lot {lot.numero_lot} est déjà palettisé.")
+        article = lot.article
+        if quantite_par_palette is None:
+            if not article.packs_par_palette:
+                raise ValueError(f"Renseignez les packs par palette de {article.code}, ou la quantité par palette.")
+            unites = Decimal(article.packs_par_palette) * Decimal(article.unites_par_pack or 1)
+            quantite_par_palette = (unites / article.facteur_unites).quantize(Decimal("0.001"), ROUND_DOWN)
+        quantite_par_palette = Decimal(quantite_par_palette)
+        if quantite_par_palette <= 0:
+            raise ValueError("La quantité par palette doit être supérieure à 0.")
+        reste, palettes = Decimal(lot.quantite), []
+        while reste > 0:
+            quantite = min(quantite_par_palette, reste)
+            palettes.append(cls.objects.create(lot=lot, depot=lot.lieu_stock, quantite=quantite, cree_par=utilisateur))
+            reste -= quantite
+        return palettes

@@ -101,7 +101,48 @@ def valeur_inducteur(of, inducteur, etape=None):
             resultats = resultats.filter(etape=etape)
         poids = resultats.aggregate(t=Sum("point__parametre__poids_analyse"))["t"]
         return (Decimal(poids), "CALCULE", "analyses réalisées x poids") if poids else (None, None, "aucune analyse")
+    if inducteur == Inducteur.TEMPS_CHANGEMENT_SERIE:
+        total = Decimal(0)
+        for changement in of.changements_serie.all():
+            total += Decimal(changement.duree_arret_min) + Decimal(changement.duree_nettoyage_min) + Decimal(changement.duree_reglage_min)
+        return (total, "MESURE", "durées des changements de série de l'OF") if total else (None, None, "aucun changement de série")
     return None, None, "inducteur non applicable à un OF"
+
+
+SOURCE_CHANGEMENT_SERIE = "Changement de série n° "
+
+
+def charges_changements_serie(periode):
+    """
+    Le coût réel du nettoyage saisi sur un changement de série devient une
+    charge DIRECTE de l'OF concerné (« direct à la série »). Recalculé à
+    chaque calcul de période : modification ou suppression suivies.
+    """
+    from apps.industriel.models import EtapeStandard
+    from .models import CategorieEconomique, NatureCout, Traitement
+    nature, _ = NatureCout.objects.get_or_create(
+        libelle="Nettoyage de changement de série", categorie=CategorieCout.PRODUCTION,
+        defaults={
+            "categorie_economique": CategorieEconomique.PRODUITS_TRAITEMENT, "traitement": Traitement.DIRECT,
+            "inducteur": Inducteur.AUCUN, "etape": None,
+            "justification": "Direct à la série : coût réel saisi sur l'événement de changement de série.",
+        },
+    )
+    attendues = {}
+    for of in ofs_de_la_periode(periode):
+        for changement in of.changements_serie.filter(cout_nettoyage__gt=0):
+            attendues[f"{SOURCE_CHANGEMENT_SERIE}{changement.pk}"] = (of, changement.cout_nettoyage)
+    existantes = {c.source: c for c in Charge.objects.filter(periode=periode, nature=nature, source__startswith=SOURCE_CHANGEMENT_SERIE)}
+    for source, charge in existantes.items():
+        if source not in attendues:
+            charge.delete()
+    for source, (of, montant) in attendues.items():
+        charge = existantes.get(source)
+        if charge is None:
+            Charge.objects.create(nature=nature, periode=periode, montant=montant, ordre_fabrication=of, source=source)
+        elif charge.montant != montant:
+            charge.montant = montant
+            charge.save()
 
 
 def ventiler(montant, parts):
@@ -372,6 +413,7 @@ def calculer_periode(periode):
     """Recalcule toute la cascade de la période, puis le coût réel des OF concernés."""
     from .models import CoutReel
     resultat = {"periode": periode, "charges": 0, "repartie": 0, "partielle": 0, "non_repartie": 0}
+    charges_changements_serie(periode)
     for charge in Charge.objects.filter(periode=periode).select_related("nature", "nature__etape"):
         statut = repartir_charge(charge)
         resultat["charges"] += 1
@@ -468,15 +510,18 @@ def cout_revient(periode):
         quantite = of.quantite_produite_bonne
         unites = article.en_unites(quantite)
         packs = article.en_packs(quantite)
-        par_etape = {}
-        for ligne in RepartitionCout.objects.filter(ordre_fabrication=of, niveau=NiveauRepartition.PRODUIT).select_related("etape"):
+        par_etape, changement_serie = {}, Decimal(0)
+        for ligne in RepartitionCout.objects.filter(ordre_fabrication=of, niveau=NiveauRepartition.PRODUIT).select_related("etape", "charge__nature"):
             libelle = ligne.etape.libelle if ligne.etape_id else "Sans étape"
             par_etape[libelle] = par_etape.get(libelle, Decimal(0)) + ligne.montant
+            if ligne.charge.source.startswith(SOURCE_CHANGEMENT_SERIE) or ligne.charge.nature.inducteur == Inducteur.TEMPS_CHANGEMENT_SERIE:
+                changement_serie += ligne.montant
         total = cout.cout_total
         par_of.append({
             "of": of.numero, "article": article.code, "quantite_produite": quantite, "unites": unites, "packs": packs,
             "matieres": cout.cout_matiere_total, "main_oeuvre": cout.cout_main_oeuvre_total,
             "charges_reparties": cout.cout_charges_reparties, "charges_par_etape": par_etape,
+            "dont_changement_serie": changement_serie,
             "energie_et_amortissement_anciens": cout.cout_energie_total + cout.cout_amortissement_total,
             "cout_production": total,
             "cout_par_unite": (total / unites) if unites else None,

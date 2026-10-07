@@ -38,6 +38,7 @@ class Fournisseur(models.Model):
     telephone = models.CharField("Téléphone", max_length=30, blank=True)
     email = models.EmailField("Email", blank=True)
     adresse = models.CharField("Adresse", max_length=255, blank=True)
+    ifu = models.CharField("IFU", max_length=30, blank=True)
     gere_par = models.ForeignKey(
         Utilisateur, verbose_name="Géré par (Responsable Achat)",
         on_delete=models.SET_NULL, null=True, blank=True,
@@ -168,7 +169,7 @@ def verifier_seuil_alerte(article):
     from decimal import Decimal
     from django.db.models import F as Champ, Sum
     from apps.stocks.models import StockArticle
-    if article.type_article != "MATIERE_PREMIERE" or not article.stock_alerte:
+    if article.type_article not in ("MATIERE_PREMIERE", "EMBALLAGE", "CONSOMMABLE") or not article.stock_alerte:
         return
     disponible = StockArticle.objects.filter(article=article).aggregate(
         total=Sum(Champ("quantite_physique") - Champ("quantite_bloquee") - Champ("quantite_reservee")),
@@ -512,7 +513,11 @@ class ReceptionAchat(ValidationAvantEnregistrement, models.Model):
     receptionne_par = models.ForeignKey(Utilisateur, verbose_name="Réceptionné par", on_delete=models.PROTECT)
     conforme = models.BooleanField(
         "Réception conforme", default=True,
-        help_text="Contrôle réception : la livraison correspond-elle à la commande ?",
+        help_text="Contrôle réception : la livraison correspond-elle à la commande ? Non conforme = lots bloqués.",
+    )
+    depot = models.ForeignKey(
+        "stocks.Depot", verbose_name="Lieu de réception", on_delete=models.PROTECT, null=True, blank=True,
+        related_name="receptions_achats", help_text="Vide = « Magasin principal ».",
     )
     observations = models.TextField("Observations", blank=True)
     date_reception = models.DateTimeField("Date de réception", auto_now_add=True)
@@ -552,6 +557,8 @@ class LigneReceptionAchat(ValidationAvantEnregistrement, models.Model):
         related_name="lignes_reception",
     )
     quantite_recue = models.DecimalField("Quantité reçue", max_digits=14, decimal_places=3)
+    lot_fournisseur = models.CharField("N° lot fournisseur", max_length=60, blank=True)
+    date_peremption = models.DateField("DLC / DLUO", null=True, blank=True)
 
     class Meta:
         verbose_name = "Ligne de réception"
@@ -589,6 +596,38 @@ class LigneReceptionAchat(ValidationAvantEnregistrement, models.Model):
     def verifier_suppression(self):
         raise ValidationError("Une ligne de réception ne peut pas être supprimée (le stock a déjà été mouvementé).")
 
+    def _creer_lot(self, depot, commande):
+        """
+        Traçabilité amont : chaque réception d'un article suivi par lot crée
+        son lot matière (lot fournisseur, DLC). Réception non conforme : lot
+        bloqué ; contrôle de réception prévu au plan qualité : lot « à
+        contrôler » jusqu'à sa libération.
+        """
+        from django.utils import timezone
+        from apps.stocks.models import LotMatiere, StatutLotMatiere
+        article = self.ligne_commande.article
+        if not article.suivi_par_lot:
+            return None
+        from apps.qualite.models import controle_reception_requis
+        statut = StatutLotMatiere.LIBERE
+        if not self.reception.conforme:
+            statut = StatutLotMatiere.BLOQUE
+        elif controle_reception_requis(article):
+            statut = StatutLotMatiere.A_CONTROLER
+        lot = LotMatiere(
+            article=article, depot=depot, lot_fournisseur=self.lot_fournisseur,
+            fournisseur=commande.fournisseur, ligne_reception=self,
+            date_reception=timezone.localdate(), date_peremption=self.date_peremption,
+            quantite_initiale=self.quantite_recue, statut=StatutLotMatiere.LIBERE,
+        )
+        lot.save()
+        if statut != StatutLotMatiere.LIBERE:
+            lot.changer_statut(statut)
+        if statut == StatutLotMatiere.A_CONTROLER:
+            from apps.qualite.models import generer_controles_reception
+            generer_controles_reception(lot)
+        return lot
+
     def save(self, *args, **kwargs):
         """
         Enregistre la ligne ET ses conséquences (quantité reçue de la
@@ -613,9 +652,10 @@ class LigneReceptionAchat(ValidationAvantEnregistrement, models.Model):
             )
             commande.save()
 
+            depot = self.reception.depot or depot_par_defaut("Magasin principal")
             MouvementStock.objects.create(
                 article=ligne_commande.article,
-                depot=depot_par_defaut("Magasin principal"),
+                depot=depot,
                 type_mouvement=TypeMouvement.ENTREE,
                 quantite=self.quantite_recue,
                 cout_unitaire=ligne_commande.prix_unitaire,   # valorisation au prix d'achat
@@ -623,6 +663,7 @@ class LigneReceptionAchat(ValidationAvantEnregistrement, models.Model):
                 document_origine=commande.numero,
                 utilisateur=self.reception.receptionne_par,
             )
+            self._creer_lot(depot, commande)
             from apps.comptabilite.ecritures import ecrire_reception
             ecrire_reception(self)
 
@@ -690,9 +731,19 @@ class RetourFournisseur(ValidationAvantEnregistrement, models.Model):
             creation = self._state.adding
             super().save(*args, **kwargs)
             if creation:
+                from apps.stocks.models import LotMatiere
+                reste = self.quantite_retournee
+                for lot in LotMatiere.objects.select_for_update().filter(
+                    ligne_reception__reception_id=self.reception_id, article_id=self.article_id, quantite_restante__gt=0,
+                ).order_by("pk"):
+                    if reste <= 0:
+                        break
+                    prise = min(lot.quantite_restante, reste)
+                    lot.retirer(prise)
+                    reste -= prise
                 MouvementStock.objects.create(
                     article=self.article,
-                    depot=depot_par_defaut("Magasin principal"),
+                    depot=self.reception.depot or depot_par_defaut("Magasin principal"),
                     type_mouvement=TypeMouvement.SORTIE,
                     quantite=self.quantite_retournee,
                     motif=f"Retour fournisseur ({self.get_motif_display()}) - commande {self.reception.commande.numero}",

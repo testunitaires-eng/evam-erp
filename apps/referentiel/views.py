@@ -127,6 +127,54 @@ class FicheTechniqueViewSet(HistoriqueMixin, viewsets.ModelViewSet):
         fiche.refresh_from_db()
         return Response(self.get_serializer(fiche).data, status=201)
 
+    @action(detail=True, methods=["post"])
+    def mettre_en_test(self, request, pk=None):
+        """POST .../fiches-techniques/{id}/mettre_en_test/ : Brouillon -> En test (composition figée pendant l'essai)."""
+        fiche = self.get_object()
+        try:
+            fiche.mettre_en_test()
+        except ValueError as erreur:
+            return Response({"erreur": str(erreur)}, status=400)
+        return Response(self.get_serializer(fiche).data)
+
+    @action(detail=True, methods=["post"])
+    def repasser_en_brouillon(self, request, pk=None):
+        """POST .../fiches-techniques/{id}/repasser_en_brouillon/ : En test -> Brouillon (ajustement après essai)."""
+        fiche = self.get_object()
+        try:
+            fiche.repasser_en_brouillon()
+        except ValueError as erreur:
+            return Response({"erreur": str(erreur)}, status=400)
+        return Response(self.get_serializer(fiche).data)
+
+    @action(detail=True, methods=["get"])
+    def simuler_besoins(self, request, pk=None):
+        """
+        GET .../fiches-techniques/{id}/simuler_besoins/?article=<id>&quantite=<q>
+        Besoins que générerait un OF (unité de référence, rendement, pertes,
+        lignes propres au format) : contrôle de la recette avant validation.
+        """
+        from apps.core.validation import convertir_decimal
+        fiche = self.get_object()
+        article = models.Article.objects.filter(pk=request.query_params.get("article") or fiche.article_id).first()
+        try:
+            quantite = convertir_decimal(request.query_params.get("quantite"), "La quantité")
+        except ValueError as erreur:
+            return Response({"erreur": str(erreur)}, status=400)
+        besoins = fiche.besoins_pour(article, quantite)
+        return Response({
+            "article": article.code, "quantite": quantite,
+            "besoins": [
+                {
+                    "matiere": ligne.matiere.code, "designation": ligne.matiere.designation,
+                    "unite": ligne.matiere.unite_mesure, "base_calcul": ligne.base_calcul,
+                    "quantite": besoin.quantize(models.Decimal("0.0001")),
+                    "montant": (besoin * ligne.prix_unitaire).quantize(models.Decimal("0.01")),
+                }
+                for ligne, besoin in besoins
+            ],
+        })
+
 
 class CompositionFicheTechniqueViewSet(viewsets.ModelViewSet):
     """Lignes de composition (matières et quantités par unité produite) : écriture ADMIN_SI uniquement."""
@@ -205,3 +253,32 @@ class UniteVenteArticleViewSet(viewsets.ModelViewSet):
     )]
     filterset_fields = ["actif"]
     search_fields = ["nom"]
+
+
+
+class ConversionUniteViewSet(viewsets.ModelViewSet):
+    """Conversions centralisées (1 sac = 25 kg, 1 carton = 6 bouteilles...)."""
+    queryset = models.ConversionUnite.objects.select_related("article")
+    serializer_class = serializers.ConversionUniteSerializer
+    permission_classes = [acces(
+        lecture=(Profil.DIRECTION, Profil.RESPONSABLE_QUALITE, Profil.MAGASINIER, Profil.COMMERCIAL, Profil.COMPTABILITE_DAF,
+                 Profil.AGENT_PRODUCTION),
+        ecriture=(Profil.RESPONSABLE_PRODUCTION, Profil.RESPONSABLE_ACHATS, Profil.ADMIN_SI,),
+    )]
+    filterset_fields = ["article", "unite_source", "unite_cible"]
+
+    @action(detail=False, methods=["get"])
+    def convertir(self, request):
+        """GET .../conversions/convertir/?quantite=2&de=SAC&vers=KG&article=<id>"""
+        from apps.core.validation import convertir_decimal
+        from django.core.exceptions import ValidationError
+        article = models.Article.objects.filter(pk=request.query_params.get("article")).first()
+        try:
+            quantite = convertir_decimal(request.query_params.get("quantite"), "La quantité", strict=False)
+            resultat = models.ConversionUnite.convertir(
+                quantite, request.query_params.get("de"), request.query_params.get("vers"), article=article,
+            )
+        except (ValueError, ValidationError) as erreur:
+            return Response({"erreur": getattr(erreur, "messages", [str(erreur)])[0]}, status=400)
+        return Response({"quantite": quantite, "de": request.query_params.get("de"),
+                         "vers": request.query_params.get("vers"), "resultat": resultat})

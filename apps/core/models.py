@@ -116,3 +116,49 @@ class Notification(models.Model):
 
     def __str__(self):
         return f"{self.destinataire} : {self.titre}"
+
+
+class ParametreEntreprise(models.Model):
+    """
+    Identité de l'entreprise imprimée sur tous les documents PDF (en-tête,
+    pied de page, mentions obligatoires). Une seule fiche. Le logo est
+    conservé en base (et non sur le disque) pour survivre aux
+    redéploiements.
+    """
+    raison_sociale = models.CharField("Raison sociale", max_length=200, default="EVAM")
+    forme_juridique = models.CharField("Forme juridique", max_length=50, blank=True, help_text="Ex : SARL, SA.")
+    capital = models.CharField("Capital social", max_length=60, blank=True, help_text="Ex : 10 000 000 FCFA.")
+    activite = models.CharField("Activité", max_length=200, blank=True, help_text="Ex : Production d'eau, de jus et de yaourt.")
+    adresse = models.CharField("Adresse", max_length=255, blank=True)
+    ville = models.CharField("Ville / pays", max_length=100, blank=True)
+    telephone = models.CharField("Téléphone", max_length=60, blank=True)
+    email = models.CharField("Email", max_length=120, blank=True)
+    site_web = models.CharField("Site web", max_length=120, blank=True)
+    ifu = models.CharField("IFU", max_length=30, blank=True)
+    rccm = models.CharField("RCCM", max_length=60, blank=True)
+    regime_fiscal = models.CharField("Régime fiscal", max_length=100, blank=True)
+    centre_impots = models.CharField("Centre des impôts", max_length=100, blank=True)
+    banque = models.CharField("Banque et RIB", max_length=200, blank=True)
+    conditions_paiement = models.TextField("Conditions de paiement (factures)", blank=True)
+    mentions_pied_de_page = models.TextField("Autres mentions de pied de page", blank=True)
+    couleur = models.CharField("Couleur des documents", max_length=7, default="#0A6676", help_text="Code hexadécimal, ex : #0A6676.")
+    logo = models.BinaryField("Logo", null=True, blank=True, editable=False)
+    logo_type = models.CharField("Type du logo", max_length=30, blank=True, editable=False)
+
+    class Meta:
+        verbose_name = "Paramètres de l'entreprise (documents)"
+        verbose_name_plural = "Paramètres de l'entreprise (documents)"
+
+    def __str__(self):
+        return self.raison_sociale
+
+    def clean(self):
+        import re
+        from django.core.exceptions import ValidationError
+        if not re.fullmatch(r"#[0-9A-Fa-f]{6}", self.couleur or ""):
+            raise ValidationError({"couleur": "Couleur au format #RRGGBB (ex : #0A6676)."})
+
+    @classmethod
+    def courant(cls):
+        parametre, _ = cls.objects.get_or_create(pk=1)
+        return parametre

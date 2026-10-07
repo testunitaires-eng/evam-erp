@@ -462,6 +462,7 @@ class Client(ValidationAvantEnregistrement, models.Model):
     type_client = models.CharField("Type de client", max_length=20, choices=TypeClient.choices)
     adresse = models.CharField("Adresse", max_length=255, blank=True)
     telephone = models.CharField("Téléphone", max_length=30, blank=True)
+    ifu = models.CharField("IFU", max_length=30, blank=True, help_text="Identifiant fiscal du client (imprimé sur ses factures).")
     encours_autorise = models.DecimalField(
         "Encours autorisé", max_digits=14, decimal_places=2, default=0,
         help_text="Montant maximum de créance tolérée avant blocage des commandes.",

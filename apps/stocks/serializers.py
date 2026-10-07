@@ -51,3 +51,34 @@ class LigneInventaireSerializer(ValidationModeleMixin, serializers.ModelSerializ
         model = models.LigneInventaire
         fields = "__all__"
 
+
+class LotMatiereSerializer(ValidationModeleMixin, serializers.ModelSerializer):
+    article_code = serializers.CharField(source="article.code", read_only=True)
+    depot_nom = serializers.CharField(source="depot.nom", read_only=True)
+    est_perime = serializers.BooleanField(read_only=True)
+
+    class Meta:
+        model = models.LotMatiere
+        fields = "__all__"
+        # Le statut évolue par les actions /liberer/ et /bloquer/ et par les contrôles qualité.
+        read_only_fields = ["statut", "ligne_reception"]
+
+
+class LigneTransfertSerializer(ValidationModeleMixin, serializers.ModelSerializer):
+    article_code = serializers.CharField(source="article.code", read_only=True)
+
+    class Meta:
+        model = models.LigneTransfert
+        fields = "__all__"
+
+
+class TransfertStockSerializer(ValidationModeleMixin, serializers.ModelSerializer):
+    lignes = LigneTransfertSerializer(many=True, read_only=True)
+    depot_source_nom = serializers.CharField(source="depot_source.nom", read_only=True)
+    depot_destination_nom = serializers.CharField(source="depot_destination.nom", read_only=True)
+
+    class Meta:
+        model = models.TransfertStock
+        fields = "__all__"
+        read_only_fields = ["statut", "cree_par", "expedie_par", "recu_par", "date_expedition", "date_reception"]
+        extra_kwargs = {"cree_par": {"required": False}}

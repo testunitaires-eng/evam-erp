@@ -24,5 +24,6 @@ router.register("familles", views.FamilleArticleViewSet, basename="famillearticl
 router.register("formats", views.FormatArticleViewSet, basename="formatarticle")
 router.register("parfums", views.ParfumViewSet, basename="parfum")
 router.register("unites-vente", views.UniteVenteArticleViewSet, basename="unitventearticle")
+router.register("conversions", views.ConversionUniteViewSet, basename="conversionunite")
 
 urlpatterns = router.urls

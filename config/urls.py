@@ -6,6 +6,8 @@ correspond directement aux modules du cahier des charges. La
 documentation interactive de l'API est disponible sur /api/docs/.
 """
 
+from django.conf import settings
+from django.conf.urls.static import static
 from django.contrib import admin
 from django.urls import path, include
 from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
@@ -25,6 +27,7 @@ urlpatterns = [
 
     # Modules métier (correspondance directe avec le cahier des charges)
     path("api/comptes/", include("apps.comptes.urls")),
+    path("api/industriel/", include("apps.industriel.urls")),
     path("api/referentiel/", include("apps.referentiel.urls")),
     path("api/fiscalite/", include("apps.fiscalite.urls")),
     path("api/achats/", include("apps.achats.urls")),
@@ -39,4 +42,8 @@ urlpatterns = [
     path("api/reporting/", include("apps.reporting.urls")),
     path("api/reclamations/", include("apps.reclamations.urls")),
     path("api/notifications/", include("apps.core.urls")),
+    path("api/documents/", include("apps.core.urls_documents")),
 ]
+
+# Pièces jointes servies par Django en développement uniquement.
+urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)

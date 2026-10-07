@@ -267,7 +267,7 @@ class OrdreFabricationViewSet(HistoriqueMixin, viewsets.ModelViewSet):
         lecture=(Profil.AGENT_PRODUCTION, Profil.DIRECTION, Profil.RESPONSABLE_QUALITE,),
         ecriture=(Profil.RESPONSABLE_PRODUCTION, Profil.ADMIN_SI,),
     )]
-    filterset_fields = ["article", "statut"]
+    filterset_fields = ["article", "statut", "ligne", "circuit"]
     search_fields = ["numero"]
 
     def get_queryset(self):
@@ -369,6 +369,48 @@ class OrdreFabricationViewSet(HistoriqueMixin, viewsets.ModelViewSet):
         return Response(serializers.DemandeMatiereSerializer(demandes, many=True).data, status=201)
 
     @action(detail=True, methods=["get"])
+    def verifier_stock(self, request, pk=None):
+        """
+        GET .../ordres-fabrication/{id}/verifier_stock/
+        Contrôle avant lancement : besoins de l'OF face au stock disponible
+        du magasin matières de son usine. Le lancement est bloqué s'il manque
+        quelque chose (selon le paramètre de production).
+        """
+        of = self.get_object()
+        manques = of.verifier_stock_pour_lancement()
+        return Response({
+            "magasin": of.depot_matieres.nom, "lancement_possible": not manques,
+            "blocage_actif": models.ParametreProduction.courant().bloquer_lancement_stock_insuffisant,
+            "manques": manques,
+        })
+
+    @action(detail=True, methods=["get"])
+    def bon_de_sortie(self, request, pk=None):
+        """GET .../ordres-fabrication/{id}/bon_de_sortie/ : bon de sortie des matières (à imprimer pour le magasin)."""
+        of = self.get_object()
+        return Response({
+            "of": of.numero, "article": of.article.code, "designation": of.article.designation,
+            "quantite_a_produire": of.quantite_a_produire, "magasin": of.depot_matieres.nom,
+            "ligne": of.ligne.code if of.ligne_id else None,
+            "recette": f"v{of.fiche_technique.version}" if of.fiche_technique_id else None,
+            "lignes": [
+                {"matiere": b.matiere.code, "designation": b.matiere.designation, "unite": b.matiere.unite_mesure,
+                 "quantite": b.quantite_theorique,
+                 "deja_sorti": sum(s.quantite_sortie for s in of.sorties_matieres.filter(matiere=b.matiere))}
+                for b in of.besoins_matieres.select_related("matiere")
+            ],
+        })
+
+    @action(detail=True, methods=["get"])
+    def lots_consommes(self, request, pk=None):
+        """GET .../ordres-fabrication/{id}/lots_consommes/ : lots de matières utilisés par l'OF (traçabilité amont)."""
+        of = self.get_object()
+        consommations = models.ConsommationLotMatiere.objects.filter(sortie__ordre_fabrication=of).select_related(
+            "lot__article", "sortie__ordre_fabrication",
+        )
+        return Response(serializers.ConsommationLotMatiereSerializer(consommations, many=True).data)
+
+    @action(detail=True, methods=["get"])
     def consommation_reelle(self, request, pk=None):
         """
         GET .../consommation_reelle/
@@ -390,14 +432,28 @@ class OrdreFabricationViewSet(HistoriqueMixin, viewsets.ModelViewSet):
             suivi_eau = serializers.SuiviEauSerializer(of.suivi_eau).data
         except models.SuiviEau.DoesNotExist:
             suivi_eau = None
+        from apps.qualite.models import blocages_qualite_of
         return Response({
             "numero": of.numero,
             "statut": of.statut,
             "quantite_prevue": of.quantite_a_produire,
             "consommation_matieres": consommation,
             "suivi_eau": suivi_eau,
-            "pertes": serializers.PerteProductionSerializer(of.pertes.all(), many=True).data,
+            "volume_eau": of.volume_eau(),
+            "pertes": serializers.PerteProductionSerializer(of.pertes.all(), many=True, context={"request": request}).data,
+            "changements_serie": serializers.ChangementSerieSerializer(
+                of.changements_serie.all(), many=True, context={"request": request},
+            ).data,
+            "blocages_qualite": blocages_qualite_of(of),
         })
+
+    @action(detail=True, methods=["get"], url_path="bon-de-sortie-pdf")
+    def bon_de_sortie_pdf(self, request, pk=None):
+        """GET /api/production/ordres-fabrication/{id}/bon-de-sortie-pdf/ : document PDF à imprimer (?telecharger=1 pour le télécharger)."""
+        from apps.core import documents
+        from apps.core.pdf import telecharger
+        objet = self.get_object()
+        return documents.bon_sortie(objet, request.user).reponse(f"bon-sortie-{objet.numero}", telecharger(request))
 
 
 class BesoinMatierePrevuViewSet(viewsets.ReadOnlyModelViewSet):
@@ -676,3 +732,35 @@ def tableau_de_bord(request):
         "matieres_manquantes": matieres_manquantes,
         "alertes_qualite": alertes_qualite,
     })
+
+
+
+class ChangementSerieViewSet(AffectationAgentMixin, viewsets.ModelViewSet):
+    """Changements de série (temps d'arrêt, nettoyage, réglage, essais, rebuts de démarrage)."""
+    queryset = models.ChangementSerie.objects.select_related("ordre_fabrication")
+    serializer_class = serializers.ChangementSerieSerializer
+    permission_classes = [acces(
+        lecture=(Profil.DIRECTION, Profil.RESPONSABLE_QUALITE, Profil.COMPTABILITE_DAF,),
+        ecriture=(Profil.RESPONSABLE_PRODUCTION, Profil.AGENT_PRODUCTION, Profil.ADMIN_SI,),
+    )]
+    filterset_fields = ["ordre_fabrication", "ligne"]
+
+
+class ParametreProductionViewSet(viewsets.GenericViewSet):
+    """GET /api/production/parametres/ et PATCH /api/production/parametres/modifier/ : règles de production (une seule fiche)."""
+    queryset = models.ParametreProduction.objects.all()
+    serializer_class = serializers.ParametreProductionSerializer
+    permission_classes = [acces(
+        lecture=(Profil.RESPONSABLE_PRODUCTION, Profil.RESPONSABLE_QUALITE, Profil.DIRECTION,),
+        ecriture=(Profil.ADMIN_SI, Profil.DIRECTION,),
+    )]
+
+    def list(self, request):
+        return Response(self.get_serializer(models.ParametreProduction.courant()).data)
+
+    @action(detail=False, methods=["patch"], url_path="modifier")
+    def modifier(self, request):
+        serializer = self.get_serializer(models.ParametreProduction.courant(), data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data)

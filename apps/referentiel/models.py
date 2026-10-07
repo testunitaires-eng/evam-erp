@@ -323,6 +323,8 @@ créer ou modifier une fiche technique (voir apps/comptes/permissions.py
 et referentiel/views.py).
 """
 
+from decimal import Decimal
+
 from django.core.exceptions import ValidationError
 from django.db import models, transaction
 from apps.comptes.models import Utilisateur
@@ -336,18 +338,54 @@ from apps.core.validation import (
 
 
 class TypeArticle(models.TextChoices):
+    """Catégories du Guide du paramétrage (§6)."""
     MATIERE_PREMIERE = "MATIERE_PREMIERE", "Matière première"
     PRODUIT_INTERMEDIAIRE = "PRODUIT_INTERMEDIAIRE", "Produit intermédiaire"
     PRODUIT_FINI = "PRODUIT_FINI", "Produit fini"
+    EMBALLAGE = "EMBALLAGE", "Emballage"
+    CONSOMMABLE = "CONSOMMABLE", "Consommable"
+    FLUIDE_PROCESS = "FLUIDE_PROCESS", "Fluide de process"
+
+
+# Articles achetés et consommés, jamais fabriqués par un OF.
+TYPES_NON_FABRIQUES = (TypeArticle.MATIERE_PREMIERE, TypeArticle.EMBALLAGE, TypeArticle.CONSOMMABLE)
+# Articles pouvant entrer dans une composition (recette / conditionnement).
+TYPES_COMPOSANTS = (
+    TypeArticle.MATIERE_PREMIERE, TypeArticle.PRODUIT_INTERMEDIAIRE, TypeArticle.EMBALLAGE,
+    TypeArticle.CONSOMMABLE, TypeArticle.FLUIDE_PROCESS,
+)
 
 
 class UniteMesure(models.TextChoices):
     KILOGRAMME = "KG", "Kilogramme"
+    GRAMME = "G", "Gramme"
     LITRE = "L", "Litre"
+    CENTILITRE = "CL", "Centilitre"
+    METRE_CUBE = "M3", "Mètre cube"
     UNITE = "UNITE", "Unité"
+    BOUTEILLE = "BOUTEILLE", "Bouteille"
+    POT = "POT", "Pot"
+    PACK = "PACK", "Pack"
     CARTON = "CARTON", "Carton"
+    SAC = "SAC", "Sac"
     PALETTE = "PALETTE", "Palette"
     METRE = "M", "Mètre"
+
+
+# Conversions universelles (valables pour tout article). Les conversions
+# propres à un article (1 sac de sucre = 25 kg, 1 carton = 6 bouteilles)
+# sont paramétrées dans ConversionUnite.
+CONVERSIONS_STANDARD = {
+    ("KG", "G"): 1000,
+    ("L", "CL"): 100,
+    ("M3", "L"): 1000,
+}
+
+
+class ModeApprovisionnement(models.TextChoices):
+    ACHETE = "ACHETE", "Acheté"
+    FABRIQUE = "FABRIQUE", "Fabriqué"
+    PROCESS = "PROCESS", "Produit par le process"
 
 
 class FamilleArticle(models.Model):
@@ -359,6 +397,11 @@ class FamilleArticle(models.Model):
     initialiser_referentiel_valeurs pour les valeurs de départ connues).
     """
     nom = models.CharField("Famille", max_length=50, unique=True)
+    activite = models.ForeignKey(
+        "industriel.Activite", verbose_name="Activité", on_delete=models.PROTECT,
+        null=True, blank=True, related_name="familles",
+        help_text="Les produits finis de cette famille appartiennent à cette activité (Eau -> EAU...).",
+    )
     actif = models.BooleanField("Actif", default=True)
 
     class Meta:
@@ -368,6 +411,20 @@ class FamilleArticle(models.Model):
 
     def __str__(self):
         return self.nom
+
+    def save(self, *args, **kwargs):
+        """Rattachement automatique à l'activité de même nom (famille « Jus » -> activité JUS)."""
+        if self.activite_id is None and self.nom:
+            from apps.industriel.models import Activite
+            try:
+                sigle = codification.sigle(self.nom)
+            except ValueError:
+                sigle = None
+            self.activite = (
+                Activite.objects.filter(designation__iexact=self.nom.strip()).first()
+                or (Activite.objects.filter(code__startswith=sigle).first() if sigle else None)
+            )
+        super().save(*args, **kwargs)
 
 
 class FormatArticle(models.Model):
@@ -417,7 +474,38 @@ PREFIXES_CODE_ARTICLE = {
     TypeArticle.MATIERE_PREMIERE: "MP",
     TypeArticle.PRODUIT_INTERMEDIAIRE: "PI",
     TypeArticle.PRODUIT_FINI: "PF",
+    TypeArticle.EMBALLAGE: "EMB",
+    TypeArticle.CONSOMMABLE: "CONS",
+    TypeArticle.FLUIDE_PROCESS: "FLU",
 }
+
+
+def _nombre(texte):
+    """Premier nombre d'un libellé (« 1,5 L » -> Decimal('1.5')), ou None."""
+    import re
+    from decimal import Decimal
+    trouve = re.search(r"\d+(?:[.,]\d+)?", texte or "")
+    return Decimal(trouve.group().replace(",", ".")) if trouve else None
+
+
+def contenance_depuis_format(valeur):
+    """« 70 cl » -> (0.7, 'L') ; « 1,5 L » -> (1.5, 'L') ; « 125 g » -> (0.125, 'KG') ; sinon (None, '')."""
+    from decimal import Decimal
+    nombre = _nombre(valeur)
+    if nombre is None:
+        return None, ""
+    unite = codification._ascii_majuscules(valeur).replace(" ", "")
+    if "CL" in unite:
+        return nombre / Decimal(100), "L"
+    if "ML" in unite:
+        return nombre / Decimal(1000), "L"
+    if "KG" in unite:
+        return nombre, "KG"
+    if unite.endswith("G") or "G" in unite.replace("KG", ""):
+        return nombre / Decimal(1000), "KG"
+    if "L" in unite:
+        return nombre, "L"
+    return None, ""
 
 
 class Article(ValidationAvantEnregistrement, models.Model):
@@ -477,6 +565,50 @@ class Article(ValidationAvantEnregistrement, models.Model):
         help_text="Choisie dans la liste (Pack de 8, Carton de 12...) - l'unité réellement facturée au client.",
     )
     actif = models.BooleanField("Actif", default=True)
+
+    # --- Socle industriel (Guide du paramétrage §6 à §8) ---
+    activite = models.ForeignKey(
+        "industriel.Activite", verbose_name="Activité", on_delete=models.PROTECT,
+        null=True, blank=True, related_name="produits",
+        help_text="Produit fini : déduite de la famille (Eau -> EAU). Sert aux lignes, circuits, contrôles et coûts.",
+    )
+    activites_autorisees = models.ManyToManyField(
+        "industriel.Activite", verbose_name="Activités autorisées", blank=True, related_name="articles_autorises",
+        help_text="Un même article (ex : sucre) sert plusieurs activités : on ne le duplique pas. Vide = toutes.",
+    )
+    mode_approvisionnement = models.CharField(
+        "Mode d'approvisionnement", max_length=10, choices=ModeApprovisionnement.choices, blank=True,
+        help_text="Déduit du type si vide : acheté (MP, emballage, consommable), fabriqué (produit fini...).",
+    )
+    unite_achat = models.CharField(
+        "Unité d'achat", max_length=10, choices=UniteMesure.choices, blank=True,
+        help_text="Ex : sac (1 sac = 25 kg, voir les conversions). Vide = unité de base.",
+    )
+    unite_consommation = models.CharField(
+        "Unité de consommation", max_length=10, choices=UniteMesure.choices, blank=True,
+        help_text="Unité des recettes et des sorties vers la production. Vide = unité de base.",
+    )
+    contenance = models.DecimalField(
+        "Contenance / poids unitaire", max_digits=10, decimal_places=4, null=True, blank=True,
+        help_text="Produit fini : contenu d'une bouteille/pot (0,7 L ; 0,125 kg). Déduit du format si vide.",
+    )
+    unite_contenance = models.CharField(
+        "Unité de contenance", max_length=10, choices=[("L", "Litre"), ("KG", "Kilogramme")], blank=True,
+    )
+    unites_par_pack = models.PositiveIntegerField(
+        "Unités par pack", null=True, blank=True,
+        help_text="Bouteilles/pots par pack ou carton (Pack de 6 -> 6). Déduit de l'unité de vente si vide.",
+    )
+    unites_par_unite_stock = models.PositiveIntegerField(
+        "Unités (bouteilles/pots) par unité de stock", null=True, blank=True,
+        help_text="1 si le stock et les OF comptent des bouteilles ; 6 s'ils comptent des packs de 6. "
+                  "Déduit de l'unité de base si vide (Pack/Carton -> unités par pack, sinon 1).",
+    )
+    packs_par_palette = models.PositiveIntegerField("Packs par palette", null=True, blank=True)
+    type_emballage = models.CharField(
+        "Type d'emballage", max_length=100, blank=True,
+        help_text="Ex : bouteille PET soufflée sur site, pot, film, carton.",
+    )
 
     # --- Bloc 2 : Fiscalité ---
     # Volontairement une simple FK, jamais un taux en clair sur
@@ -565,6 +697,71 @@ class Article(ValidationAvantEnregistrement, models.Model):
                 modifies.append(champ)
         return modifies
 
+    def completer_donnees_industrielles(self):
+        """
+        Déduit ce qui est déjà connu, sans ressaisie : activité depuis la
+        famille, contenance depuis le format (70 cl -> 0,7 L), unités par
+        pack depuis l'unité de vente (Pack de 6 -> 6), mode
+        d'approvisionnement depuis le type. Une valeur saisie l'emporte.
+        """
+        if self.activite_id is None and self.famille_id and self.famille.activite_id \
+                and self.type_article == TypeArticle.PRODUIT_FINI:
+            self.activite_id = self.famille.activite_id
+        if self.contenance is None and self.format_id:
+            self.contenance, self.unite_contenance = contenance_depuis_format(self.format.valeur)
+        if self.unites_par_pack is None and self.unite_vente_id:
+            nombre = _nombre(self.unite_vente.nom)
+            self.unites_par_pack = int(nombre) if nombre else 1
+        if not self.mode_approvisionnement and self.type_article:
+            self.mode_approvisionnement = (
+                ModeApprovisionnement.ACHETE if self.type_article in TYPES_NON_FABRIQUES
+                else ModeApprovisionnement.PROCESS if self.type_article == TypeArticle.FLUIDE_PROCESS
+                else ModeApprovisionnement.FABRIQUE
+            )
+
+    # --- Quantités industrielles (clés de répartition des coûts) ---
+    @property
+    def facteur_unites(self):
+        """Nombre de bouteilles/pots dans UNE unité de stock de l'article."""
+        from decimal import Decimal
+        if self.unites_par_unite_stock:
+            return Decimal(self.unites_par_unite_stock)
+        if self.unite_mesure in (UniteMesure.PACK, UniteMesure.CARTON) and self.unites_par_pack:
+            return Decimal(self.unites_par_pack)
+        return Decimal(1)
+
+    def en_unites(self, quantite):
+        """Quantité (en unité de stock) -> nombre de bouteilles/pots."""
+        from decimal import Decimal
+        return Decimal(quantite or 0) * self.facteur_unites
+
+    def en_packs(self, quantite):
+        from decimal import Decimal
+        return self.en_unites(quantite) / Decimal(self.unites_par_pack or 1)
+
+    def en_contenance(self, quantite):
+        """Quantité -> litres (ou kg) de produit ; None si la contenance n'est pas connue."""
+        if not self.contenance:
+            return None
+        return self.en_unites(quantite) * self.contenance
+
+    def en_palettes(self, quantite):
+        if not self.packs_par_palette:
+            return None
+        from decimal import Decimal
+        return self.en_packs(quantite) / Decimal(self.packs_par_palette)
+
+    def convertir(self, quantite, de, vers):
+        """Conversion centralisée (voir ConversionUnite.convertir)."""
+        return ConversionUnite.convertir(quantite, de, vers, article=self)
+
+    def est_autorise_pour(self, activite):
+        if activite is None or not self.pk:
+            return True
+        if self.activite_id:
+            return self.activite_id == activite.pk
+        return not self.activites_autorisees.exists() or self.activites_autorisees.filter(pk=activite.pk).exists()
+
     def save(self, *args, **kwargs):
         """
         Code automatique (voir apps/core/codification.py) :
@@ -578,6 +775,7 @@ class Article(ValidationAvantEnregistrement, models.Model):
         "valeurs déjà connues, choisies dans des listes".
         """
         modifie = bool(self.champs_code_modifies())
+        self.completer_donnees_industrielles()
         if self.type_article == TypeArticle.PRODUIT_FINI:
             if not self.code or not self.est_utilise():
                 self.code = self.code_produit_fini_attendu()
@@ -631,12 +829,25 @@ class Article(ValidationAvantEnregistrement, models.Model):
                 f"L'article {self.code} est déjà utilisé (commande, stock, OF...) : "
                 "son type, sa famille, son parfum, son format et son unité de vente ne peuvent plus changer."
             )})
-        if self.pk and self.type_article == TypeArticle.MATIERE_PREMIERE \
-                and valeur_en_base(self, "type_article") != TypeArticle.MATIERE_PREMIERE \
+        if self.pk and self.type_article in TYPES_NON_FABRIQUES \
+                and valeur_en_base(self, "type_article") not in TYPES_NON_FABRIQUES \
                 and self.fiches_techniques.exists():
             raise ValidationError({"type_article": (
-                "Cet article a déjà une fiche de composition : il ne peut pas devenir une matière première."
+                f"Cet article a déjà une fiche de composition : il ne peut pas devenir « {self.get_type_article_display()} »."
             )})
+        if self.famille_id and self.famille.activite_id and self.activite_id \
+                and self.type_article == TypeArticle.PRODUIT_FINI and self.activite_id != self.famille.activite_id:
+            raise ValidationError({"activite": (
+                f"La famille « {self.famille.nom} » appartient à l'activité {self.famille.activite.code}."
+            )})
+        if self.activite_id and self.pk and valeur_en_base(self, "activite") not in (None, self.activite_id) and self.est_utilise():
+            raise ValidationError({"activite": "Cet article est déjà utilisé : son activité ne change plus."})
+        exiger_positif_optionnel(self.contenance, "contenance", "La contenance", strict=True)
+        if self.contenance and not self.unite_contenance:
+            raise ValidationError({"unite_contenance": "Précisez l'unité de la contenance (L ou kg)."})
+        for champ in ("unites_par_pack", "unites_par_unite_stock", "packs_par_palette"):
+            if getattr(self, champ) == 0:
+                raise ValidationError({champ: "Cette valeur doit être supérieure à 0 (laisser vide si inconnue)."})
         exiger_positif(self.stock_minimum, "stock_minimum", "Le stock minimum", strict=False)
         exiger_positif(self.stock_alerte, "stock_alerte", "Le stock d'alerte", strict=False)
         if self.code_fiscal_id and not self.code_fiscal.actif and valeur_en_base(self, "code_fiscal") != self.code_fiscal_id:
@@ -657,10 +868,22 @@ class Article(ValidationAvantEnregistrement, models.Model):
 
     @property
     def fiche_technique_validee(self):
-        """La fiche de composition en vigueur (validée, version la plus récente), ou None."""
+        """
+        La recette en vigueur : fiche validée de l'article (version la plus
+        récente, dans ses dates de validité), sinon fiche validée d'un autre
+        format qui la partage (« une recette n'est pas recréée pour chaque
+        format si la composition reste identique »). None sinon.
+        """
+        from django.db.models import Q
+        from django.utils import timezone
+        aujourd_hui = timezone.localdate()
+        en_vigueur = FicheTechnique.objects.filter(statut=StatutFicheTechnique.VALIDEE).filter(
+            Q(date_debut_validite__isnull=True) | Q(date_debut_validite__lte=aujourd_hui),
+            Q(date_fin_validite__isnull=True) | Q(date_fin_validite__gte=aujourd_hui),
+        )
         return (
-            self.fiches_techniques.filter(statut=StatutFicheTechnique.VALIDEE)
-            .order_by("-version").first()
+            en_vigueur.filter(article_id=self.pk).order_by("-version").first()
+            or en_vigueur.filter(formats_associes=self).order_by("-version").first()
         )
 
     @property
@@ -677,8 +900,23 @@ class Article(ValidationAvantEnregistrement, models.Model):
 
 class StatutFicheTechnique(models.TextChoices):
     BROUILLON = "BROUILLON", "Brouillon"
+    EN_TEST = "EN_TEST", "En test"
     VALIDEE = "VALIDEE", "Validée"
-    ARCHIVEE = "ARCHIVEE", "Archivée"
+    ARCHIVEE = "ARCHIVEE", "Remplacée / archivée"
+
+
+class UniteReference(models.TextChoices):
+    """Unité de référence d'une recette (« pour 1 000 L », « par unité »...)."""
+    UNITE_STOCK = "UNITE_STOCK", "Unité de stock du produit fabriqué"
+    LITRE = "L", "Litre de produit"
+    KILOGRAMME = "KG", "Kilogramme de produit"
+
+
+class BaseCalcul(models.TextChoices):
+    """Ce à quoi la quantité d'un composant se rapporte."""
+    REFERENCE = "REFERENCE", "Quantité de référence de la recette"
+    UNITE = "UNITE", "Par bouteille / pot produit"
+    PACK = "PACK", "Par pack / carton produit"
 
 
 class FicheTechnique(ValidationAvantEnregistrement, models.Model):
@@ -712,6 +950,30 @@ class FicheTechnique(ValidationAvantEnregistrement, models.Model):
     date_creation = models.DateTimeField("Date de création", auto_now_add=True)
     date_validation = models.DateTimeField("Date de validation", null=True, blank=True)
 
+    # --- Recette (Guide §13 et Guide Jus §7) ---
+    quantite_reference = models.DecimalField(
+        "Quantité de référence", max_digits=12, decimal_places=3, default=1,
+        help_text="La composition est donnée pour cette quantité (ex : 1 000 pour « pour 1 000 L »).",
+    )
+    unite_reference = models.CharField(
+        "Unité de référence", max_length=15, choices=UniteReference.choices, default=UniteReference.UNITE_STOCK,
+    )
+    rendement_theorique_pct = models.DecimalField(
+        "Rendement théorique (%)", max_digits=5, decimal_places=2, null=True, blank=True,
+        help_text="Ex : 98 -> les besoins de la recette sont majorés de 100/98.",
+    )
+    parametres_process = models.TextField(
+        "Paramètres de process", blank=True,
+        help_text="Températures, temps, agitation... tels qu'ils figurent sur la fiche validée.",
+    )
+    formats_associes = models.ManyToManyField(
+        Article, verbose_name="Autres formats utilisant cette recette", blank=True, related_name="recettes_partagees",
+        help_text="Ex : la recette du jus orange 1 L sert aussi au 70 cl et au 1,5 L (seuls les emballages diffèrent).",
+    )
+    date_debut_validite = models.DateField("Valide à partir du", null=True, blank=True)
+    date_fin_validite = models.DateField("Valide jusqu'au", null=True, blank=True)
+    document_reference = models.CharField("Fiche / formulation de référence", max_length=200, blank=True)
+
     class Meta:
         verbose_name = "Fiche technique"
         verbose_name_plural = "Fiches techniques"
@@ -722,19 +984,34 @@ class FicheTechnique(ValidationAvantEnregistrement, models.Model):
         return f"Fiche {self.article.code} v{self.version} ({self.get_statut_display()})"
 
     TRANSITIONS = {
-        StatutFicheTechnique.BROUILLON: {StatutFicheTechnique.VALIDEE},
+        StatutFicheTechnique.BROUILLON: {StatutFicheTechnique.EN_TEST, StatutFicheTechnique.VALIDEE},
+        StatutFicheTechnique.EN_TEST: {StatutFicheTechnique.BROUILLON, StatutFicheTechnique.VALIDEE},
         StatutFicheTechnique.VALIDEE: {StatutFicheTechnique.ARCHIVEE},
     }
+    CHAMPS_RECETTE = (
+        "quantite_reference", "unite_reference", "rendement_theorique_pct", "parametres_process",
+        "date_debut_validite", "date_fin_validite",
+    )
 
     def clean(self):
         """
         - fiche d'un article fabriqué (pas d'une matière première) ;
-        - toujours créée en brouillon ; Brouillon -> Validée -> Archivée ;
+        - toujours créée en brouillon ; Brouillon -> (En test) -> Validée -> Remplacée ;
         - une fiche validée ou archivée ne se modifie plus (versionnement :
           on crée une nouvelle version), seul l'archivage est possible.
         """
-        if self.article_id and self.article.type_article == TypeArticle.MATIERE_PREMIERE:
-            raise ValidationError({"article": "Une matière première n'a pas de fiche technique."})
+        if self.article_id and self.article.type_article in TYPES_NON_FABRIQUES:
+            raise ValidationError({"article": f"Un article « {self.article.get_type_article_display()} » n'a pas de fiche technique."})
+        exiger_positif(self.quantite_reference, "quantite_reference", "La quantité de référence")
+        if self.rendement_theorique_pct is not None and not (0 < self.rendement_theorique_pct <= 100):
+            raise ValidationError({"rendement_theorique_pct": "Le rendement doit être compris entre 0 (exclu) et 100."})
+        if self.date_debut_validite and self.date_fin_validite and self.date_fin_validite < self.date_debut_validite:
+            raise ValidationError({"date_fin_validite": "La fin de validité ne peut pas précéder son début."})
+        if self.unite_reference in (UniteReference.LITRE, UniteReference.KILOGRAMME) and self.article_id \
+                and self.article.contenance and self.article.unite_contenance and self.article.unite_contenance != self.unite_reference:
+            raise ValidationError({"unite_reference": (
+                f"{self.article.code} se mesure en {self.article.unite_contenance} : la recette ne peut pas être exprimée en {self.unite_reference}."
+            )})
         ancien_statut = valeur_en_base(self, "statut")
         if ancien_statut == StatutFicheTechnique.ARCHIVEE:
             raise ValidationError("Cette fiche technique est archivée : elle ne peut plus être modifiée.")
@@ -742,11 +1019,13 @@ class FicheTechnique(ValidationAvantEnregistrement, models.Model):
             ancien_statut, self.statut, self.TRANSITIONS, "statut de la fiche technique",
             initial=StatutFicheTechnique.BROUILLON,
         )
-        if ancien_statut == StatutFicheTechnique.VALIDEE:
-            for champ in ("article", "version"):
+        if ancien_statut in (StatutFicheTechnique.VALIDEE, StatutFicheTechnique.EN_TEST):
+            for champ in ("article", "version") + self.CHAMPS_RECETTE:
                 attribut = f"{champ}_id" if champ == "article" else champ
+                if champ == "date_fin_validite" and ancien_statut == StatutFicheTechnique.VALIDEE:
+                    continue   # on peut fixer la fin de validité d'une recette en vigueur
                 if valeur_en_base(self, champ) != getattr(self, attribut):
-                    raise ValidationError({champ: "Une fiche validée ne peut plus être modifiée : créez une nouvelle version."})
+                    raise ValidationError({champ: "Une fiche en test ou validée ne se modifie plus : repassez-la en brouillon ou créez une nouvelle version."})
 
     def verifier_suppression(self):
         if self.statut != StatutFicheTechnique.BROUILLON:
@@ -759,10 +1038,7 @@ class FicheTechnique(ValidationAvantEnregistrement, models.Model):
         actifs, hors article de la fiche et hors éléments déjà présents.
         """
         return (
-            Article.objects.filter(
-                actif=True,
-                type_article__in=[TypeArticle.MATIERE_PREMIERE, TypeArticle.PRODUIT_INTERMEDIAIRE],
-            )
+            Article.objects.filter(actif=True, type_article__in=TYPES_COMPOSANTS)
             .exclude(pk=self.article_id)
             .exclude(pk__in=self.composition.values("matiere_id"))
             .order_by("type_article", "designation")
@@ -793,8 +1069,22 @@ class FicheTechnique(ValidationAvantEnregistrement, models.Model):
                     prix = convertir_decimal(element.get("prix_unitaire"), "Le prix unitaire", strict=False)
                 except ValueError as erreur:
                     raise ValidationError(str(erreur))
+                optionnels = {
+                    champ: element[champ] for champ in ("base_calcul", "ordre_incorporation", "role")
+                    if element.get(champ) not in (None, "")
+                }
+                for champ in ("article_format", "etape"):
+                    if element.get(champ) not in (None, ""):
+                        optionnels[f"{champ}_id"] = element[champ]
+                if element.get("perte_theorique_pct") not in (None, ""):
+                    try:
+                        optionnels["perte_theorique_pct"] = convertir_decimal(
+                            element["perte_theorique_pct"], "La perte théorique", strict=False)
+                    except ValueError as erreur:
+                        raise ValidationError(str(erreur))
                 ligne = CompositionFicheTechnique(
                     fiche_technique=self, matiere=matiere, quantite_necessaire=quantite, prix_unitaire=prix,
+                    **optionnels,
                 )
                 ligne.save()
                 lignes.append(ligne)
@@ -814,8 +1104,8 @@ class FicheTechnique(ValidationAvantEnregistrement, models.Model):
         précédente version validée du même article est archivée (une
         seule version active à la fois).
         """
-        if self.statut != StatutFicheTechnique.BROUILLON:
-            raise ValueError("Seule une fiche en brouillon peut être validée.")
+        if self.statut not in (StatutFicheTechnique.BROUILLON, StatutFicheTechnique.EN_TEST):
+            raise ValueError("Seule une fiche en brouillon ou en test peut être validée.")
         if not self.composition.exists():
             raise ValueError("Impossible de valider une fiche technique sans aucune ligne de composition.")
         for ancienne in FicheTechnique.objects.filter(
@@ -828,6 +1118,78 @@ class FicheTechnique(ValidationAvantEnregistrement, models.Model):
         from django.utils import timezone
         self.date_validation = timezone.now()
         self.save()
+
+    def mettre_en_test(self):
+        """Brouillon -> En test (essais avant validation) ; la composition est alors figée."""
+        if self.statut != StatutFicheTechnique.BROUILLON:
+            raise ValueError("Seule une fiche en brouillon peut passer en test.")
+        if not self.composition.exists():
+            raise ValueError("Impossible de tester une fiche sans composition.")
+        self.statut = StatutFicheTechnique.EN_TEST
+        self.save()
+
+    def repasser_en_brouillon(self):
+        """En test -> Brouillon (ajustement de la composition après essai)."""
+        if self.statut != StatutFicheTechnique.EN_TEST:
+            raise ValueError("Seule une fiche en test peut repasser en brouillon.")
+        self.statut = StatutFicheTechnique.BROUILLON
+        self.save()
+
+    def verifier_formats(self, formats):
+        """Formats partageant la recette : produits finis de la même activité, sans recette validée propre."""
+        erreurs = []
+        for article in formats:
+            if article.pk == self.article_id:
+                continue
+            if article.type_article != TypeArticle.PRODUIT_FINI:
+                erreurs.append(f"{article.code} n'est pas un produit fini")
+            elif self.article.activite_id and article.activite_id and article.activite_id != self.article.activite_id:
+                erreurs.append(f"{article.code} est d'une autre activité")
+        if erreurs:
+            raise ValidationError({"formats_associes": "; ".join(erreurs) + "."})
+
+    def base_de_calcul(self, article, quantite):
+        """Quantité de l'OF exprimée dans l'unité de référence de la recette."""
+        from decimal import Decimal
+        if self.unite_reference == UniteReference.UNITE_STOCK:
+            return Decimal(quantite)
+        valeur = article.en_contenance(quantite)
+        if valeur is None or article.unite_contenance != self.unite_reference:
+            raise ValidationError({"article": (
+                f"La recette est exprimée en {self.get_unite_reference_display().lower()} : "
+                f"renseignez la contenance de {article.code} (ex : 1 L, 125 g)."
+            )})
+        return valeur
+
+    def besoins_pour(self, article, quantite):
+        """
+        Besoins théoriques pour produire `quantite` (unité de stock) de
+        `article` : [(ligne de composition, quantité)]. Chaque ligne se
+        rapporte à la quantité de référence (majorée du rendement), à la
+        bouteille/pot ou au pack ; puis la perte théorique de la ligne
+        s'ajoute. Les lignes réservées à un autre format sont ignorées.
+        """
+        from decimal import Decimal
+        resultat = []
+        base_reference = None
+        for ligne in self.composition.select_related("matiere").order_by("ordre_incorporation", "id"):
+            if ligne.article_format_id and ligne.article_format_id != article.pk:
+                continue
+            if ligne.base_calcul == BaseCalcul.UNITE:
+                base = article.en_unites(quantite)
+            elif ligne.base_calcul == BaseCalcul.PACK:
+                base = article.en_packs(quantite)
+            else:
+                if base_reference is None:
+                    base_reference = self.base_de_calcul(article, quantite) / Decimal(self.quantite_reference)
+                    if self.rendement_theorique_pct:
+                        base_reference = base_reference * Decimal(100) / Decimal(self.rendement_theorique_pct)
+                base = base_reference
+            besoin = Decimal(ligne.quantite_necessaire) * base
+            if ligne.perte_theorique_pct:
+                besoin = besoin * (Decimal(100) + Decimal(ligne.perte_theorique_pct)) / Decimal(100)
+            resultat.append((ligne, besoin))
+        return resultat
 
 
 class CompositionFicheTechnique(ValidationAvantEnregistrement, models.Model):
@@ -844,8 +1206,29 @@ class CompositionFicheTechnique(ValidationAvantEnregistrement, models.Model):
         on_delete=models.PROTECT, related_name="utilise_dans_fiches",
     )
     quantite_necessaire = models.DecimalField(
-        "Quantité nécessaire par unité produite",
+        "Quantité nécessaire",
         max_digits=12, decimal_places=4,
+        help_text="Pour la quantité de référence de la recette, ou par bouteille/pot ou par pack selon la base de calcul.",
+    )
+    base_calcul = models.CharField(
+        "Base de calcul", max_length=10, choices=BaseCalcul.choices, default=BaseCalcul.REFERENCE,
+        help_text="Ingrédients : quantité de référence (ex : 100 kg de sucre pour 1 000 L). "
+                  "Emballages : par bouteille (préforme, bouchon) ou par pack (film, carton).",
+    )
+    article_format = models.ForeignKey(
+        Article, verbose_name="Uniquement pour le format", on_delete=models.PROTECT, null=True, blank=True,
+        related_name="lignes_composition_specifiques",
+        help_text="Recette partagée : emballage propre à un format (préforme 1,5 L...). Vide = tous les formats.",
+    )
+    ordre_incorporation = models.PositiveIntegerField("Ordre d'incorporation", default=0)
+    role = models.CharField("Rôle", max_length=100, blank=True, help_text="Ex : base, ingrédient, emballage primaire.")
+    etape = models.ForeignKey(
+        "industriel.EtapeStandard", verbose_name="Étape de consommation", on_delete=models.PROTECT,
+        null=True, blank=True, related_name="+",
+        help_text="Ex : préformes au soufflage, film à la plastification (sert au coût par étape).",
+    )
+    perte_theorique_pct = models.DecimalField(
+        "Perte théorique (%)", max_digits=5, decimal_places=2, null=True, blank=True,
     )
     prix_unitaire = models.DecimalField(
         "Prix unitaire de l'élément", max_digits=14, decimal_places=2, default=0,
@@ -871,9 +1254,11 @@ class CompositionFicheTechnique(ValidationAvantEnregistrement, models.Model):
         """Mise à jour du prix seul : permise même sur une fiche validée (les quantités restent figées)."""
         if self.pk is None:
             return False
-        for champ in ("fiche_technique", "matiere", "quantite_necessaire"):
-            attribut = f"{champ}_id" if champ != "quantite_necessaire" else champ
-            if valeur_en_base(self, champ) != getattr(self, attribut):
+        for champ in ("fiche_technique", "matiere", "article_format", "etape"):
+            if valeur_en_base(self, champ) != getattr(self, f"{champ}_id"):
+                return False
+        for champ in ("quantite_necessaire", "base_calcul", "ordre_incorporation", "perte_theorique_pct", "role"):
+            if valeur_en_base(self, champ) != getattr(self, champ):
                 return False
         return True
 
@@ -886,6 +1271,16 @@ class CompositionFicheTechnique(ValidationAvantEnregistrement, models.Model):
         """
         exiger_positif(self.quantite_necessaire, "quantite_necessaire", "La quantité nécessaire")
         exiger_positif(self.prix_unitaire, "prix_unitaire", "Le prix unitaire", strict=False)
+        from apps.core.validation import exiger_pourcentage
+        exiger_pourcentage(self.perte_theorique_pct, "perte_theorique_pct", "La perte théorique")
+        if self.article_format_id and self.fiche_technique_id:
+            fiche = self.fiche_technique
+            if self.article_format_id != fiche.article_id and not (
+                fiche.pk and fiche.formats_associes.filter(pk=self.article_format_id).exists()
+            ):
+                raise ValidationError({"article_format": (
+                    f"{self.article_format.code} n'utilise pas cette recette : ajoutez-le d'abord aux formats associés."
+                )})
         mise_a_jour_prix = self.seul_le_prix_change()
         if mise_a_jour_prix and self.fiche_technique.statut == StatutFicheTechnique.ARCHIVEE:
             raise ValidationError("Cette fiche technique est archivée : ses prix ne se modifient plus.")
@@ -909,10 +1304,15 @@ class CompositionFicheTechnique(ValidationAvantEnregistrement, models.Model):
         if self.matiere_id:
             if not self.matiere.actif:
                 raise ValidationError({"matiere": f"La matière {self.matiere.code} est inactive."})
-            if self.matiere.type_article == TypeArticle.PRODUIT_FINI:
+            if self.matiere.type_article not in TYPES_COMPOSANTS:
                 raise ValidationError({"matiere": (
                     f"{self.matiere.code} est un produit fini : la composition ne contient que des "
-                    "matières premières et produits intermédiaires (emballages, étiquettes...)."
+                    "matières premières, emballages, consommables, fluides de process et produits intermédiaires."
+                )})
+            if self.fiche_technique_id and self.fiche_technique.article.activite_id \
+                    and not self.matiere.est_autorise_pour(self.fiche_technique.article.activite):
+                raise ValidationError({"matiere": (
+                    f"{self.matiere.code} n'est pas autorisé pour l'activité {self.fiche_technique.article.activite.code}."
                 )})
 
     def verifier_suppression(self):
@@ -999,3 +1399,79 @@ class ControleQualiteRequis(models.Model):
 
     def __str__(self):
         return f"{self.article.code} : {self.type_controle} ({self.get_moment_display()})"
+
+
+class ConversionUnite(ValidationAvantEnregistrement, models.Model):
+    """
+    Conversions centralisées (Guide §7 : « il ne faut pas coder une
+    conversion différente dans chaque module ») :
+        1 SAC = 25 KG (sucre), 1 CARTON = 6 BOUTEILLE, 1 M3 = 1 000 L.
+    Sans article : conversion valable pour tous les articles.
+    """
+    article = models.ForeignKey(
+        Article, verbose_name="Article", on_delete=models.CASCADE, null=True, blank=True,
+        related_name="conversions", help_text="Vide = conversion générale.",
+    )
+    unite_source = models.CharField("1 unité de", max_length=10, choices=UniteMesure.choices)
+    facteur = models.DecimalField("vaut", max_digits=16, decimal_places=6)
+    unite_cible = models.CharField("unités de", max_length=10, choices=UniteMesure.choices)
+
+    class Meta:
+        verbose_name = "Conversion d'unités"
+        verbose_name_plural = "Conversions d'unités"
+        unique_together = ("article", "unite_source", "unite_cible")
+
+    def __str__(self):
+        cible = f" ({self.article.code})" if self.article_id else ""
+        return f"1 {self.unite_source} = {self.facteur} {self.unite_cible}{cible}"
+
+    def clean(self):
+        exiger_positif(self.facteur, "facteur", "Le facteur de conversion")
+        if self.unite_source == self.unite_cible:
+            raise ValidationError({"unite_cible": "Les deux unités doivent être différentes."})
+        if ConversionUnite.objects.filter(
+            article_id=self.article_id, unite_source=self.unite_cible, unite_cible=self.unite_source,
+        ).exclude(pk=self.pk).exists():
+            raise ValidationError({"unite_source": "La conversion inverse existe déjà : elle est utilisée dans les deux sens."})
+
+    @staticmethod
+    def facteur_entre(de, vers, article=None):
+        """Facteur f tel que 1 `de` = f `vers` (Decimal), ou None si aucune conversion n'est connue."""
+        from decimal import Decimal
+        if de == vers:
+            return Decimal(1)
+        aretes = {}
+
+        def ajouter(source, cible, facteur):
+            facteur = Decimal(facteur)
+            aretes.setdefault(source, []).append((cible, facteur))
+            aretes.setdefault(cible, []).append((source, Decimal(1) / facteur))
+
+        for (source, cible), facteur in CONVERSIONS_STANDARD.items():
+            ajouter(source, cible, facteur)
+        conversions = ConversionUnite.objects.filter(article__isnull=True)
+        if article is not None and article.pk:
+            conversions = ConversionUnite.objects.filter(models.Q(article__isnull=True) | models.Q(article=article))
+        for conversion in conversions:
+            ajouter(conversion.unite_source, conversion.unite_cible, conversion.facteur)
+        # Parcours en largeur : 1 SAC -> 25 KG -> 25 000 G.
+        vus, file = {de: Decimal(1)}, [de]
+        while file:
+            courant = file.pop(0)
+            for cible, facteur in aretes.get(courant, []):
+                if cible not in vus:
+                    vus[cible] = vus[courant] * facteur
+                    if cible == vers:
+                        return vus[cible]
+                    file.append(cible)
+        return None
+
+    @classmethod
+    def convertir(cls, quantite, de, vers, article=None):
+        """Convertit une quantité ; lève ValidationError si aucune conversion n'est paramétrée."""
+        from decimal import Decimal
+        facteur = cls.facteur_entre(de, vers, article)
+        if facteur is None:
+            nom = f" pour {article.code}" if article is not None else ""
+            raise ValidationError(f"Aucune conversion paramétrée de {de} vers {vers}{nom}.")
+        return Decimal(quantite) * facteur

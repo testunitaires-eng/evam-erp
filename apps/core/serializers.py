@@ -8,7 +8,7 @@ exact, jamais un enregistrement partiel ni une erreur 500.
 from django.core.exceptions import ValidationError as DjangoValidationError
 from rest_framework import serializers
 
-from .models import Notification
+from .models import Notification, ParametreEntreprise
 
 
 def erreur_django_vers_drf(erreur):
@@ -66,3 +66,25 @@ class NotificationSerializer(serializers.ModelSerializer):
         model = Notification
         fields = ["id", "titre", "message", "type_document", "document_id", "reference", "lue", "date"]
         read_only_fields = fields
+
+
+class ParametreEntrepriseSerializer(serializers.ModelSerializer):
+    a_un_logo = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ParametreEntreprise
+        exclude = ["id", "logo", "logo_type"]
+
+    def get_a_un_logo(self, parametre):
+        return bool(parametre.logo)
+
+    def validate(self, attrs):
+        from django.core.exceptions import ValidationError as DjangoValidationError
+        instance = self.instance
+        for champ, valeur in attrs.items():
+            setattr(instance, champ, valeur)
+        try:
+            instance.clean()
+        except DjangoValidationError as erreur:
+            raise erreur_django_vers_drf(erreur)
+        return attrs

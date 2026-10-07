@@ -113,7 +113,7 @@ class ElementCompositionSerializer(serializers.ModelSerializer):
     """
     class Meta:
         model = models.Article
-        fields = ["id", "code", "designation", "type_article", "unite_mesure"]
+        fields = ["id", "code", "designation", "type_article", "unite_mesure", "unite_consommation"]
         read_only_fields = fields
 
 
@@ -142,7 +142,14 @@ class FicheTechniqueSerializer(ValidationModeleMixin, serializers.ModelSerialize
     cout_matieres_par_unite = serializers.SerializerMethodField()
 
     def get_cout_matieres_par_unite(self, fiche):
-        return sum((ligne.montant_par_unite for ligne in fiche.composition.all()), 0)
+        """Coût matières d'UNE unité de stock du produit (unité de référence, rendement et pertes compris)."""
+        from decimal import Decimal
+        from django.core.exceptions import ValidationError as DjangoValidationError
+        try:
+            besoins = fiche.besoins_pour(fiche.article, 1)
+        except DjangoValidationError:
+            return None   # recette en litres sans contenance connue
+        return sum(((besoin * ligne.prix_unitaire).quantize(Decimal("0.01")) for ligne, besoin in besoins), Decimal(0))
 
     class Meta:
         model = models.FicheTechnique
@@ -154,9 +161,24 @@ class FicheTechniqueSerializer(ValidationModeleMixin, serializers.ModelSerialize
 
     def validate_statut(self, valeur):
         actuel = self.instance.statut if self.instance is not None else models.StatutFicheTechnique.BROUILLON
-        if valeur != actuel and valeur == models.StatutFicheTechnique.VALIDEE:
-            raise serializers.ValidationError("Utilisez l'action /valider/ pour valider une fiche technique.")
+        if valeur != actuel and valeur in (models.StatutFicheTechnique.VALIDEE, models.StatutFicheTechnique.EN_TEST):
+            raise serializers.ValidationError("Utilisez les actions /valider/ ou /mettre_en_test/.")
         return valeur
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        formats = attrs.get("formats_associes")
+        if formats is not None:
+            from django.core.exceptions import ValidationError as DjangoValidationError
+            from apps.core.serializers import erreur_django_vers_drf
+            fiche = self.instance or models.FicheTechnique(article=attrs.get("article"))
+            if self.instance is not None and self.instance.statut != models.StatutFicheTechnique.BROUILLON:
+                raise serializers.ValidationError({"formats_associes": "Les formats d'une recette se modifient en brouillon."})
+            try:
+                fiche.verifier_formats(formats)
+            except DjangoValidationError as erreur:
+                raise erreur_django_vers_drf(erreur)
+        return attrs
 
 
 class FicheConditionnementSerializer(ValidationModeleMixin, serializers.ModelSerializer):
@@ -168,4 +190,12 @@ class FicheConditionnementSerializer(ValidationModeleMixin, serializers.ModelSer
 class ControleQualiteRequisSerializer(ValidationModeleMixin, serializers.ModelSerializer):
     class Meta:
         model = models.ControleQualiteRequis
+        fields = "__all__"
+
+
+class ConversionUniteSerializer(ValidationModeleMixin, serializers.ModelSerializer):
+    article_code = serializers.CharField(source="article.code", read_only=True, default=None)
+
+    class Meta:
+        model = models.ConversionUnite
         fields = "__all__"

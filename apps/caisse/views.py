@@ -162,6 +162,14 @@ class EncaissementViewSet(FiltreCaissierMixin, viewsets.ModelViewSet):
     # Un encaissement ne se modifie ni ne se supprime (traçabilité caisse).
     http_method_names = METHODES_CREATION_LECTURE
 
+    @action(detail=True, methods=["get"], url_path="pdf")
+    def pdf(self, request, pk=None):
+        """GET /api/caisse/encaissements/{id}/pdf/ : document PDF à imprimer (?telecharger=1 pour le télécharger)."""
+        from apps.core import documents
+        from apps.core.pdf import telecharger
+        objet = self.get_object()
+        return documents.recu_caisse(objet, request.user).reponse(f"recu-{objet.numero}", telecharger(request))
+
 
 class EcartCaisseViewSet(
     mixins.CreateModelMixin, mixins.RetrieveModelMixin,

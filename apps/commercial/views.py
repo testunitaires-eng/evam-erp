@@ -117,7 +117,13 @@ class FactureViewSet(HistoriqueMixin, viewsets.ModelViewSet):
             return Response({"erreur": str(erreur)}, status=400)
         return Response(self.get_serializer(facture).data)
 
-
+    @action(detail=True, methods=["get"], url_path="pdf")
+    def pdf(self, request, pk=None):
+        """GET /api/commercial/factures/{id}/pdf/ : document PDF à imprimer (?telecharger=1 pour le télécharger)."""
+        from apps.core import documents
+        from apps.core.pdf import telecharger
+        objet = self.get_object()
+        return documents.facture(objet, request.user).reponse(f"facture-{objet.numero}", telecharger(request))
 
 
 class LigneFactureViewSet(viewsets.ReadOnlyModelViewSet):
@@ -163,6 +169,14 @@ class AvoirViewSet(HistoriqueMixin, viewsets.ModelViewSet):
         except ValueError as erreur:
             return Response({"erreur": str(erreur)}, status=400)
         return Response(self.get_serializer(avoir).data)
+
+    @action(detail=True, methods=["get"], url_path="pdf")
+    def pdf(self, request, pk=None):
+        """GET /api/commercial/avoirs/{id}/pdf/ : document PDF à imprimer (?telecharger=1 pour le télécharger)."""
+        from apps.core import documents
+        from apps.core.pdf import telecharger
+        objet = self.get_object()
+        return documents.avoir(objet, request.user).reponse(f"avoir-{objet.numero}", telecharger(request))
 
 
 @api_view(["GET"])

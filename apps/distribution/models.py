@@ -62,6 +62,8 @@ class Tournee(ValidationAvantEnregistrement, models.Model):
     chauffeur = models.ForeignKey(Chauffeur, verbose_name="Chauffeur", on_delete=models.PROTECT)
     vehicule = models.ForeignKey(Vehicule, verbose_name="Véhicule", on_delete=models.PROTECT)
     date_tournee = models.DateField("Date de la tournée")
+    kilometrage_depart = models.PositiveIntegerField("Compteur au départ (km)", null=True, blank=True)
+    kilometrage_retour = models.PositiveIntegerField("Compteur au retour (km)", null=True, blank=True)
 
     class Meta:
         verbose_name = "Tournée"
@@ -80,6 +82,17 @@ class Tournee(ValidationAvantEnregistrement, models.Model):
             raise ValidationError({"vehicule": f"Le véhicule {self.vehicule.immatriculation} est inactif."})
         if self.chauffeur_id and not self.chauffeur.utilisateur.is_active:
             raise ValidationError({"chauffeur": "Le compte de ce chauffeur est désactivé."})
+        if self.kilometrage_depart is not None and self.kilometrage_retour is not None \
+                and self.kilometrage_retour < self.kilometrage_depart:
+            raise ValidationError({"kilometrage_retour": "Le compteur au retour ne peut pas être inférieur au départ."})
+
+    @property
+    def kilometres(self):
+        """Distance relevée (clé « km » du coût de distribution) ; None si non relevée."""
+        from decimal import Decimal
+        if self.kilometrage_depart is None or self.kilometrage_retour is None:
+            return None
+        return Decimal(self.kilometrage_retour - self.kilometrage_depart)
 
 
 class StatutPreparation(models.TextChoices):
@@ -110,6 +123,10 @@ class PreparationLivraison(ValidationAvantEnregistrement, models.Model):
         Utilisateur, verbose_name="Préparée par (Magasinier)",
         on_delete=models.PROTECT, related_name="preparations_faites",
         null=True, blank=True,
+    )
+    depot = models.ForeignKey(
+        "stocks.Depot", verbose_name="Lieu de sortie", on_delete=models.PROTECT, null=True, blank=True,
+        related_name="preparations", help_text="Stock usine ou dépôt extérieur. Vide = « Dépôt produits finis ».",
     )
     date_lancement = models.DateTimeField("Date de lancement", auto_now_add=True)
     date_confirmation_sortie = models.DateTimeField("Date de sortie magasin", null=True, blank=True)
@@ -144,6 +161,8 @@ class PreparationLivraison(ValidationAvantEnregistrement, models.Model):
         )
         if self.pk and valeur_en_base(self, "commande") != self.commande_id:
             raise ValidationError({"commande": "La commande d'une préparation ne peut pas être changée."})
+        if self.depot_id and self.depot.type_lieu not in ("STOCK_USINE", "DEPOT_EXTERIEUR"):
+            raise ValidationError({"depot": "On livre depuis un stock usine ou un dépôt extérieur."})
         if ancien_statut is None and self.commande_id:
             commande = self.commande
             if commande.statut not in (StatutCommande.VALIDEE, StatutCommande.EN_PREPARATION):
@@ -178,7 +197,7 @@ class PreparationLivraison(ValidationAvantEnregistrement, models.Model):
         self.statut = StatutPreparation.SORTIE_MAGASIN
         self.date_confirmation_sortie = timezone.now()
         self.save()
-        depot_pf = depot_par_defaut("Dépôt produits finis")
+        depot_pf = self.depot or depot_par_defaut("Dépôt produits finis")
         for ligne in self.commande.lignes.all():
             MouvementStock.objects.create(
                 article=ligne.article,

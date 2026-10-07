@@ -47,6 +47,7 @@ INSTALLED_APPS = [
     "apps.reporting",
     "apps.reclamations",
     "apps.comptes",        # Module 12 - Utilisateurs, profils, droits
+    "apps.industriel",     # Socle : activités, usines, lignes, postes, machines, circuits
     "apps.referentiel",    # Module 2  - Articles, fiches techniques, conditionnement
     "apps.achats",         # Module 3  - Fournisseurs, besoins, commandes fournisseurs
     "apps.stocks",         # Module 4  - Mouvements, dépôts, inventaires
@@ -136,6 +137,11 @@ USE_TZ = True
 
 STATIC_URL = "static/"
 STATIC_ROOT = os.path.join(BASE_DIR, 'staticfiles')
+
+# Pièces jointes (photos, bulletins d'analyse du module qualité). Sur Railway,
+# monter un volume sur MEDIA_ROOT (le disque du conteneur n'est pas persistant).
+MEDIA_URL = "media/"
+MEDIA_ROOT = os.environ.get("MEDIA_ROOT", os.path.join(BASE_DIR, "media"))
 
 # Optionnel mais recommandé : Utiliser le stockage compressé et mis en cache de Whitenoise
 STORAGES = {

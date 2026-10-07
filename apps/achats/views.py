@@ -307,6 +307,14 @@ class CommandeFournisseurViewSet(HistoriqueMixin, viewsets.ModelViewSet):
             return Response({"erreur": str(erreur)}, status=400)
         return Response(self.get_serializer(commande).data)
 
+    @action(detail=True, methods=["get"], url_path="pdf")
+    def pdf(self, request, pk=None):
+        """GET /api/achats/commandes/{id}/pdf/ : document PDF à imprimer (?telecharger=1 pour le télécharger)."""
+        from apps.core import documents
+        from apps.core.pdf import telecharger
+        objet = self.get_object()
+        return documents.commande_fournisseur(objet, request.user).reponse(f"bon-commande-{objet.numero}", telecharger(request))
+
 
 # class LigneCommandeFournisseurViewSet(viewsets.ModelViewSet):
 #     queryset = models.LigneCommandeFournisseur.objects.all()

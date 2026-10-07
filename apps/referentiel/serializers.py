@@ -117,7 +117,24 @@ class ElementCompositionSerializer(serializers.ModelSerializer):
         read_only_fields = fields
 
 
-class CompositionFicheTechniqueSerializer(ValidationModeleMixin, serializers.ModelSerializer):
+class SansPrixPourQualiteMixin:
+    """
+    Le Responsable Qualité lit les recettes (plan de contrôle par recette)
+    mais pas leur chiffrage : prix et coûts sont retirés de sa réponse.
+    """
+    CHAMPS_FINANCIERS = ("prix_unitaire", "montant_par_unite", "cout_matieres_par_unite")
+
+    def to_representation(self, instance):
+        donnees = super().to_representation(instance)
+        requete = self.context.get("request")
+        utilisateur = getattr(requete, "user", None)
+        if utilisateur is not None and getattr(utilisateur, "profil", None) == "RESPONSABLE_QUALITE" and not utilisateur.is_superuser:
+            for champ in self.CHAMPS_FINANCIERS:
+                donnees.pop(champ, None)
+        return donnees
+
+
+class CompositionFicheTechniqueSerializer(SansPrixPourQualiteMixin, ValidationModeleMixin, serializers.ModelSerializer):
     """
     On choisit l'élément (`matiere` = id d'un article existant) et on
     indique sa quantité par unité produite. Code, désignation, type et
@@ -136,7 +153,7 @@ class CompositionFicheTechniqueSerializer(ValidationModeleMixin, serializers.Mod
         extra_kwargs = {"prix_unitaire": {"required": True}}
 
 
-class FicheTechniqueSerializer(ValidationModeleMixin, serializers.ModelSerializer):
+class FicheTechniqueSerializer(SansPrixPourQualiteMixin, ValidationModeleMixin, serializers.ModelSerializer):
     composition = CompositionFicheTechniqueSerializer(many=True, read_only=True)
     # Coût des matières pour UNE unité du produit (somme des éléments).
     cout_matieres_par_unite = serializers.SerializerMethodField()

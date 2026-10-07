@@ -41,7 +41,7 @@ class ReclamationClientViewSet(HistoriqueMixin, viewsets.ModelViewSet):
 
 
 class RetourPhysiqueViewSet(HistoriqueMixin, viewsets.ModelViewSet):
-    queryset = models.RetourPhysique.objects.all()
+    queryset = models.RetourPhysique.objects.select_related("reclamation__client", "reclamation__article", "lot")
     serializer_class = serializers.RetourPhysiqueSerializer
     permission_classes = [role_required(*PROFILS_STOCK_QUALITE)]
     filterset_fields = ["reclamation", "statut"]
@@ -52,9 +52,23 @@ class RetourPhysiqueViewSet(HistoriqueMixin, viewsets.ModelViewSet):
     def perform_create(self, serializer):
         serializer.save(receptionne_par=self.request.user)
 
+    @action(detail=False, methods=["get"])
+    def reclamations_a_receptionner(self, request):
+        """
+        GET /api/reclamations/retours-physiques/reclamations_a_receptionner/
+        Réclamations non clôturées sans retour enregistré : la liste de choix
+        du Magasinier à la réception (il ne lit pas les réclamations).
+        """
+        reclamations = models.ReclamationClient.objects.filter(
+            retour_physique__isnull=True,
+        ).exclude(statut=models.StatutReclamation.CLOTUREE).select_related(
+            "client", "article", "bon_livraison",
+        ).order_by("date_creation")
+        return Response(serializers.ReclamationAReceptionnerSerializer(reclamations, many=True).data)
+
 
 class ControleRetourViewSet(viewsets.ModelViewSet):
-    queryset = models.ControleRetour.objects.all()
+    queryset = models.ControleRetour.objects.select_related("retour_physique__reclamation__client", "retour_physique__reclamation__article")
     serializer_class = serializers.ControleRetourSerializer
     permission_classes = [role_required(*PROFILS_STOCK_QUALITE)]
     filterset_fields = ["retour_physique", "resultat"]

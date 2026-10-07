@@ -67,6 +67,13 @@ class CoutEnergie(ValidationAvantEnregistrement, models.Model):
         # un format différent rendrait la charge invisible dans les calculs.
         if not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", self.periode or ""):
             raise ValidationError({"periode": "La période doit être au format AAAA-MM (ex : 2026-09)."})
+        # Ancienne saisie (obsolète) : ignorée par CoutReel.calculer dès que la
+        # cascade a une charge sur la période. On refuse plutôt que de l'ignorer.
+        if Charge.objects.filter(periode=self.periode).exists():
+            raise ValidationError({"periode": (
+                f"La période {self.periode} est gérée par les coûts en cascade : "
+                "saisissez l'énergie comme une charge de la cascade."
+            )})
 
 
 class CoutMainOeuvre(ValidationAvantEnregistrement, models.Model):

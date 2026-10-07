@@ -1326,3 +1326,120 @@ class ChiffrageMatieresTests(BaseValidation):
         self.assertNotIn("montant", besoin)
         self.assertNotIn("prix_unitaire", besoin)
         self.assertNotIn("montant_total_matieres", api.get(f"/api/production/ordres-fabrication/{of_id}/").data)
+
+
+class CoherenceRolesTests(BaseValidation):
+    """Problème.md : chaque profil reçoit les noms et les données de son travail, sans plus."""
+
+    def client_pour(self, profil):
+        utilisateur = Utilisateur.objects.create_user(profil.lower(), password="x", profil=profil)
+        api = APIClient()
+        api.force_authenticate(utilisateur)
+        return utilisateur, api
+
+    def test_magasinier_voit_quoi_preparer(self):
+        """1.4 / B-1 : la préparation porte la commande, le client et les articles, sans prix."""
+        _, magasinier = self.client_pour(Profil.MAGASINIER)
+        preparation = PreparationLivraison.objects.create(commande=self.commande(lignes=((10, 100), (5, 100)), statut="VALIDEE"), lancee_par=self.admin)
+        self.assertEqual(magasinier.get("/api/commercial/commandes/").status_code, 403)
+        donnees = magasinier.get(f"/api/distribution/preparations/{preparation.id}/").data
+        self.assertEqual((donnees["commande_numero"], donnees["client_nom"]), (preparation.commande.numero, "Client test"))
+        self.assertEqual([(l["code"], l["quantite"]) for l in donnees["lignes"]], [("EAU70P8", Decimal("10")), ("EAU70P8", Decimal("5"))])
+        self.assertNotIn("prix_unitaire", donnees["lignes"][0])
+
+    def test_agent_voit_le_produit_de_ses_of(self):
+        """2.3 / B-2 : l'OF et ses besoins portent les noms d'articles (l'agent ne lit pas les articles)."""
+        agent, api = self.client_pour(Profil.AGENT_PRODUCTION)
+        of = OrdreFabrication.objects.create(article=self.produit, quantite_a_produire=10, responsable=self.admin)
+        of.affecter_agents([agent], par=self.admin)
+        self.assertEqual(api.get("/api/referentiel/articles/").status_code, 403)
+        donnees = api.get(f"/api/production/ordres-fabrication/{of.id}/").data
+        self.assertEqual(donnees["article_code"], "EAU70P8")
+        besoin = api.get(f"/api/production/besoins-matieres/?ordre_fabrication={of.id}").data["results"][0]
+        self.assertEqual((besoin["matiere_code"], besoin["of_numero"]), ("MP1", of.numero))
+
+    def test_qualite_voit_le_fournisseur_du_lot_matiere(self):
+        """2.4 / B-3."""
+        from datetime import date
+        from apps.stocks.models import LotMatiere
+        _, qualite = self.client_pour(Profil.RESPONSABLE_QUALITE)
+        self.entree_stock(self.matiere, 10)
+        fournisseur = Fournisseur.objects.create(nom="Sucrerie du Sud")
+        lot = LotMatiere.objects.create(article=self.matiere, depot=depot_par_defaut("Magasin principal"), fournisseur=fournisseur,
+                                        date_reception=date.today(), quantite_initiale=5)
+        self.assertEqual(qualite.get("/api/achats/fournisseurs/").status_code, 403)
+        self.assertEqual(qualite.get(f"/api/stocks/lots-matieres/{lot.id}/").data["fournisseur_nom"], "Sucrerie du Sud")
+
+    def test_magasinier_lit_les_lots_mais_pas_le_rappel(self):
+        """2.5 / B-4 : lots lisibles pour un transfert ; le rappel (contacts clients) reste fermé."""
+        from datetime import date
+        _, magasinier = self.client_pour(Profil.MAGASINIER)
+        of = OrdreFabrication.objects.create(article=self.produit, quantite_a_produire=10, responsable=self.admin)
+        lot = Lot.objects.create(article=self.produit, ordre_fabrication=of, quantite=10, date_production=date.today())
+        self.assertEqual(magasinier.get(f"/api/qualite/lots/{lot.id}/").data["article_code"], "EAU70P8")
+        self.assertEqual(magasinier.get(f"/api/qualite/lots/{lot.id}/rappel/").status_code, 403)
+        self.assertEqual(magasinier.post(f"/api/qualite/lots/{lot.id}/liberer/").status_code, 403)
+
+    def test_retours_sans_lire_les_reclamations(self):
+        """1.3 / B-5 : réclamations à réceptionner (vue réduite) et retours portant numéro et client."""
+        from apps.reclamations.models import ReclamationClient
+        _, magasinier = self.client_pour(Profil.MAGASINIER)
+        reclamation = ReclamationClient.objects.create(
+            client=self.client_evam, article=self.produit, quantite=2, prix_unitaire=100,
+            type_probleme="PRODUIT_DEFECTUEUX", description="Bouteilles fuyantes", cree_par=self.admin,
+        )
+        self.assertEqual(magasinier.get("/api/reclamations/reclamations/").status_code, 403)
+        a_receptionner = magasinier.get("/api/reclamations/retours-physiques/reclamations_a_receptionner/").data
+        self.assertEqual([(r["numero"], r["client_nom"], r["article_code"]) for r in a_receptionner],
+                         [(reclamation.numero, "Client test", "EAU70P8")])
+        self.assertNotIn("prix_unitaire", a_receptionner[0])
+        r = magasinier.post("/api/reclamations/retours-physiques/", {"reclamation": reclamation.id, "quantite_retournee": "2"}, format="json")
+        self.assertEqual((r.status_code, r.data.get("reclamation_numero"), r.data.get("client_nom")), (201, reclamation.numero, "Client test"), r.content)
+        self.assertEqual(magasinier.get("/api/reclamations/retours-physiques/reclamations_a_receptionner/").data, [])
+
+    def test_qualite_lit_les_recettes_sans_les_prix(self):
+        """1.5 / B-6."""
+        _, qualite = self.client_pour(Profil.RESPONSABLE_QUALITE)
+        fiche = self.produit.fiche_technique_validee
+        donnees = qualite.get(f"/api/referentiel/fiches-techniques/{fiche.id}/").data
+        self.assertNotIn("cout_matieres_par_unite", donnees)
+        self.assertEqual(donnees["composition"][0]["matiere_code"], "MP1")
+        self.assertNotIn("prix_unitaire", donnees["composition"][0])
+        self.assertNotIn("prix_unitaire", qualite.get("/api/referentiel/compositions/").data["results"][0])
+        self.assertEqual(qualite.get(f"/api/referentiel/fiches-techniques/{fiche.id}/simuler_besoins/?quantite=1").status_code, 403)
+        self.assertEqual(qualite.patch(f"/api/referentiel/fiches-techniques/{fiche.id}/", {"commentaire": "x"}, format="json").status_code, 403)
+        self.assertIn("cout_matieres_par_unite", self.api.get(f"/api/referentiel/fiches-techniques/{fiche.id}/").data)
+
+    def test_seul_le_caissier_demande_un_decaissement(self):
+        """3.2 : la DAF autorise mais ne demande pas ; elle garde la lecture."""
+        session, _ = self.ouvrir_caisse()
+        _, daf = self.client_pour(Profil.COMPTABILITE_DAF)
+        self.assertEqual(daf.post("/api/caisse/decaissements/", {"session_caisse": session.id, "montant": "10", "motif": "x"}, format="json").status_code, 403)
+        self.assertEqual(daf.get("/api/caisse/decaissements/a_autoriser/").status_code, 200)
+
+    def test_anciens_mecanismes_obsoletes(self):
+        """5.2 / 5.3 / B-8."""
+        from apps.couts.models import Charge, NatureCout
+        _, qualite = self.client_pour(Profil.RESPONSABLE_QUALITE)
+        self.assertEqual(qualite.get("/api/referentiel/controles-qualite-requis/").status_code, 200)
+        self.assertEqual(qualite.post("/api/referentiel/controles-qualite-requis/", {"article": self.produit.id}, format="json").status_code, 403)
+
+        _, daf = self.client_pour(Profil.COMPTABILITE_DAF)
+        energie = {"type_energie": "ELECTRICITE", "periode": "2026-09", "montant": "100"}
+        Charge.objects.create(nature=NatureCout.objects.get(libelle="Électricité des pompes de forage"), periode="2026-09", montant=500)
+        self.assertIn("cascade", str(self.assert_refus(daf.post("/api/couts/couts-energie/", energie, format="json")).data))
+        self.assertEqual(daf.post("/api/couts/couts-energie/", {**energie, "periode": "2026-08"}, format="json").status_code, 201)
+
+    def test_besoins_page_2_calcules_sur_leurs_propres_lignes(self):
+        """Stock disponible / manquant calculés pour les lignes de la page renvoyée, pas pour le début de la liste."""
+        from apps.production.models import BesoinMatierePrevu
+        for _ in range(25):   # 25 besoins de MP1 (stock nul) : la page 1
+            OrdreFabrication.objects.create(article=self.produit, quantite_a_produire=1, responsable=self.admin)
+        mp2 = Article.objects.create(code="MP2", type_article="MATIERE_PREMIERE", unite_mesure="KG")
+        self.entree_stock(mp2, 7)
+        of = OrdreFabrication.objects.first()
+        BesoinMatierePrevu.objects.create(ordre_fabrication=of, matiere=mp2, quantite_theorique=3, prix_unitaire=0)
+        page_2 = self.api.get("/api/production/besoins-matieres/?page=2").data
+        self.assertEqual(page_2["count"], 26)
+        ligne = page_2["results"][0]
+        self.assertEqual((ligne["matiere_code"], ligne["stock_disponible"], ligne["manquant"], ligne["situation"]), ("MP2", 7, 0, "Disponible"))

@@ -340,6 +340,7 @@ class Inducteur(models.TextChoices):
     HEURES_MO = "HEURES_MO", "Heures de main-d'œuvre"
     KWH = "KWH", "kWh"
     ANALYSES_PONDEREES = "ANALYSES_PONDEREES", "Analyses pondérées"
+    TEMPS_CHANGEMENT_SERIE = "TEMPS_CHANGEMENT_SERIE", "Temps de changement de série (min)"
     PALETTES_JOURS = "PALETTES_JOURS", "Palettes-jours (stockage)"
     KM = "KM", "Kilomètres (tournées)"
     QUANTITE_LIVREE = "QUANTITE_LIVREE", "Quantité livrée"
@@ -350,6 +351,7 @@ UNITES_INDUCTEURS = {
     Inducteur.VOLUME_EAU_M3: "m³", Inducteur.BOUTEILLES: "unités", Inducteur.PACKS: "packs",
     Inducteur.PALETTES: "palettes", Inducteur.LITRES_PRODUITS: "L", Inducteur.HEURES_MACHINE: "h",
     Inducteur.HEURES_MO: "h", Inducteur.KWH: "kWh", Inducteur.ANALYSES_PONDEREES: "analyses pondérées",
+    Inducteur.TEMPS_CHANGEMENT_SERIE: "min",
     Inducteur.PALETTES_JOURS: "palettes-jours", Inducteur.KM: "km", Inducteur.QUANTITE_LIVREE: "unités livrées",
     Inducteur.AUCUN: "",
 }
@@ -393,7 +395,7 @@ class NatureCout(ValidationAvantEnregistrement, models.Model):
     categorie = models.CharField("Catégorie", max_length=15, choices=CategorieCout.choices, default=CategorieCout.PRODUCTION)
     categorie_economique = models.CharField("Catégorie économique", max_length=20, choices=CategorieEconomique.choices, default=CategorieEconomique.AUTRE)
     traitement = models.CharField("Traitement", max_length=10, choices=Traitement.choices, default=Traitement.INDIRECT)
-    inducteur = models.CharField("Clé / inducteur", max_length=20, choices=Inducteur.choices)
+    inducteur = models.CharField("Clé / inducteur", max_length=30, choices=Inducteur.choices)
     justification = models.TextField("Justification de la clé", blank=True)
     date_debut = models.DateField("Valide à partir du", null=True, blank=True)
     date_fin = models.DateField("Valide jusqu'au", null=True, blank=True)
@@ -533,7 +535,7 @@ class RepartitionCout(models.Model):
     ordre_fabrication = models.ForeignKey(OrdreFabrication, verbose_name="OF", on_delete=models.CASCADE, null=True, blank=True, related_name="repartitions_couts")
     article = models.ForeignKey(Article, verbose_name="Produit / format", on_delete=models.PROTECT, null=True, blank=True, related_name="+")
     etape = models.ForeignKey("industriel.EtapeStandard", verbose_name="Étape", on_delete=models.PROTECT, null=True, blank=True, related_name="+")
-    inducteur = models.CharField("Clé", max_length=20, choices=Inducteur.choices)
+    inducteur = models.CharField("Clé", max_length=30, choices=Inducteur.choices)
     unite_cle = models.CharField("Unité de la clé", max_length=30, blank=True)
     valeur_cle_totale = models.DecimalField("Valeur totale de la clé", max_digits=18, decimal_places=4, null=True, blank=True)
     valeur_cle_part = models.DecimalField("Valeur de la clé pour ce niveau", max_digits=18, decimal_places=4, null=True, blank=True)

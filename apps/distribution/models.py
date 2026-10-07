@@ -197,8 +197,15 @@ class PreparationLivraison(ValidationAvantEnregistrement, models.Model):
         self.statut = StatutPreparation.SORTIE_MAGASIN
         self.date_confirmation_sortie = timezone.now()
         self.save()
+        from apps.stocks.models import StockArticle, sortir_lots
         depot_pf = self.depot or depot_par_defaut("Dépôt produits finis")
         for ligne in self.commande.lignes.all():
+            stock = StockArticle.objects.filter(article=ligne.article, depot=depot_pf).first()
+            if stock is not None and stock.quantite_disponible >= ligne.quantite:
+                # Lots livrés : les plus proches de leur DLC d'abord ; le lien
+                # lot -> ligne de commande -> client sert au rappel de lot.
+                sortir_lots(ligne.article, depot_pf, ligne.quantite, f"Vente - commande {self.commande.numero}",
+                            self.commande.numero, ligne_commande=ligne)
             MouvementStock.objects.create(
                 article=ligne.article,
                 depot=depot_pf,

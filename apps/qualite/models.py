@@ -262,19 +262,29 @@ class Lot(ValidationAvantEnregistrement, models.Model):
             raise ValueError("Ce lot est déjà bloqué.")
         if self.statut == StatutLot.LIBERE:
             from apps.stocks.models import StockArticle
-            stock = StockArticle.objects.select_for_update().filter(
-                article=self.article, depot=self.lieu_stock,
-            ).first()
-            if stock is None or stock.quantite_disponible < self.quantite:
-                disponible = stock.quantite_disponible if stock else 0
-                raise ValueError(
-                    f"Impossible de bloquer le lot {self.numero_lot} : il n'en reste que {disponible} "
-                    f"disponible(s) en stock produits finis sur {self.quantite} (le reste a déjà été vendu/sorti)."
-                )
-            stock.quantite_bloquee += self.quantite
-            stock.save()
+            # Le lot est bloqué là où il se trouve encore (stock usine, dépôts) ;
+            # ce qui est déjà vendu est retrouvé par la traçabilité (rappel).
+            restes = self.stock_par_lieu() if self.mouvements_lot.exists() else {self.lieu_stock: self.quantite}
+            for depot, quantite in restes.items():
+                stock = StockArticle.objects.select_for_update().filter(article=self.article, depot=depot).first()
+                if stock is None or stock.quantite_disponible < quantite:
+                    disponible = stock.quantite_disponible if stock else 0
+                    raise ValueError(
+                        f"Impossible de bloquer le lot {self.numero_lot} : il n'en reste que {disponible} "
+                        f"disponible(s) au « {depot.nom} » sur {quantite}."
+                    )
+                stock.quantite_bloquee += quantite
+                stock.save()
         self.statut = StatutLot.BLOQUE
         self.save()
+
+    def stock_par_lieu(self):
+        """{lieu: quantité restante du lot} (lots suivis depuis leur libération)."""
+        from django.db.models import Sum
+        from apps.stocks.models import Depot
+        soldes = self.mouvements_lot.values("depot").annotate(solde=Sum("quantite")).filter(solde__gt=0)
+        depots = Depot.objects.in_bulk([ligne["depot"] for ligne in soldes])
+        return {depots[ligne["depot"]]: ligne["solde"] for ligne in soldes}
 
     @transaction.atomic
     def liberer(self, utilisateur):
@@ -316,6 +326,11 @@ class Lot(ValidationAvantEnregistrement, models.Model):
             motif=f"Libération qualité du lot {self.numero_lot}",
             document_origine=self.numero_lot,
             utilisateur=utilisateur,
+        )
+        from apps.stocks.models import MouvementLot
+        MouvementLot.objects.create(
+            lot=self, depot=self.lieu_stock, quantite=self.quantite,
+            motif="Libération qualité", document_origine=self.numero_lot,
         )
 
 
@@ -501,7 +516,11 @@ class Declencheur(models.TextChoices):
     CHAQUE_OF = "CHAQUE_OF", "Une fois par OF"
     CHAQUE_LOT = "CHAQUE_LOT", "À chaque lot de produit fini"
     PERIODIQUE = "PERIODIQUE", "Toutes les X minutes pendant la production"
+    PAR_QUANTITE = "PAR_QUANTITE", "Toutes les X unités / litres produits (ou m³ traités)"
+    CHAQUE_CUVE = "CHAQUE_CUVE", "À chaque cuve préparée"
     CHANGEMENT_SERIE = "CHANGEMENT_SERIE", "Après chaque changement de série"
+    APRES_NETTOYAGE = "APRES_NETTOYAGE", "Après nettoyage / désinfection"
+    APRES_ARRET = "APRES_ARRET", "Après arrêt / redémarrage"
     PONCTUEL = "PONCTUEL", "Ponctuel (à la demande)"
 
 
@@ -551,6 +570,11 @@ class PointControle(ValidationAvantEnregistrement, models.Model):
     # Quand
     declencheur = models.CharField("Fréquence / déclenchement", max_length=20, choices=Declencheur.choices)
     frequence_minutes = models.PositiveIntegerField("Toutes les (minutes)", null=True, blank=True)
+    frequence_quantite = models.DecimalField(
+        "Toutes les (quantité)", max_digits=14, decimal_places=3, null=True, blank=True,
+        help_text="Contrôle « par quantité » : quantité produite à l'étape du contrôle (unités, litres ou m³ "
+                  "selon la saisie de l'étape), ex : tous les 5 000 bouteilles, tous les 10 m³.",
+    )
     # Comment
     type_echantillon = models.CharField("Type d'échantillon", max_length=100, blank=True)
     quantite_echantillon = models.CharField("Quantité d'échantillon", max_length=50, blank=True)
@@ -589,6 +613,8 @@ class PointControle(ValidationAvantEnregistrement, models.Model):
         from apps.core.validation import exiger_ordre_dates
         if self.declencheur == Declencheur.PERIODIQUE and not self.frequence_minutes:
             raise ValidationError({"frequence_minutes": "Indiquez la fréquence (en minutes) d'un contrôle périodique."})
+        if self.declencheur == Declencheur.PAR_QUANTITE and not (self.frequence_quantite and self.frequence_quantite > 0):
+            raise ValidationError({"frequence_quantite": "Indiquez la quantité entre deux contrôles (ex : 5 000)."})
         if self.declencheur == Declencheur.RECEPTION:
             if not self.article_id:
                 raise ValidationError({"article": "Un contrôle de réception porte sur un article (matière, emballage...)."})
@@ -1031,11 +1057,23 @@ class NonConformite(ValidationAvantEnregistrement, models.Model):
         return self
 
 
+TYPES_PIECES_JOINTES = {"image/png", "image/jpeg", "image/webp", "application/pdf"}
+TAILLE_MAX_PIECE_JOINTE = 10 * 1024 * 1024
+
+
 class PieceJointeQualite(models.Model):
-    """Photos, bulletins d'analyse, documents fournisseur joints à un contrôle ou à une NC."""
+    """
+    Photos, bulletins d'analyse, documents fournisseur joints à un contrôle
+    ou à une NC. Le fichier est conservé EN BASE (comme le logo) : il
+    survit aux redéploiements Railway sans volume, et il n'est servi que
+    par l'API, avec les droits d'accès du module qualité.
+    """
     resultat = models.ForeignKey(ResultatControle, verbose_name="Contrôle", on_delete=models.PROTECT, null=True, blank=True, related_name="pieces_jointes")
     non_conformite = models.ForeignKey(NonConformite, verbose_name="Non-conformité", on_delete=models.PROTECT, null=True, blank=True, related_name="pieces_jointes")
-    fichier = models.FileField("Fichier", upload_to="qualite/%Y/%m")
+    nom_fichier = models.CharField("Nom du fichier", max_length=200)
+    type_contenu = models.CharField("Type", max_length=60)
+    taille = models.PositiveIntegerField("Taille (octets)", default=0)
+    contenu = models.BinaryField("Contenu", editable=False)
     description = models.CharField("Description", max_length=200, blank=True)
     ajoute_par = models.ForeignKey(Utilisateur, verbose_name="Ajouté par", on_delete=models.PROTECT, null=True, blank=True, related_name="+")
     date_ajout = models.DateTimeField("Ajouté le", auto_now_add=True)
@@ -1075,7 +1113,7 @@ def points_applicables(of, declencheurs):
     return points
 
 
-def generer_controles(of, declencheurs, lot=None):
+def generer_controles(of, declencheurs, lot=None, equipement=None):
     """
     Génère les contrôles à réaliser selon le plan (schéma qualité, étape 3) :
     au démarrage de l'OF (DEMARRAGE, CHAQUE_OF, premier PERIODIQUE), à
@@ -1088,10 +1126,31 @@ def generer_controles(of, declencheurs, lot=None):
         if point.declencheur in (Declencheur.DEMARRAGE, Declencheur.CHAQUE_OF, Declencheur.PERIODIQUE) and \
                 ResultatControle.objects.filter(point=point, ordre_fabrication=of, est_reprise=False).exclude(statut=StatutResultat.ANNULE).exists():
             continue
+        if equipement is not None and point.equipement_id and point.equipement_id != equipement.pk:
+            continue   # contrôle propre à une autre cuve / machine
         crees.append(ResultatControle.objects.create(
             point=point, ordre_fabrication=of, lot=lot if point.declencheur == Declencheur.CHAQUE_LOT else None,
-            date_prevue=timezone.now(),
+            equipement=equipement or point.equipement, date_prevue=timezone.now(),
         ))
+    return crees
+
+
+def generer_controles_par_quantite(of, avant, apres):
+    """
+    Contrôles « toutes les X unités / litres / m³ » : `avant` et `apres`
+    donnent la quantité produite cumulée par étape ({code: quantité})
+    avant et après une saisie ; un contrôle est créé à chaque seuil franchi.
+    """
+    import math
+    from django.utils import timezone
+    crees = []
+    for point in points_applicables(of, (Declencheur.PAR_QUANTITE,)):
+        code = point.etape.code if point.etape_id else None
+        cumul_avant = avant.get(code, 0) if code else max(avant.values(), default=0)
+        cumul_apres = apres.get(code, 0) if code else max(apres.values(), default=0)
+        franchis = math.floor(cumul_apres / point.frequence_quantite) - math.floor(cumul_avant / point.frequence_quantite)
+        for _ in range(max(franchis, 0)):
+            crees.append(ResultatControle.objects.create(point=point, ordre_fabrication=of, date_prevue=timezone.now()))
     return crees
 
 

@@ -326,6 +326,7 @@ class LotMatiereViewSet(viewsets.ModelViewSet):
     def tracabilite(self, request, pk=None):
         """GET .../lots-matieres/{id}/tracabilite/ : traçabilité AVAL (OF -> lots de produits finis), ex. pour un rappel."""
         from apps.production.models import ConsommationLotMatiere
+        from apps.qualite.views import clients_du_lot
         lot = self.get_object()
         consommations = ConsommationLotMatiere.objects.filter(lot=lot).select_related("sortie__ordre_fabrication__article")
         ofs = {}
@@ -334,7 +335,8 @@ class LotMatiereViewSet(viewsets.ModelViewSet):
             ligne = ofs.setdefault(of.pk, {
                 "of": of.numero, "article": of.article.code, "statut": of.get_statut_display(), "quantite_consommee": 0,
                 "lots_produits_finis": [
-                    {"lot": l.numero_lot, "quantite": l.quantite, "statut": l.get_statut_display()} for l in of.lots.all()
+                    {"lot": l.numero_lot, "quantite": l.quantite, "statut": l.get_statut_display(),
+                     "clients": clients_du_lot(l)} for l in of.lots.all()
                 ],
             })
             ligne["quantite_consommee"] += consommation.quantite_nette
@@ -349,3 +351,75 @@ class LotMatiereViewSet(viewsets.ModelViewSet):
                 for r in lot.resultats_controles.select_related("point")
             ],
         })
+
+
+class EmplacementViewSet(viewsets.ModelViewSet):
+    """Emplacements de stockage (allée, rack, niveau) d'un lieu."""
+    queryset = models.Emplacement.objects.select_related("depot")
+    serializer_class = serializers.EmplacementSerializer
+    permission_classes = [acces(
+        lecture=(Profil.DIRECTION, Profil.RESPONSABLE_DISTRIBUTION, Profil.RESPONSABLE_PRODUCTION, Profil.RESPONSABLE_QUALITE,),
+        ecriture=(Profil.MAGASINIER, Profil.ADMIN_SI,),
+    )]
+    filterset_fields = ["depot", "actif"]
+    search_fields = ["code", "designation"]
+
+
+class PaletteViewSet(viewsets.ModelViewSet):
+    """Palettes identifiées : rangement dans un emplacement, expédition, étiquette."""
+    queryset = models.Palette.objects.select_related("lot__article", "depot", "emplacement")
+    serializer_class = serializers.PaletteSerializer
+    permission_classes = [acces(
+        lecture=(Profil.DIRECTION, Profil.RESPONSABLE_DISTRIBUTION, Profil.RESPONSABLE_PRODUCTION, Profil.RESPONSABLE_QUALITE, Profil.COMMERCIAL,),
+        ecriture=(Profil.MAGASINIER, Profil.ADMIN_SI,),
+    )]
+    filterset_fields = ["lot", "depot", "emplacement", "statut", "lot__article"]
+    search_fields = ["numero", "lot__numero_lot"]
+    http_method_names = ["get", "post", "head", "options"]
+
+    def create(self, request, *args, **kwargs):
+        return Response({"erreur": "Les palettes se constituent depuis le lot : POST /api/qualite/lots/{id}/palettiser/."}, status=405)
+
+    @action(detail=True, methods=["post"])
+    def deplacer(self, request, pk=None):
+        """POST .../palettes/{id}/deplacer/ {"emplacement": <id> ou null}"""
+        palette = self.get_object()
+        if palette.statut != models.StatutPalette.EN_STOCK:
+            return Response({"erreur": f"La palette {palette.numero} n'est pas en stock."}, status=400)
+        identifiant = request.data.get("emplacement")
+        emplacement = models.Emplacement.objects.filter(pk=identifiant).first() if identifiant else None
+        if identifiant and emplacement is None:
+            return Response({"erreur": "Emplacement introuvable."}, status=400)
+        palette.emplacement = emplacement
+        palette.save()
+        return Response(self.get_serializer(palette).data)
+
+    @action(detail=True, methods=["post"])
+    def expedier(self, request, pk=None):
+        """POST .../palettes/{id}/expedier/ : palette chargée pour une livraison (sort de son emplacement)."""
+        palette = self.get_object()
+        if palette.statut != models.StatutPalette.EN_STOCK:
+            return Response({"erreur": f"La palette {palette.numero} n'est pas en stock."}, status=400)
+        palette.statut, palette.emplacement = models.StatutPalette.EXPEDIEE, None
+        palette.save()
+        return Response(self.get_serializer(palette).data)
+
+    @action(detail=True, methods=["get"])
+    def etiquette(self, request, pk=None):
+        """GET .../palettes/{id}/etiquette/ : étiquette PDF (A5, code-barres)."""
+        from django.http import HttpResponse
+        from apps.core.documents import etiquette_palettes
+        palette = self.get_object()
+        reponse = HttpResponse(etiquette_palettes([palette], request.user), content_type="application/pdf")
+        reponse["Content-Disposition"] = f'inline; filename="palette-{palette.numero}.pdf"'
+        return reponse
+
+
+class MouvementLotViewSet(viewsets.ReadOnlyModelViewSet):
+    """Entrées / sorties de chaque lot de produit fini par lieu (stock par lot)."""
+    queryset = models.MouvementLot.objects.select_related("lot", "depot")
+    serializer_class = serializers.MouvementLotSerializer
+    permission_classes = [acces(lecture=(
+        Profil.DIRECTION, Profil.MAGASINIER, Profil.RESPONSABLE_QUALITE, Profil.RESPONSABLE_DISTRIBUTION, Profil.ADMIN_SI,
+    ))]
+    filterset_fields = ["lot", "depot", "ligne_commande", "ligne_transfert"]

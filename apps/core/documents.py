@@ -103,10 +103,12 @@ def bon_livraison(bon, utilisateur=None):
         ],
     )
     lignes = [
-        [l.article.code, l.article.designation, _quantite(l.quantite), l.article.unite_vente.nom if l.article.unite_vente_id else _unite(l.article)]
+        [l.article.code, l.article.designation, _quantite(l.quantite),
+         l.article.unite_vente.nom if l.article.unite_vente_id else _unite(l.article),
+         ", ".join(f"{m.lot.numero_lot} ({nombre(-m.quantite)})" for m in l.lots_livres.select_related("lot"))]
         for l in commande.lignes.select_related("article", "article__unite_vente")
     ]
-    document.avec_lignes(["Code", "Désignation", "Quantité", "Unité"], lignes, [27, None, 26, 34], colonnes_nombres=(2,))
+    document.avec_lignes(["Code", "Désignation", "Quantité", "Unité", "Lots livrés"], lignes, [27, None, 22, 28, 46], colonnes_nombres=(2,))
     document.avec_texte("Marchandise reçue en bon état et conforme à la commande, sauf réserves écrites ci-dessous.")
     if bon.incident_livraison:
         document.avec_texte(f"Réserves / incident : {bon.incident_livraison}")
@@ -130,7 +132,7 @@ def commande_fournisseur(commande, utilisateur=None):
         montant_ligne = ligne.quantite_commandee * ligne.prix_unitaire
         total += montant_ligne
         lignes.append([ligne.article.code, ligne.article.designation, _quantite(ligne.quantite_commandee),
-                       _unite(ligne.article), montant(ligne.prix_unitaire), montant(montant_ligne)])
+                       ligne.unite or _unite(ligne.article), montant(ligne.prix_unitaire), montant(montant_ligne)])
     document.avec_lignes(["Code", "Désignation", "Quantité", "Unité", "Prix unitaire", "Montant"], lignes,
                          [27, None, 22, 22, 26, 28], colonnes_nombres=(2, 4, 5))
     document.avec_totaux([("Total de la commande (FCFA)", montant(total))], en_lettres_de=total,
@@ -202,3 +204,67 @@ def bon_transfert(transfert, utilisateur=None):
     document.avec_lignes(["Code", "Désignation", "Lot", "Quantité", "Unité"], lignes, [27, None, 32, 24, 24], colonnes_nombres=(3,))
     document.avec_texte(transfert.observations)
     return document.avec_signatures("Expédié par (magasin)", "Le transporteur", "Reçu par (dépôt)")
+
+
+def etiquette_palettes(palettes, utilisateur=None):
+    """
+    Étiquettes de palette (une page A5 paysage par palette) : n° de palette
+    en code-barres (Code 128), produit, lot, quantité, DLC, lieu.
+    Retourne le contenu PDF (bytes).
+    """
+    from io import BytesIO
+    from reportlab.graphics.barcode import code128
+    from reportlab.lib.pagesizes import A5, landscape
+    from reportlab.lib.units import mm
+    from reportlab.lib.utils import ImageReader
+    from django.utils import timezone
+    from reportlab.pdfgen import canvas
+    from .models import ParametreEntreprise
+    from .pdf import _couleur
+    entreprise = ParametreEntreprise.courant()
+    couleur = _couleur(entreprise)
+    largeur, hauteur = landscape(A5)
+    tampon = BytesIO()
+    page = canvas.Canvas(tampon, pagesize=(largeur, hauteur))
+    page.setTitle("Étiquettes de palette")
+    for palette in palettes:
+        lot, article = palette.lot, palette.lot.article
+        page.setFillColor(couleur)
+        page.rect(0, hauteur - 22 * mm, largeur, 22 * mm, stroke=0, fill=1)
+        if entreprise.logo:
+            try:
+                page.drawImage(ImageReader(BytesIO(bytes(entreprise.logo))), 8 * mm, hauteur - 19 * mm,
+                               width=30 * mm, height=16 * mm, preserveAspectRatio=True, mask="auto")
+            except Exception:
+                pass
+        page.setFillColorRGB(1, 1, 1)
+        page.setFont("Helvetica-Bold", 16)
+        page.drawRightString(largeur - 8 * mm, hauteur - 13 * mm, entreprise.raison_sociale)
+        page.setFillColorRGB(0, 0, 0)
+        page.setFont("Helvetica-Bold", 22)
+        page.drawString(8 * mm, hauteur - 34 * mm, f"PALETTE {palette.numero}")
+        code = code128.Code128(palette.numero, barHeight=20 * mm, barWidth=0.5 * mm)
+        code.drawOn(page, 8 * mm, hauteur - 60 * mm)
+        page.setFont("Helvetica", 10)
+        page.drawString(10 * mm, hauteur - 65 * mm, palette.numero)
+        lignes = [
+            ("Produit", f"{article.code} - {article.designation}"),
+            ("Lot", lot.numero_lot + (f"  (OF {lot.ordre_fabrication.numero})" if lot.ordre_fabrication_id else "")),
+            ("Quantité", f"{nombre(palette.quantite)} {article.get_unite_mesure_display()}"
+                         + (f"  = {nombre(article.en_packs(palette.quantite))} packs" if article.unites_par_pack else "")),
+            ("Fabriqué le", date_fr(lot.date_production)),
+            ("À consommer avant", date_fr(lot.date_peremption) if lot.date_peremption else "-"),
+            ("Lieu", f"{palette.depot.nom}" + (f" - {palette.emplacement.code}" if palette.emplacement_id else "")),
+        ]
+        y = hauteur - 78 * mm
+        for libelle, valeur in lignes:
+            page.setFont("Helvetica", 10)
+            page.drawString(8 * mm, y, libelle)
+            page.setFont("Helvetica-Bold", 12)
+            page.drawString(48 * mm, y, valeur[:70])
+            y -= 9 * mm
+        page.setFont("Helvetica", 7)
+        page.drawString(8 * mm, 6 * mm, f"Édité le {date_fr(timezone.now())}")
+        page.showPage()
+    page.save()
+    return tampon.getvalue()

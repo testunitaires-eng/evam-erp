@@ -147,3 +147,25 @@ class ParametreEntrepriseTests(BaseValidation):
         api.force_authenticate(commercial)
         self.assertEqual(api.get("/api/documents/entreprise/").status_code, 200)
         self.assertEqual(api.patch("/api/documents/entreprise/", {"raison_sociale": "X"}, format="json").status_code, 403)
+
+
+class DroitsFinanciersTests(BaseValidation):
+    """Le DAF saisit et calcule les coûts ; la Direction consulte seulement."""
+
+    def api_profil(self, profil):
+        utilisateur = Utilisateur.objects.create_user(profil.lower(), password="x", profil=profil)
+        api = APIClient()
+        api.force_authenticate(utilisateur)
+        return api
+
+    def test_direction_en_lecture_seule_sur_les_couts(self):
+        direction = self.api_profil(Profil.DIRECTION)
+        daf = self.api_profil(Profil.COMPTABILITE_DAF)
+        donnees = {"article": self.matiere.id, "cout_unitaire": "650", "date_valorisation": "2026-10-01"}
+        for url in ("/api/couts/couts-matieres/", "/api/couts/couts-standards/", "/api/couts/charges/", "/api/couts/natures/"):
+            self.assertEqual(direction.get(url).status_code, 200, url)
+        self.assertEqual(direction.post("/api/couts/couts-matieres/", donnees, format="json").status_code, 403)
+        self.assertEqual(direction.post("/api/couts/cascade/calculer/", {"periode": "2026-10"}, format="json").status_code, 403)
+        self.assertEqual(daf.post("/api/couts/couts-matieres/", donnees, format="json").status_code, 201)
+        self.assertEqual(daf.post("/api/couts/cascade/calculer/", {"periode": "2026-10"}, format="json").status_code, 200)
+        self.assertEqual(self.api_profil(Profil.RESPONSABLE_PRODUCTION).get("/api/couts/couts-matieres/").status_code, 403)

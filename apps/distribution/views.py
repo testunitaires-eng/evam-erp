@@ -190,8 +190,9 @@ class DepotViewSet(viewsets.ModelViewSet):
 class TourneeViewSet(viewsets.ModelViewSet):
     queryset = models.Tournee.objects.all()
     serializer_class = serializers.TourneeSerializer
+    # La DAF lit les tournées pour leur rattacher les frais de distribution.
     permission_classes = [acces(
-        lecture=(Profil.DIRECTION, Profil.CHAUFFEUR,),
+        lecture=(Profil.DIRECTION, Profil.CHAUFFEUR, Profil.COMPTABILITE_DAF,),
         ecriture=(Profil.RESPONSABLE_DISTRIBUTION, Profil.ADMIN_SI,),
     )]
     filterset_fields = ["chauffeur", "vehicule", "date_tournee"]

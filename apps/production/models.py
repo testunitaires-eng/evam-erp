@@ -1064,6 +1064,7 @@ pour refuser toute nouvelle écriture une fois l'OF CLOTURE ou ANNULE.
 
 from django.core.exceptions import ValidationError
 from django.db import models, transaction
+from django.utils.timezone import now as timezone_now
 from apps.comptes.models import Utilisateur
 from apps.referentiel.models import Article
 from apps.core.models import generer_numero
@@ -1432,7 +1433,8 @@ class OrdreFabrication(ValidationAvantEnregistrement, models.Model):
         """Étapes du circuit de l'OF, dans l'ordre (vide sans circuit)."""
         if not self.circuit_id:
             return []
-        return list(self.circuit.etapes.select_related("etape", "poste", "equipement").order_by("ordre"))
+        # .all() puis tri en Python : profite du prefetch_related de la liste des OF.
+        return sorted(self.circuit.etapes.all(), key=lambda etape: etape.ordre)
 
     def volume_eau(self):
         """
@@ -1600,6 +1602,8 @@ class OrdreFabrication(ValidationAvantEnregistrement, models.Model):
     @property
     def montant_total_matieres(self):
         """Montant total des éléments nécessaires à l'OF (somme des besoins chiffrés)."""
+        if hasattr(self, "montant_besoins_annote"):   # calculé par la requête de la liste (une seule requête)
+            return self.montant_besoins_annote or 0
         from django.db.models import Sum
         return self.besoins_matieres.aggregate(total=Sum("montant"))["total"] or 0
 
@@ -2387,6 +2391,26 @@ class EtapeProduction(SaisieSurOFMixin, ValidationAvantEnregistrement, models.Mo
             if of and of.activite and self.equipement.activite_id and self.equipement.activite_id != of.activite.pk:
                 raise ValidationError({"equipement": f"La machine {self.equipement.code} est dédiée à une autre activité."})
 
+    def save(self, *args, **kwargs):
+        """Saisie de quantité : déclenche les contrôles « toutes les X unités / litres / m³ »."""
+        avant = self._cumuls_par_etape()
+        with transaction.atomic():
+            super().save(*args, **kwargs)
+            apres = self._cumuls_par_etape()
+            if apres != avant:
+                from apps.qualite.models import generer_controles_par_quantite
+                generer_controles_par_quantite(self.ordre_fabrication, avant, apres)
+
+    def _cumuls_par_etape(self):
+        from django.db.models import Sum
+        if not self.ordre_fabrication_id:
+            return {}
+        return {
+            ligne["etape"]: ligne["total"] or 0
+            for ligne in EtapeProduction.objects.filter(ordre_fabrication_id=self.ordre_fabrication_id)
+            .values("etape").annotate(total=Sum("quantite_produite"))
+        }
+
     @property
     def heures_machine_effectives(self):
         """Heures machine saisies, sinon durée (fin - début - arrêts) ; None si inconnues."""
@@ -2592,3 +2616,65 @@ class ParametreProduction(models.Model):
     def courant(cls):
         parametre, _ = cls.objects.get_or_create(pk=1)
         return parametre
+
+
+class TypeEvenement(models.TextChoices):
+    CUVE = "CUVE", "Cuve préparée"
+    NETTOYAGE = "NETTOYAGE", "Nettoyage / désinfection"
+    ARRET_REDEMARRAGE = "ARRET_REDEMARRAGE", "Arrêt puis redémarrage"
+
+
+DECLENCHEURS_EVENEMENT = {
+    TypeEvenement.CUVE: "CHAQUE_CUVE",
+    TypeEvenement.NETTOYAGE: "APRES_NETTOYAGE",
+    TypeEvenement.ARRET_REDEMARRAGE: "APRES_ARRET",
+}
+
+
+class EvenementProduction(SaisieSurOFMixin, ValidationAvantEnregistrement, models.Model):
+    """
+    Événement de production qui déclenche des contrôles du plan : cuve
+    préparée (« à chaque cuve »), nettoyage / désinfection, arrêt puis
+    redémarrage. La cuve ou la machine concernée est reprise sur les
+    contrôles générés.
+    """
+    ordre_fabrication = models.ForeignKey(OrdreFabrication, verbose_name="OF", on_delete=models.PROTECT, related_name="evenements")
+    type_evenement = models.CharField("Événement", max_length=20, choices=TypeEvenement.choices)
+    equipement = models.ForeignKey(
+        "industriel.Equipement", verbose_name="Cuve / machine", on_delete=models.PROTECT, null=True, blank=True, related_name="+",
+    )
+    numero_cuve = models.CharField("N° de cuvée / batch", max_length=40, blank=True)
+    volume = models.DecimalField("Volume (L)", max_digits=12, decimal_places=2, null=True, blank=True)
+    duree_min = models.DecimalField("Durée (min)", max_digits=8, decimal_places=1, null=True, blank=True)
+    date = models.DateTimeField("Date", default=timezone_now)
+    observations = models.TextField("Observations", blank=True)
+    saisi_par = models.ForeignKey(Utilisateur, verbose_name="Saisi par", on_delete=models.PROTECT, null=True, blank=True, related_name="+")
+
+    class Meta:
+        verbose_name = "Événement de production"
+        verbose_name_plural = "Événements de production"
+        ordering = ["-date"]
+
+    def __str__(self):
+        return f"{self.ordre_fabrication.numero} - {self.get_type_evenement_display()} ({self.date:%d/%m %H:%M})"
+
+    def clean(self):
+        self.controler_of_en_production()
+        exiger_positif_optionnel(self.volume, "volume", "Le volume", strict=True)
+        exiger_positif_optionnel(self.duree_min, "duree_min", "La durée")
+        if self.type_evenement == TypeEvenement.CUVE and self.equipement_id and self.equipement.type_equipement not in ("CUVE", "MELANGEUR"):
+            raise ValidationError({"equipement": f"{self.equipement.code} n'est pas une cuve ni un mélangeur."})
+        of = self.ordre_fabrication if self.ordre_fabrication_id else None
+        if of and of.activite and self.equipement_id and self.equipement.activite_id and self.equipement.activite_id != of.activite.pk:
+            raise ValidationError({"equipement": f"{self.equipement.code} est dédié à une autre activité."})
+
+    def save(self, *args, **kwargs):
+        creation = self._state.adding
+        with transaction.atomic():
+            super().save(*args, **kwargs)
+            if creation:
+                from apps.qualite.models import generer_controles
+                generer_controles(
+                    self.ordre_fabrication, declencheurs=(DECLENCHEURS_EVENEMENT[self.type_evenement],),
+                    equipement=self.equipement,
+                )

@@ -111,6 +111,32 @@ class PlanProductionSerializer(ValidationModeleMixin, serializers.ModelSerialize
 
 class OrdreFabricationSerializer(SansDonneesFinancieresPourAgentMixin, ValidationModeleMixin, serializers.ModelSerializer):
     montant_total_matieres = serializers.DecimalField(max_digits=16, decimal_places=2, read_only=True)
+    activite_code = serializers.SerializerMethodField()
+    usine_code = serializers.SerializerMethodField()
+    ligne_code = serializers.CharField(source="ligne.code", read_only=True, default=None)
+    circuit_code = serializers.CharField(source="circuit.code", read_only=True, default=None)
+    etapes_prevues = serializers.SerializerMethodField()
+
+    def get_activite_code(self, of):
+        return of.activite.code if of.activite else None
+
+    def get_usine_code(self, of):
+        return of.usine.code if of.usine else None
+
+    def get_etapes_prevues(self, of):
+        """Étapes du circuit avec l'avancement saisi (quantités produites à l'étape)."""
+        from django.db.models import Sum
+        resultat = []
+        for etape in of.etapes_prevues():
+            saisies = of.etapes.filter(etape=etape.etape.code)
+            resultat.append({
+                "ordre": etape.ordre, "code": etape.etape.code, "libelle": etape.etape.libelle,
+                "obligatoire": etape.obligatoire, "poste": etape.poste.code if etape.poste_id else None,
+                "machine": etape.equipement.code if etape.equipement_id else None,
+                "saisies": saisies.count(),
+                "quantite_produite": saisies.aggregate(t=Sum("quantite_produite"))["t"],
+            })
+        return resultat
 
     class Meta:
         model = models.OrdreFabrication
@@ -215,6 +241,8 @@ class SuiviEauSerializer(ValidationModeleMixin, SaisiParMixin, serializers.Model
 
 
 class EtapeProductionSerializer(ValidationModeleMixin, serializers.ModelSerializer):
+    heures_machine_effectives = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True, allow_null=True)
+
     class Meta:
         model = models.EtapeProduction
         fields = "__all__"
@@ -227,8 +255,36 @@ class EtapeProductionSerializer(ValidationModeleMixin, serializers.ModelSerializ
         return nom_utilisateur(etape.agent)
 
 
-class PerteProductionSerializer(ValidationModeleMixin, SaisiParMixin, serializers.ModelSerializer):
+class PerteProductionSerializer(SansDonneesFinancieresPourAgentMixin, ValidationModeleMixin, SaisiParMixin, serializers.ModelSerializer):
+    CHAMPS_FINANCIERS = ("valeur",)
+
     class Meta:
         model = models.PerteProduction
         fields = "__all__"
         read_only_fields = ["saisi_par"]
+
+
+class ChangementSerieSerializer(SansDonneesFinancieresPourAgentMixin, ValidationModeleMixin, SaisiParMixin, serializers.ModelSerializer):
+    CHAMPS_FINANCIERS = ("cout_nettoyage",)
+
+    class Meta:
+        model = models.ChangementSerie
+        fields = "__all__"
+        read_only_fields = ["saisi_par"]
+
+
+class ConsommationLotMatiereSerializer(serializers.ModelSerializer):
+    lot_numero = serializers.CharField(source="lot.numero", read_only=True)
+    lot_fournisseur = serializers.CharField(source="lot.lot_fournisseur", read_only=True)
+    matiere = serializers.CharField(source="lot.article.code", read_only=True)
+    of = serializers.CharField(source="sortie.ordre_fabrication.numero", read_only=True)
+
+    class Meta:
+        model = models.ConsommationLotMatiere
+        fields = "__all__"
+
+
+class ParametreProductionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = models.ParametreProduction
+        exclude = ["id"]

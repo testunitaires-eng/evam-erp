@@ -206,9 +206,43 @@ DEPOTS_SYSTEME = {
 }
 
 
+class TypeLieu(models.TextChoices):
+    """Guide du paramétrage §5 : le stock usine reste distinct du stock des dépôts extérieurs."""
+    MAGASIN_MATIERES = "MAGASIN_MATIERES", "Magasin matières (usine)"
+    STOCK_USINE = "STOCK_USINE", "Stock usine (produits finis)"
+    DEPOT_EXTERIEUR = "DEPOT_EXTERIEUR", "Dépôt extérieur / point de vente"
+    QUARANTAINE = "QUARANTAINE", "Quarantaine"
+
+
+TYPES_DEPOTS_SYSTEME = {
+    "Magasin principal": TypeLieu.MAGASIN_MATIERES,
+    "Dépôt produits finis": TypeLieu.STOCK_USINE,
+    "Quarantaine": TypeLieu.QUARANTAINE,
+}
+
+
 class Depot(ValidationAvantEnregistrement, models.Model):
-    """Un lieu de stockage physique (usine, dépôt régional...)."""
+    """
+    Un lieu de stockage : magasin matières ou stock produits finis d'une
+    usine, dépôt extérieur (point de vente), quarantaine. On paramètre le
+    lieu et ses règles, jamais sa quantité (calculée par les mouvements).
+    """
+    code = models.CharField("Code", max_length=30, unique=True, null=True, blank=True, editable=False)
     nom = models.CharField("Nom du dépôt", max_length=100)
+    type_lieu = models.CharField("Type de lieu", max_length=20, choices=TypeLieu.choices, default=TypeLieu.DEPOT_EXTERIEUR)
+    usine = models.ForeignKey(
+        "industriel.Usine", verbose_name="Usine de rattachement", on_delete=models.PROTECT,
+        null=True, blank=True, related_name="lieux_stockage",
+    )
+    activite = models.ForeignKey(
+        "industriel.Activite", verbose_name="Activité", on_delete=models.PROTECT,
+        null=True, blank=True, related_name="lieux_stockage", help_text="Vide = toutes activités.",
+    )
+    articles_autorises = models.ManyToManyField(
+        Article, verbose_name="Articles autorisés", blank=True, related_name="lieux_autorises",
+        help_text="Vide = tous les articles.",
+    )
+    gestion_lots = models.BooleanField("Gestion des lots", default=True)
     adresse = models.CharField("Adresse", max_length=255, blank=True)
     actif = models.BooleanField("Actif", default=True)
 
@@ -219,9 +253,26 @@ class Depot(ValidationAvantEnregistrement, models.Model):
     def __str__(self):
         return self.nom
 
+    PREFIXES_CODE = {
+        TypeLieu.MAGASIN_MATIERES: "MAG", TypeLieu.STOCK_USINE: "ST",
+        TypeLieu.DEPOT_EXTERIEUR: "DEP", TypeLieu.QUARANTAINE: "QUA",
+    }
+
+    def save(self, *args, **kwargs):
+        if not self.code:
+            from apps.core.models import generer_code_unique
+            self.code = generer_code_unique(Depot, self.PREFIXES_CODE.get(self.type_lieu, "LIEU"), largeur=3)
+        super().save(*args, **kwargs)
+
     @property
     def est_systeme(self):
         return self.nom in DEPOTS_SYSTEME
+
+    def accepte(self, article):
+        """L'article peut-il être stocké ici ?"""
+        if self.activite_id and article.activite_id and article.activite_id != self.activite_id:
+            return False
+        return not self.pk or not self.articles_autorises.exists() or self.articles_autorises.filter(pk=article.pk).exists()
 
     def clean(self):
         self.nom = (self.nom or "").strip()
@@ -238,6 +289,11 @@ class Depot(ValidationAvantEnregistrement, models.Model):
                 )})
             if not self.actif:
                 raise ValidationError({"actif": f"« {ancien_nom} » est un dépôt système : il ne peut pas être désactivé."})
+            if self.type_lieu != TYPES_DEPOTS_SYSTEME[ancien_nom]:
+                raise ValidationError({"type_lieu": f"« {ancien_nom} » est un dépôt système : son type est fixe."})
+        if self.type_lieu in (TypeLieu.MAGASIN_MATIERES, TypeLieu.STOCK_USINE) and not self.usine_id \
+                and self.nom not in DEPOTS_SYSTEME:
+            raise ValidationError({"usine": "Un magasin matières ou un stock usine est rattaché à une usine."})
 
     def verifier_suppression(self):
         if self.est_systeme:
@@ -257,8 +313,24 @@ def depot_par_defaut(nom):
     PreparationLivraison...) plutôt que de continuer à résoudre le
     dépôt par son nom.
     """
-    depot, _ = Depot.objects.get_or_create(nom=nom, defaults={"actif": True})
+    depot, _ = Depot.objects.get_or_create(
+        nom=nom, defaults={"actif": True, "type_lieu": TYPES_DEPOTS_SYSTEME.get(nom, TypeLieu.DEPOT_EXTERIEUR)},
+    )
     return depot
+
+
+def depot_matieres(usine=None):
+    """Magasin matières de l'usine s'il est paramétré, sinon « Magasin principal »."""
+    if usine is not None and usine.magasin_matieres_id:
+        return usine.magasin_matieres
+    return depot_par_defaut("Magasin principal")
+
+
+def depot_produits_finis(usine=None):
+    """Stock produits finis de l'usine s'il est paramétré, sinon « Dépôt produits finis »."""
+    if usine is not None and usine.stock_produits_finis_id:
+        return usine.stock_produits_finis
+    return depot_par_defaut("Dépôt produits finis")
 
 
 class StockArticle(models.Model):
@@ -382,6 +454,13 @@ class MouvementStock(models.Model):
             return
         if not self.depot.actif:
             raise ValidationError({"depot": f"Le dépôt « {self.depot.nom} » est inactif."})
+        entree = self.type_mouvement in (TypeMouvement.ENTREE, TypeMouvement.RETOUR) or (
+            self.type_mouvement == TypeMouvement.AJUSTEMENT and self.quantite > 0
+        )
+        if entree and not self.depot.accepte(self.article):
+            raise ValidationError({"depot": (
+                f"{self.article.code} n'est pas autorisé dans le lieu « {self.depot.nom} » (articles / activité autorisés)."
+            )})
 
         stock = StockArticle.objects.filter(article_id=self.article_id, depot_id=self.depot_id).first()
         if self.type_mouvement == TypeMouvement.SORTIE:
@@ -561,3 +640,339 @@ class LigneInventaire(ValidationAvantEnregistrement, models.Model):
     @property
     def ecart(self):
         return self.quantite_comptee - self.quantite_theorique
+
+
+class StatutTransfert(models.TextChoices):
+    BROUILLON = "BROUILLON", "Brouillon"
+    EXPEDIE = "EXPEDIE", "Expédié (en transit)"
+    RECU = "RECU", "Reçu"
+    ANNULE = "ANNULE", "Annulé"
+
+
+class TransfertStock(ValidationAvantEnregistrement, models.Model):
+    """
+    Bon de transfert entre deux lieux (stock usine -> dépôt extérieur...).
+    Le stock bouge vraiment : l'expédition SORT la marchandise du lieu
+    source, la réception (confirmée au dépôt) l'ENTRE dans le lieu de
+    destination, au coût moyen de la sortie. Entre les deux, elle est en
+    transit (dans aucun des deux stocks).
+    """
+    numero = models.CharField("N° bon de transfert", max_length=30, unique=True, editable=False)
+    depot_source = models.ForeignKey(Depot, verbose_name="Lieu source", on_delete=models.PROTECT, related_name="transferts_sortants")
+    depot_destination = models.ForeignKey(Depot, verbose_name="Lieu de destination", on_delete=models.PROTECT, related_name="transferts_entrants")
+    statut = models.CharField("Statut", max_length=20, choices=StatutTransfert.choices, default=StatutTransfert.BROUILLON)
+    observations = models.TextField("Observations", blank=True)
+    cree_par = models.ForeignKey(Utilisateur, verbose_name="Créé par", on_delete=models.PROTECT, related_name="transferts_crees")
+    expedie_par = models.ForeignKey(Utilisateur, verbose_name="Expédié par", on_delete=models.PROTECT, null=True, blank=True, related_name="transferts_expedies")
+    recu_par = models.ForeignKey(Utilisateur, verbose_name="Reçu par", on_delete=models.PROTECT, null=True, blank=True, related_name="transferts_recus")
+    date_creation = models.DateTimeField("Date de création", auto_now_add=True)
+    date_expedition = models.DateTimeField("Date d'expédition", null=True, blank=True)
+    date_reception = models.DateTimeField("Date de réception", null=True, blank=True)
+
+    class Meta:
+        verbose_name = "Bon de transfert"
+        verbose_name_plural = "Bons de transfert"
+        ordering = ["-date_creation"]
+
+    def __str__(self):
+        return f"{self.numero} : {self.depot_source} -> {self.depot_destination}"
+
+    TRANSITIONS = {
+        StatutTransfert.BROUILLON: {StatutTransfert.EXPEDIE, StatutTransfert.ANNULE},
+        StatutTransfert.EXPEDIE: {StatutTransfert.RECU},
+    }
+
+    def save(self, *args, **kwargs):
+        if not self.numero:
+            self.numero = generer_numero("BT")
+        super().save(*args, **kwargs)
+
+    def clean(self):
+        ancien_statut = valeur_en_base(self, "statut")
+        if ancien_statut in (StatutTransfert.RECU, StatutTransfert.ANNULE):
+            raise ValidationError(f"Le transfert {self.numero} est {self.get_statut_display().lower()} : il ne peut plus être modifié.")
+        verifier_transition(ancien_statut, self.statut, self.TRANSITIONS, "statut du transfert", initial=StatutTransfert.BROUILLON)
+        if self.depot_source_id and self.depot_source_id == self.depot_destination_id:
+            raise ValidationError({"depot_destination": "Le lieu de destination doit être différent du lieu source."})
+        for champ in ("depot_source", "depot_destination"):
+            depot = getattr(self, champ) if getattr(self, f"{champ}_id") else None
+            if depot is not None and not depot.actif:
+                raise ValidationError({champ: f"Le lieu « {depot.nom} » est inactif."})
+        if ancien_statut not in (None, StatutTransfert.BROUILLON):
+            for champ in ("depot_source", "depot_destination"):
+                if valeur_en_base(self, champ) != getattr(self, f"{champ}_id"):
+                    raise ValidationError({champ: "Un transfert expédié ne change plus de lieux."})
+
+    def verifier_suppression(self):
+        if self.statut != StatutTransfert.BROUILLON:
+            raise ValidationError("Seul un transfert en brouillon peut être supprimé (sinon : annulez-le avant expédition).")
+
+    @transaction.atomic
+    def expedier(self, utilisateur):
+        """Sortie du lieu source (tout ou rien : contrôle du stock disponible ligne par ligne)."""
+        from django.utils import timezone
+        if self.statut != StatutTransfert.BROUILLON:
+            raise ValueError("Seul un transfert en brouillon peut être expédié.")
+        lignes = list(self.lignes.select_related("article"))
+        if not lignes:
+            raise ValueError("Ce transfert n'a aucune ligne.")
+        self.statut = StatutTransfert.EXPEDIE
+        self.expedie_par = utilisateur
+        self.date_expedition = timezone.now()
+        self.save()
+        for ligne in lignes:
+            if not self.depot_destination.accepte(ligne.article):
+                raise ValueError(f"{ligne.article.code} n'est pas autorisé dans « {self.depot_destination.nom} ».")
+            mouvement = MouvementStock.objects.create(
+                article=ligne.article, depot=self.depot_source, type_mouvement=TypeMouvement.SORTIE,
+                quantite=ligne.quantite, motif=f"Transfert vers {self.depot_destination.nom}",
+                document_origine=self.numero, utilisateur=utilisateur,
+            )
+            ligne.cout_unitaire = mouvement.cout_unitaire
+            ligne.save(update_fields=["cout_unitaire"])
+
+    @transaction.atomic
+    def receptionner(self, utilisateur):
+        """Confirmation de réception au dépôt : entrée dans le lieu de destination au coût de la sortie."""
+        from django.utils import timezone
+        if self.statut != StatutTransfert.EXPEDIE:
+            raise ValueError("Seul un transfert expédié peut être réceptionné.")
+        self.statut = StatutTransfert.RECU
+        self.recu_par = utilisateur
+        self.date_reception = timezone.now()
+        self.save()
+        for ligne in self.lignes.select_related("article"):
+            MouvementStock.objects.create(
+                article=ligne.article, depot=self.depot_destination, type_mouvement=TypeMouvement.ENTREE,
+                quantite=ligne.quantite, cout_unitaire=ligne.cout_unitaire,
+                motif=f"Transfert depuis {self.depot_source.nom}", document_origine=self.numero, utilisateur=utilisateur,
+            )
+
+    def annuler(self):
+        if self.statut != StatutTransfert.BROUILLON:
+            raise ValueError("Un transfert expédié ne s'annule plus : il doit être réceptionné.")
+        self.statut = StatutTransfert.ANNULE
+        self.save()
+
+
+class LigneTransfert(ValidationAvantEnregistrement, models.Model):
+    transfert = models.ForeignKey(TransfertStock, verbose_name="Transfert", on_delete=models.CASCADE, related_name="lignes")
+    article = models.ForeignKey(Article, verbose_name="Article", on_delete=models.PROTECT)
+    lot = models.ForeignKey("qualite.Lot", verbose_name="Lot", on_delete=models.PROTECT, null=True, blank=True)
+    quantite = models.DecimalField("Quantité", max_digits=14, decimal_places=3)
+    cout_unitaire = models.DecimalField("Coût unitaire (à l'expédition)", max_digits=14, decimal_places=4, null=True, blank=True, editable=False)
+
+    class Meta:
+        verbose_name = "Ligne de transfert"
+        verbose_name_plural = "Lignes de transfert"
+
+    def __str__(self):
+        return f"{self.transfert.numero} : {self.quantite} {self.article.code}"
+
+    def clean(self):
+        exiger_positif(self.quantite, "quantite", "La quantité")
+        transfert = TransfertStock.objects.filter(pk=valeur_en_base(self, "transfert") or self.transfert_id).first()
+        if transfert and transfert.statut != StatutTransfert.BROUILLON:
+            raise ValidationError("Ce transfert n'est plus en brouillon : ses lignes sont figées.")
+        if self.lot_id:
+            if self.article_id and self.lot.article_id != self.article_id:
+                raise ValidationError({"lot": "Ce lot ne correspond pas à l'article."})
+            if self.lot.statut != "LIBERE":
+                raise ValidationError({"lot": f"Le lot {self.lot.numero_lot} n'est pas libéré : il ne peut pas être transféré."})
+        if self.transfert_id and self.article_id and TransfertStock.objects.filter(pk=self.transfert_id).exists() \
+                and LigneTransfert.objects.filter(transfert_id=self.transfert_id, article_id=self.article_id, lot_id=self.lot_id).exclude(pk=self.pk).exists():
+            raise ValidationError({"article": "Cet article (et ce lot) figure déjà dans le transfert."})
+
+    def verifier_suppression(self):
+        if self.transfert.statut != StatutTransfert.BROUILLON:
+            raise ValidationError("Ce transfert n'est plus en brouillon : ses lignes sont figées.")
+
+
+class StatutLotMatiere(models.TextChoices):
+    A_CONTROLER = "A_CONTROLER", "À contrôler (réception)"
+    LIBERE = "LIBERE", "Libéré"
+    BLOQUE = "BLOQUE", "Bloqué"
+    EPUISE = "EPUISE", "Épuisé"
+
+
+class LotMatiere(ValidationAvantEnregistrement, models.Model):
+    """
+    Lot d'une matière, d'un emballage ou d'un consommable, avec son lot
+    fournisseur et sa DLC. Créé à la réception (ou à la saisie d'un stock
+    initial) ; consommé par les sorties matières des OF, les plus proches
+    de leur DLC d'abord (puis les plus anciens). Un lot « à contrôler »
+    ou « bloqué » est indisponible (quantité bloquée dans le stock).
+    """
+    numero = models.CharField("N° lot interne", max_length=30, unique=True, editable=False)
+    article = models.ForeignKey(Article, verbose_name="Article", on_delete=models.PROTECT, related_name="lots_matieres")
+    depot = models.ForeignKey(Depot, verbose_name="Lieu de stockage", on_delete=models.PROTECT, related_name="lots_matieres")
+    lot_fournisseur = models.CharField("N° lot fournisseur", max_length=60, blank=True)
+    fournisseur = models.ForeignKey("achats.Fournisseur", verbose_name="Fournisseur", on_delete=models.PROTECT, null=True, blank=True, related_name="lots_livres")
+    ligne_reception = models.ForeignKey(
+        "achats.LigneReceptionAchat", verbose_name="Réception", on_delete=models.PROTECT, null=True, blank=True, related_name="lots",
+    )
+    date_reception = models.DateField("Date de réception")
+    date_peremption = models.DateField("DLC / DLUO", null=True, blank=True)
+    quantite_initiale = models.DecimalField("Quantité reçue", max_digits=14, decimal_places=3)
+    quantite_restante = models.DecimalField("Quantité restante", max_digits=14, decimal_places=3, editable=False)
+    statut = models.CharField("Statut", max_length=20, choices=StatutLotMatiere.choices, default=StatutLotMatiere.LIBERE)
+    observations = models.TextField("Observations", blank=True)
+    date_creation = models.DateTimeField("Créé le", auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Lot matière"
+        verbose_name_plural = "Lots matières"
+        ordering = ["date_peremption", "date_reception", "pk"]
+
+    def __str__(self):
+        fournisseur = f" (fourn. {self.lot_fournisseur})" if self.lot_fournisseur else ""
+        return f"{self.numero} - {self.article.code}{fournisseur}"
+
+    TRANSITIONS = {
+        StatutLotMatiere.A_CONTROLER: {StatutLotMatiere.LIBERE, StatutLotMatiere.BLOQUE, StatutLotMatiere.EPUISE},
+        StatutLotMatiere.LIBERE: {StatutLotMatiere.BLOQUE, StatutLotMatiere.EPUISE},
+        StatutLotMatiere.BLOQUE: {StatutLotMatiere.LIBERE, StatutLotMatiere.EPUISE},
+        StatutLotMatiere.EPUISE: {StatutLotMatiere.LIBERE},
+    }
+    INDISPONIBLES = (StatutLotMatiere.A_CONTROLER, StatutLotMatiere.BLOQUE)
+
+    def save(self, *args, **kwargs):
+        if not self.numero:
+            self.numero = generer_numero("LM")
+        if self._state.adding and self.quantite_restante is None:
+            self.quantite_restante = self.quantite_initiale
+        ancien = valeur_en_base(self, "statut")
+        with transaction.atomic():
+            super().save(*args, **kwargs)
+            self._repercuter_blocage(ancien)
+
+    def clean(self):
+        exiger_positif(self.quantite_initiale, "quantite_initiale", "La quantité reçue")
+        if self.date_peremption and self.date_reception and self.date_peremption < self.date_reception:
+            raise ValidationError({"date_peremption": "La DLC ne peut pas précéder la réception."})
+        ancien = valeur_en_base(self, "statut")
+        verifier_transition(ancien, self.statut, self.TRANSITIONS, "statut du lot matière")
+        if ancien is None and not self.ligne_reception_id and self.article_id and self.depot_id:
+            # Lot saisi sur un stock déjà présent (stock initial sans lot) : on ne
+            # peut pas « loter » plus que le stock physique non encore loti.
+            from django.db.models import Sum
+            stock = StockArticle.objects.filter(article_id=self.article_id, depot_id=self.depot_id).first()
+            physique = stock.quantite_physique if stock else 0
+            deja = LotMatiere.objects.filter(article_id=self.article_id, depot_id=self.depot_id).exclude(
+                statut=StatutLotMatiere.EPUISE,
+            ).aggregate(t=Sum("quantite_restante"))["t"] or 0
+            if self.quantite_initiale > physique - deja:
+                raise ValidationError({"quantite_initiale": (
+                    f"Seulement {physique - deja} de {self.article.code} au « {self.depot.nom} » ne sont rattachés à aucun lot."
+                )})
+        if ancien is not None:
+            for champ in ("article", "depot"):
+                if valeur_en_base(self, champ) != getattr(self, f"{champ}_id"):
+                    raise ValidationError({champ: "L'article et le lieu d'un lot ne changent plus."})
+            if valeur_en_base(self, "quantite_initiale") != self.quantite_initiale:
+                raise ValidationError({"quantite_initiale": "La quantité reçue d'un lot ne change plus."})
+
+    def verifier_suppression(self):
+        raise ValidationError("Un lot matière ne se supprime pas (traçabilité).")
+
+    def _repercuter_blocage(self, ancien):
+        """Un lot à contrôler / bloqué rend sa quantité restante indisponible dans le stock du lieu."""
+        avant = ancien in self.INDISPONIBLES
+        apres = self.statut in self.INDISPONIBLES
+        if avant == apres:
+            return
+        stock, _ = StockArticle.objects.select_for_update().get_or_create(article_id=self.article_id, depot_id=self.depot_id)
+        if apres:
+            stock.quantite_bloquee += self.quantite_restante
+        else:
+            stock.quantite_bloquee = max(stock.quantite_bloquee - self.quantite_restante, 0)
+        stock.save()
+
+    @property
+    def est_perime(self):
+        from django.utils import timezone
+        return bool(self.date_peremption and self.date_peremption < timezone.localdate())
+
+    def changer_statut(self, statut):
+        self.statut = statut
+        self.save()
+
+    def consommer(self, quantite):
+        self.quantite_restante -= quantite
+        if self.quantite_restante <= 0:
+            self.quantite_restante = 0
+            self.statut = StatutLotMatiere.EPUISE
+        self.save()
+
+    def restituer(self, quantite):
+        self.quantite_restante += quantite
+        if self.statut == StatutLotMatiere.EPUISE:
+            self.statut = StatutLotMatiere.LIBERE
+        elif self.statut in self.INDISPONIBLES:
+            # Retour dans un lot bloqué entre-temps : la quantité retournée est bloquée aussi.
+            stock, _ = StockArticle.objects.select_for_update().get_or_create(article_id=self.article_id, depot_id=self.depot_id)
+            stock.quantite_bloquee += quantite
+            stock.save()
+        self.save()
+
+    def retirer(self, quantite):
+        """Retour fournisseur : la quantité quitte le lot (et son blocage éventuel)."""
+        if self.statut in self.INDISPONIBLES:
+            stock = StockArticle.objects.select_for_update().filter(article_id=self.article_id, depot_id=self.depot_id).first()
+            if stock is not None:
+                stock.quantite_bloquee = max(stock.quantite_bloquee - quantite, 0)
+                stock.save()
+        self.quantite_restante -= quantite
+        if self.quantite_restante <= 0:
+            self.quantite_restante = 0
+            self.statut = StatutLotMatiere.EPUISE
+        self.save()
+
+    @classmethod
+    def allouer(cls, article, depot, quantite, lot_impose=None):
+        """
+        Lots à consommer pour sortir `quantite` : [(lot, quantité)].
+        Ordre : DLC la plus proche, puis réception la plus ancienne (FEFO).
+        Lots périmés, à contrôler ou bloqués exclus. La part non couverte
+        par des lots ne peut venir que du stock sans lot (stock antérieur
+        au suivi par lot) ; sinon la sortie est refusée.
+        """
+        from decimal import Decimal
+        from django.db.models import Sum
+        from django.utils import timezone
+        quantite = Decimal(quantite)
+        if lot_impose is not None:
+            if lot_impose.article_id != article.pk or lot_impose.depot_id != depot.pk:
+                raise ValidationError({"lot_matiere": f"Le lot {lot_impose.numero} n'est pas un lot de {article.code} dans « {depot.nom} »."})
+            if lot_impose.statut != StatutLotMatiere.LIBERE:
+                raise ValidationError({"lot_matiere": f"Le lot {lot_impose.numero} est « {lot_impose.get_statut_display()} »."})
+            if lot_impose.est_perime:
+                raise ValidationError({"lot_matiere": f"Le lot {lot_impose.numero} est périmé ({lot_impose.date_peremption})."})
+            if lot_impose.quantite_restante < quantite:
+                raise ValidationError({"lot_matiere": f"Le lot {lot_impose.numero} ne contient plus que {lot_impose.quantite_restante}."})
+            return [(lot_impose, quantite)]
+        lots = cls.objects.select_for_update().filter(
+            article=article, depot=depot, statut=StatutLotMatiere.LIBERE, quantite_restante__gt=0,
+        ).exclude(date_peremption__lt=timezone.localdate()).order_by(
+            models.F("date_peremption").asc(nulls_last=True), "date_reception", "pk",
+        )
+        allocation, reste = [], quantite
+        for lot in lots:
+            if reste <= 0:
+                break
+            prise = min(lot.quantite_restante, reste)
+            allocation.append((lot, prise))
+            reste -= prise
+        if reste > 0:
+            stock = StockArticle.objects.filter(article=article, depot=depot).first()
+            physique = stock.quantite_physique if stock else Decimal(0)
+            sous_lots = cls.objects.filter(article=article, depot=depot).exclude(
+                statut=StatutLotMatiere.EPUISE,
+            ).aggregate(t=Sum("quantite_restante"))["t"] or Decimal(0)
+            sans_lot = physique - sous_lots
+            if reste > sans_lot:
+                raise ValidationError({"quantite_sortie": (
+                    f"{article.code} : {quantite - reste} disponible dans des lots libérés non périmés "
+                    f"et {max(sans_lot, 0)} hors lot au « {depot.nom} » ; sortie de {quantite} impossible."
+                )})
+        return allocation

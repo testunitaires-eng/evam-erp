@@ -94,7 +94,7 @@ des mouvements (qui mettent StockArticle à jour, voir signals.py).
 """
 
 from rest_framework import viewsets
-from rest_framework.decorators import api_view, permission_classes as drf_permission_classes
+from rest_framework.decorators import action, api_view, permission_classes as drf_permission_classes
 from rest_framework.response import Response
 from apps.core.views import HistoriqueMixin
 from . import models, serializers
@@ -115,7 +115,9 @@ class DepotViewSet(viewsets.ModelViewSet):
         lecture=(Profil.DIRECTION, Profil.RESPONSABLE_PRODUCTION, Profil.RESPONSABLE_QUALITE, Profil.RESPONSABLE_ACHATS, Profil.COMMERCIAL, Profil.RESPONSABLE_DISTRIBUTION, Profil.COMPTABILITE_DAF,),
         ecriture=(Profil.ADMIN_SI, Profil.MAGASINIER,),
     )]
-    
+    filterset_fields = ["type_lieu", "usine", "activite", "actif"]
+
+
 class StockArticleViewSet(viewsets.ReadOnlyModelViewSet):
     """
     Lecture seule pour tous les profils authentifiés (Commercial doit
@@ -203,3 +205,147 @@ def valorisation(request):
             "quantite": stock.quantite_physique, "cout_unitaire_moyen": cmup.quantize(Decimal("0.0001")), "valeur": valeur,
         })
     return Response({"valeur_totale": total, "lignes": lignes})
+
+
+
+class TransfertStockViewSet(HistoriqueMixin, viewsets.ModelViewSet):
+    """
+    Bons de transfert (stock usine -> dépôt extérieur...) : le Magasinier
+    prépare et expédie ; le dépôt confirme la réception.
+    """
+    queryset = models.TransfertStock.objects.select_related("depot_source", "depot_destination").prefetch_related("lignes")
+    serializer_class = serializers.TransfertStockSerializer
+    permission_classes = [acces(
+        lecture=(Profil.DIRECTION, Profil.RESPONSABLE_DISTRIBUTION, Profil.COMMERCIAL, Profil.COMPTABILITE_DAF,),
+        ecriture=(Profil.MAGASINIER, Profil.ADMIN_SI,),
+    )]
+    filterset_fields = ["statut", "depot_source", "depot_destination"]
+    search_fields = ["numero"]
+
+    def perform_create(self, serializer):
+        serializer.save(cree_par=self.request.user)
+
+    def _action(self, request, methode, *args):
+        transfert = self.get_object()
+        try:
+            getattr(transfert, methode)(*args)
+        except ValueError as erreur:
+            return Response({"erreur": str(erreur)}, status=400)
+        return Response(self.get_serializer(transfert).data)
+
+    @action(detail=True, methods=["post"])
+    def expedier(self, request, pk=None):
+        """POST .../transferts/{id}/expedier/ : sortie du lieu source (tout ou rien)."""
+        return self._action(request, "expedier", request.user)
+
+    @action(detail=True, methods=["post"])
+    def receptionner(self, request, pk=None):
+        """POST .../transferts/{id}/receptionner/ : entrée au lieu de destination."""
+        return self._action(request, "receptionner", request.user)
+
+    @action(detail=True, methods=["post"])
+    def annuler(self, request, pk=None):
+        return self._action(request, "annuler")
+
+    @action(detail=True, methods=["get"])
+    def bon(self, request, pk=None):
+        """GET .../transferts/{id}/bon/ : données du bon de transfert à imprimer."""
+        transfert = self.get_object()
+        return Response({
+            "numero": transfert.numero, "statut": transfert.get_statut_display(),
+            "de": f"{transfert.depot_source.code} - {transfert.depot_source.nom}",
+            "vers": f"{transfert.depot_destination.code} - {transfert.depot_destination.nom}",
+            "date_expedition": transfert.date_expedition, "date_reception": transfert.date_reception,
+            "expedie_par": transfert.expedie_par.username if transfert.expedie_par_id else None,
+            "recu_par": transfert.recu_par.username if transfert.recu_par_id else None,
+            "lignes": [
+                {"article": l.article.code, "designation": l.article.designation, "quantite": l.quantite,
+                 "unite": l.article.unite_mesure, "lot": l.lot.numero_lot if l.lot_id else None}
+                for l in transfert.lignes.select_related("article", "lot")
+            ],
+        })
+
+    @action(detail=True, methods=["get"], url_path="pdf")
+    def pdf(self, request, pk=None):
+        """GET /api/stocks/transferts/{id}/pdf/ : document PDF à imprimer (?telecharger=1 pour le télécharger)."""
+        from apps.core import documents
+        from apps.core.pdf import telecharger
+        objet = self.get_object()
+        return documents.bon_transfert(objet, request.user).reponse(f"bon-transfert-{objet.numero}", telecharger(request))
+
+
+class LigneTransfertViewSet(viewsets.ModelViewSet):
+    queryset = models.LigneTransfert.objects.select_related("article", "transfert")
+    serializer_class = serializers.LigneTransfertSerializer
+    permission_classes = [acces(
+        lecture=(Profil.DIRECTION, Profil.RESPONSABLE_DISTRIBUTION, Profil.COMMERCIAL,),
+        ecriture=(Profil.MAGASINIER, Profil.ADMIN_SI,),
+    )]
+    filterset_fields = ["transfert", "article"]
+
+
+class LotMatiereViewSet(viewsets.ModelViewSet):
+    """
+    Lots matières / emballages (créés à la réception). Le Magasinier
+    saisit les lots d'un stock initial ; la Qualité libère ou bloque.
+    """
+    queryset = models.LotMatiere.objects.select_related("article", "depot", "fournisseur")
+    serializer_class = serializers.LotMatiereSerializer
+    permission_classes = [acces(
+        lecture=(Profil.DIRECTION, Profil.RESPONSABLE_PRODUCTION, Profil.RESPONSABLE_ACHATS, Profil.RESPONSABLE_QUALITE,),
+        ecriture=(Profil.MAGASINIER, Profil.ADMIN_SI,),
+    )]
+    filterset_fields = ["article", "depot", "statut", "fournisseur", "lot_fournisseur"]
+    search_fields = ["numero", "lot_fournisseur"]
+    http_method_names = ["get", "post", "patch", "head", "options"]
+
+    def _changer(self, request, statut):
+        if request.user.profil not in (Profil.RESPONSABLE_QUALITE, Profil.ADMIN_SI) and not request.user.is_superuser:
+            return Response({"erreur": "Seul le Responsable Qualité libère ou bloque un lot matière."}, status=403)
+        lot = models.LotMatiere.objects.get(pk=self.kwargs["pk"])
+        lot.changer_statut(statut)
+        return Response(self.get_serializer(lot).data)
+
+    def get_permissions(self):
+        if self.action in ("liberer", "bloquer"):
+            from rest_framework.permissions import IsAuthenticated
+            return [IsAuthenticated()]
+        return super().get_permissions()
+
+    @action(detail=True, methods=["post"])
+    def liberer(self, request, pk=None):
+        """POST .../lots-matieres/{id}/liberer/ (Responsable Qualité)."""
+        return self._changer(request, models.StatutLotMatiere.LIBERE)
+
+    @action(detail=True, methods=["post"])
+    def bloquer(self, request, pk=None):
+        """POST .../lots-matieres/{id}/bloquer/ (Responsable Qualité)."""
+        return self._changer(request, models.StatutLotMatiere.BLOQUE)
+
+    @action(detail=True, methods=["get"])
+    def tracabilite(self, request, pk=None):
+        """GET .../lots-matieres/{id}/tracabilite/ : traçabilité AVAL (OF -> lots de produits finis), ex. pour un rappel."""
+        from apps.production.models import ConsommationLotMatiere
+        lot = self.get_object()
+        consommations = ConsommationLotMatiere.objects.filter(lot=lot).select_related("sortie__ordre_fabrication__article")
+        ofs = {}
+        for consommation in consommations:
+            of = consommation.sortie.ordre_fabrication
+            ligne = ofs.setdefault(of.pk, {
+                "of": of.numero, "article": of.article.code, "statut": of.get_statut_display(), "quantite_consommee": 0,
+                "lots_produits_finis": [
+                    {"lot": l.numero_lot, "quantite": l.quantite, "statut": l.get_statut_display()} for l in of.lots.all()
+                ],
+            })
+            ligne["quantite_consommee"] += consommation.quantite_nette
+        return Response({
+            "lot": lot.numero, "article": lot.article.code, "lot_fournisseur": lot.lot_fournisseur,
+            "fournisseur": str(lot.fournisseur) if lot.fournisseur_id else None,
+            "date_reception": lot.date_reception, "date_peremption": lot.date_peremption,
+            "quantite_initiale": lot.quantite_initiale, "quantite_restante": lot.quantite_restante,
+            "statut": lot.get_statut_display(), "ordres_fabrication": list(ofs.values()),
+            "controles": [
+                {"numero": r.numero, "controle": r.point.designation, "statut": r.get_statut_display(), "valeur": r.valeur}
+                for r in lot.resultats_controles.select_related("point")
+            ],
+        })

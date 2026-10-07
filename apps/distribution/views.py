@@ -325,6 +325,14 @@ class BonLivraisonViewSet(HistoriqueMixin, viewsets.ModelViewSet):
             return Response({"erreur": str(erreur)}, status=400)
         return Response(self.get_serializer(bon).data)
 
+    @action(detail=True, methods=["get"], url_path="pdf")
+    def pdf(self, request, pk=None):
+        """GET /api/distribution/bons-livraison/{id}/pdf/ : document PDF à imprimer (?telecharger=1 pour le télécharger)."""
+        from apps.core import documents
+        from apps.core.pdf import telecharger
+        objet = self.get_object()
+        return documents.bon_livraison(objet, request.user).reponse(f"bon-livraison-{objet.numero}", telecharger(request))
+
 
 class TransfertDepotViewSet(viewsets.ModelViewSet):
     queryset = models.TransfertDepot.objects.all()

@@ -31,8 +31,12 @@ router.register("etapes", views.EtapeProductionViewSet, basename="etapeproductio
 router.register("pertes", views.PerteProductionViewSet, basename="perteproduction")
 router.register("changements-serie", views.ChangementSerieViewSet, basename="changementserie")
 router.register("evenements", views.EvenementProductionViewSet, basename="evenementproduction")
+router.register("formats-of", views.FormatOFViewSet, basename="formatof")
+router.register("reservations", views.ReservationMatiereViewSet, basename="reservationmatiere")
+router.register("donnees-etapes", views.DonneeObligatoireEtapeViewSet, basename="donneeobligatoireetape")
 router.register("parametres", views.ParametreProductionViewSet, basename="parametreproduction")
 
 urlpatterns = [
     path("tableau-de-bord/", views.tableau_de_bord, name="tableau-de-bord-production"),
+    path("planning/", views.planning, name="planning-production"),
 ] + router.urls

@@ -245,6 +245,7 @@ class Migration(migrations.Migration):
 
     dependencies = [
         ("industriel", "0001_initial"),
+        ("core", "0003_notifications_anomalies"),
         ("referentiel", "0009_article_activite_article_activites_autorisees_and_more"),
         ("stocks", "0004_depot_activite_depot_articles_autorises_depot_code_and_more"),
         ("couts", "0003_charge_activite_charge_equipement_and_more"),

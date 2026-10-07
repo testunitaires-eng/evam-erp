@@ -71,7 +71,33 @@ class CommandeViewSet(HistoriqueMixin, viewsets.ModelViewSet):
         serializer.save(cree_par=self.request.user)
 
 
-class LigneCommandeViewSet(viewsets.ModelViewSet):
+class DerogationPrixMixin:
+    """
+    POST .../{id}/autoriser_prix/ {"prix_unitaire": ..., "motif": "..."}
+    Dérogation au tarif (client sous contrat uniquement), réservée à la
+    Direction et à la DAF ; tracée (qui, motif, prix du tarif).
+    """
+
+    def get_permissions(self):
+        if self.action == "autoriser_prix":
+            return [acces(ecriture=(Profil.DIRECTION, Profil.COMPTABILITE_DAF, Profil.ADMIN_SI))()]
+        return super().get_permissions()
+
+    @action(detail=True, methods=["post"])
+    def autoriser_prix(self, request, pk=None):
+        from apps.core.validation import convertir_decimal
+        ligne = self.get_object()
+        try:
+            ligne.prix_unitaire = convertir_decimal(request.data.get("prix_unitaire"), "Le prix unitaire")
+        except ValueError as erreur:
+            return Response({"erreur": str(erreur)}, status=400)
+        ligne.motif_derogation = (request.data.get("motif") or "").strip()
+        ligne.derogation_autorisee_par = request.user
+        ligne.save()
+        return Response(self.get_serializer(ligne).data)
+
+
+class LigneCommandeViewSet(DerogationPrixMixin, viewsets.ModelViewSet):
     queryset = models.LigneCommande.objects.all()
     serializer_class = serializers.LigneCommandeSerializer
     permission_classes = [acces(
@@ -116,6 +142,24 @@ class FactureViewSet(HistoriqueMixin, viewsets.ModelViewSet):
         except ValueError as erreur:
             return Response({"erreur": str(erreur)}, status=400)
         return Response(self.get_serializer(facture).data)
+
+    @action(detail=True, methods=["get", "post"])
+    def sfec(self, request, pk=None):
+        """
+        GET  .../factures/{id}/sfec/ : données préparées pour la facture normalisée + statut ;
+        POST .../factures/{id}/sfec/ : demande la certification (refusée tant que la SFEC n'est pas activée).
+        """
+        from apps.fiscalite import sfec
+        facture = self.get_object()
+        if request.method == "POST":
+            try:
+                sfec.certifier(facture)
+            except ValueError as erreur:
+                return Response({"erreur": str(erreur)}, status=400)
+        return Response({
+            "statut": facture.sfec_statut, "code": facture.sfec_code, "message": facture.sfec_message,
+            "donnees": sfec.donnees_facture(facture),
+        })
 
     @action(detail=True, methods=["get"], url_path="pdf")
     def pdf(self, request, pk=None):
@@ -206,3 +250,83 @@ def impayes(request):
             })
     resultat.sort(key=lambda f: f["jours_retard"], reverse=True)
     return Response(resultat)
+
+
+
+class DevisViewSet(HistoriqueMixin, viewsets.ModelViewSet):
+    """Devis : brouillon -> envoyé -> accepté (en tout ou partie, crée la commande) / refusé / expiré."""
+    queryset = models.Devis.objects.select_related("client").prefetch_related("lignes__article", "commandes")
+    serializer_class = serializers.DevisSerializer
+    permission_classes = [acces(
+        lecture=(Profil.DIRECTION, Profil.COMPTABILITE_DAF,),
+        ecriture=(Profil.COMMERCIAL, Profil.ADMIN_SI,),
+    )]
+    filterset_fields = ["client", "statut", "type_commande"]
+    search_fields = ["numero", "client__nom"]
+
+    def get_queryset(self):
+        # Les devis envoyés dont la date de validité est passée deviennent « Expiré ».
+        for devis in models.Devis.objects.filter(statut=models.StatutDevis.ENVOYE, date_validite__lt=models.Devis._aujourd_hui()):
+            devis.expirer_si_depasse()
+        return super().get_queryset()
+
+    def perform_create(self, serializer):
+        serializer.save(cree_par=self.request.user)
+
+    def _action(self, methode, *args):
+        devis = self.get_object()
+        try:
+            resultat = getattr(devis, methode)(*args)
+        except ValueError as erreur:
+            return Response({"erreur": str(erreur)}, status=400)
+        return devis, resultat
+
+    @action(detail=True, methods=["post"])
+    def envoyer(self, request, pk=None):
+        resultat = self._action("envoyer")
+        return resultat if isinstance(resultat, Response) else Response(self.get_serializer(resultat[0]).data)
+
+    @action(detail=True, methods=["post"])
+    def reviser(self, request, pk=None):
+        """POST .../devis/{id}/reviser/ : repasse un devis envoyé en brouillon pour le modifier."""
+        resultat = self._action("reviser")
+        return resultat if isinstance(resultat, Response) else Response(self.get_serializer(resultat[0]).data)
+
+    @action(detail=True, methods=["post"])
+    def refuser(self, request, pk=None):
+        resultat = self._action("refuser", request.data.get("motif", ""))
+        return resultat if isinstance(resultat, Response) else Response(self.get_serializer(resultat[0]).data)
+
+    @action(detail=True, methods=["post"])
+    def accepter(self, request, pk=None):
+        """
+        POST .../devis/{id}/accepter/  {"quantites": {"<id ligne>": quantité, ...}} (facultatif)
+        Crée la commande liée (brouillon) avec les quantités acceptées.
+        """
+        quantites = request.data.get("quantites") or {}
+        if not isinstance(quantites, dict):
+            return Response({"erreur": "« quantites » : {id de ligne: quantité acceptée}."}, status=400)
+        resultat = self._action("accepter", request.user, quantites)
+        if isinstance(resultat, Response):
+            return resultat
+        devis, commande = resultat
+        return Response({"devis": self.get_serializer(devis).data,
+                         "commande": serializers.CommandeSerializer(commande).data}, status=201)
+
+    @action(detail=True, methods=["get"], url_path="pdf")
+    def pdf(self, request, pk=None):
+        """GET /api/commercial/devis/{id}/pdf/ : devis à remettre au client."""
+        from apps.core import documents
+        from apps.core.pdf import telecharger
+        objet = self.get_object()
+        return documents.devis(objet, request.user).reponse(f"devis-{objet.numero}", telecharger(request))
+
+
+class LigneDevisViewSet(DerogationPrixMixin, viewsets.ModelViewSet):
+    queryset = models.LigneDevis.objects.select_related("article", "devis")
+    serializer_class = serializers.LigneDevisSerializer
+    permission_classes = [acces(
+        lecture=(Profil.DIRECTION, Profil.COMPTABILITE_DAF,),
+        ecriture=(Profil.COMMERCIAL, Profil.ADMIN_SI,),
+    )]
+    filterset_fields = ["devis", "article"]

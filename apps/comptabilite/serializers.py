@@ -88,3 +88,9 @@ class ParametreControleSerializer(ValidationModeleMixin, serializers.ModelSerial
     def get_modifie_par_nom(self, parametre):
         utilisateur = parametre.modifie_par
         return (utilisateur.get_full_name() or utilisateur.username) if utilisateur else None
+
+
+class RegleCompteSerializer(ValidationModeleMixin, serializers.ModelSerializer):
+    class Meta:
+        model = models.RegleCompte
+        fields = "__all__"

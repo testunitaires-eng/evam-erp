@@ -11,7 +11,12 @@ Schémas (comptes paramétrables, voir CompteParametre) :
 - Encaissement       : D 571 Caisse | 521 Banque | Mobile Money / C 411 Client
 - Décaissement       : D 658 Charges diverses (ou 411 Client si remboursement) / C 571 Caisse
 - Avoir utilisé      : D 709 Rabais accordés / C 411 Client
-- Réception d'achat  : D 602 Achats de matières / C 401 Fournisseur
+- Réception d'achat  : D 60x Achats (selon la nature de l'article) / C 401 Fournisseur
+- Ventes comptoir    : particuliers au comptant -> pas d'écriture par facture ni par
+                       encaissement, mais une SYNTHÈSE à la clôture de la session de
+                       caisse : D 571 (ou banque / Mobile Money) / C 702x, C taxes
+Les comptes de vente (702x par activité, format...) et d'achat (par nature
+d'article) se paramètrent dans RegleCompte.
 """
 
 from decimal import Decimal
@@ -73,28 +78,89 @@ def ecritures_de(document):
     )
 
 
-def ecrire_facture(facture):
-    """Vente : le client doit le TTC ; ventes HT par compte de vente de l'article, taxes à l'État."""
-    client = facture.client
+def compte_de_vente(article):
+    """Compte de vente : compte saisi sur l'article, sinon règle paramétrée (702x par activité / format), sinon défaut."""
+    from .models import RegleCompte, SensCompte
+    return (article.compte_vente or RegleCompte.compte_pour(article, SensCompte.VENTE)
+            or compte(CleCompte.VENTES_PRODUITS_FINIS))
+
+
+def compte_d_achat(article):
+    """Compte d'achat selon la nature de l'article (règle paramétrée), sinon achats de matières."""
+    from .models import RegleCompte, SensCompte
+    return RegleCompte.compte_pour(article, SensCompte.ACHAT) or compte(CleCompte.ACHATS_MATIERES)
+
+
+def credits_de_vente(facture, part=Decimal(1)):
+    """{compte: montant} des ventes HT (par compte de vente) et des taxes d'une facture, au prorata `part`."""
     credits = {}
-    taxes = {CleCompte.TVA_COLLECTEE: Decimal("0"), CleCompte.ACCISES: Decimal("0"), CleCompte.CENTIMES_ADDITIONNELS: Decimal("0")}
     for ligne in facture.lignes_facture.select_related("article"):
-        numero = ligne.article.compte_vente or compte(CleCompte.VENTES_PRODUITS_FINIS)
-        credits[numero] = credits.get(numero, Decimal("0")) + Decimal(ligne.montant_ht)
-        taxes[CleCompte.TVA_COLLECTEE] += Decimal(ligne.montant_tva)
-        taxes[CleCompte.ACCISES] += Decimal(ligne.montant_accise)
-        taxes[CleCompte.CENTIMES_ADDITIONNELS] += Decimal(ligne.montant_centimes)
-    libelle = f"Facture {facture.numero} - {client.nom}"
-    lignes = [(numero, "", libelle, 0, montant) for numero, montant in credits.items()]
-    lignes += [(compte(cle), "", f"{CleCompte(cle).label} - {facture.numero}", 0, montant) for cle, montant in taxes.items()]
-    # Écart d'arrondi éventuel (TTC arrondi ligne par ligne) : sur la 1re ligne de vente.
-    total_credit = sum((Decimal(l[4]).quantize(CENTIME) for l in lignes), Decimal("0"))
-    ecart = Decimal(facture.montant_total).quantize(CENTIME) - total_credit
+        for numero, montant in (
+            (compte_de_vente(ligne.article), ligne.montant_ht), (compte(CleCompte.TVA_COLLECTEE), ligne.montant_tva),
+            (compte(CleCompte.ACCISES), ligne.montant_accise), (compte(CleCompte.CENTIMES_ADDITIONNELS), ligne.montant_centimes),
+        ):
+            if montant:
+                credits[numero] = credits.get(numero, Decimal("0")) + Decimal(montant) * part
+    return credits
+
+
+def equilibrer(lignes, total):
+    """Arrondi : l'écart au centime va sur la plus grosse ligne de crédit."""
+    lignes = [(n, t, x, d, Decimal(c).quantize(CENTIME)) for n, t, x, d, c in lignes]
+    ecart = Decimal(total).quantize(CENTIME) - sum((l[4] for l in lignes), Decimal("0"))
     if ecart and lignes:
-        numero, tiers, texte, debit, credit = lignes[0]
-        lignes[0] = (numero, tiers, texte, debit, Decimal(credit) + ecart)
+        index = max(range(len(lignes)), key=lambda i: lignes[i][4])
+        numero, tiers, texte, debit, credit = lignes[index]
+        lignes[index] = (numero, tiers, texte, debit, credit + ecart)
+    return lignes
+
+
+def vente_en_synthese(facture):
+    """
+    Q63 : vente au comptant à un particulier en caisse -> pas de compte
+    client individuel ; elle est comptabilisée dans l'écriture de synthèse
+    de la session de caisse (D 571 / C 702x, taxes), le détail restant
+    dans la caisse.
+    """
+    return facture.client.type_client == "PARTICULIER" and facture.commande.type_commande == "COMPTANT"
+
+
+def ecrire_facture(facture):
+    """Vente : le client doit le TTC ; ventes HT par compte de vente (702x), taxes à l'État."""
+    if vente_en_synthese(facture):
+        return None
+    client = facture.client
+    libelle = f"Facture {facture.numero} - {client.nom}"
+    lignes = [(numero, "", libelle, 0, montant) for numero, montant in credits_de_vente(facture).items()]
+    lignes = equilibrer(lignes, facture.montant_total)
     lignes.insert(0, (compte(CleCompte.CLIENTS), client.code, libelle, facture.montant_total, 0))
     return passer_ecriture(facture, Journal.VENTES, facture.numero, libelle, lignes)
+
+
+def ecrire_synthese_caisse(session):
+    """
+    Clôture de session : une écriture de synthèse pour les ventes au
+    comptant aux particuliers encaissées dans la session :
+    D 571 / 521 / 5215 (par mode de paiement) / C 702x (HT par compte de
+    vente) et C taxes, au prorata de chaque encaissement.
+    """
+    debits, credits, total = {}, {}, Decimal("0")
+    for encaissement in session.encaissements.select_related("facture__client", "facture__commande"):
+        facture = encaissement.facture
+        if not vente_en_synthese(facture) or not facture.montant_total:
+            continue
+        part = Decimal(encaissement.montant) / Decimal(facture.montant_total)
+        tresorerie = compte(TRESORERIE_PAR_MODE[encaissement.mode_paiement])
+        debits[tresorerie] = debits.get(tresorerie, Decimal("0")) + Decimal(encaissement.montant)
+        for numero, montant in credits_de_vente(facture, part).items():
+            credits[numero] = credits.get(numero, Decimal("0")) + montant
+        total += Decimal(encaissement.montant)
+    if not total:
+        return None
+    libelle = f"Synthèse ventes comptoir - {session.caisse.nom} - session {session.pk} du {session.date_cloture:%d/%m/%Y}"
+    lignes = [(numero, "", libelle, montant, 0) for numero, montant in debits.items()]
+    lignes += equilibrer([(numero, "", libelle, 0, montant) for numero, montant in credits.items()], total)
+    return passer_ecriture(session, Journal.CAISSE, f"CAISSE-{session.pk}", libelle, lignes)
 
 
 def contre_passer(document, motif):
@@ -117,6 +183,8 @@ TRESORERIE_PAR_MODE = {
 
 def ecrire_encaissement(encaissement):
     facture = encaissement.facture
+    if vente_en_synthese(facture):
+        return None   # comptabilisé dans la synthèse de la session de caisse
     libelle = f"Encaissement {encaissement.numero} - facture {facture.numero} - {facture.client.nom}"
     return passer_ecriture(encaissement, Journal.CAISSE, encaissement.numero, libelle, [
         (compte(TRESORERIE_PAR_MODE[encaissement.mode_paiement]), "", libelle, encaissement.montant, 0),
@@ -158,6 +226,6 @@ def ecrire_reception(ligne_reception):
         f"- {commande.fournisseur.nom}"
     )
     return passer_ecriture(ligne_reception, Journal.ACHATS, commande.numero, libelle, [
-        (compte(CleCompte.ACHATS_MATIERES), "", libelle, montant, 0),
+        (compte_d_achat(ligne_commande.article), "", libelle, montant, 0),
         (compte(CleCompte.FOURNISSEURS), commande.fournisseur.code, libelle, 0, montant),
     ])

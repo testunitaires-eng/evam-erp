@@ -294,7 +294,16 @@ class Equipement(ValidationAvantEnregistrement, models.Model):
     designation = models.CharField("Désignation", max_length=100)
     type_equipement = models.CharField("Type", max_length=20, choices=TypeEquipement.choices)
     usine = models.ForeignKey(Usine, verbose_name="Usine", on_delete=models.PROTECT, related_name="equipements")
-    poste = models.ForeignKey(Poste, verbose_name="Poste", on_delete=models.PROTECT, null=True, blank=True, related_name="equipements")
+    poste = models.ForeignKey(Poste, verbose_name="Poste principal", on_delete=models.PROTECT, null=True, blank=True, related_name="equipements")
+    postes_supplementaires = models.ManyToManyField(
+        Poste, verbose_name="Autres postes réalisés", blank=True, related_name="equipements_secondaires",
+        help_text="Machine combinée (ex : remplissage + bouchage) : modélisée une seule fois, rattachée à tous ses postes.",
+    )
+    inducteur_amortissement = models.CharField(
+        "Inducteur d'amortissement", max_length=30, blank=True,
+        help_text="Clé d'imputation de l'amortissement selon l'usage réel (m³ d'eau, heures machine, bouteilles, packs...). "
+                  "Vide = volume d'eau en amont, heures machine ailleurs.",
+    )
     activite = models.ForeignKey(
         Activite, verbose_name="Activité dédiée", on_delete=models.PROTECT, null=True, blank=True,
         related_name="equipements", help_text="Vide = équipement commun à plusieurs activités.",
@@ -325,6 +334,14 @@ class Equipement(ValidationAvantEnregistrement, models.Model):
     def est_commun(self):
         return self.activite_id is None
 
+    def realise(self, poste):
+        """La machine réalise-t-elle ce poste (poste principal ou poste supplémentaire) ?"""
+        if poste is None:
+            return True
+        if not self.poste_id and not self.pk:
+            return True
+        return self.poste_id == poste.pk or (self.pk and self.postes_supplementaires.filter(pk=poste.pk).exists())
+
     @property
     def amortissement_mensuel(self):
         if self.valeur_acquisition and self.duree_amortissement_mois:
@@ -339,6 +356,12 @@ class Equipement(ValidationAvantEnregistrement, models.Model):
     def clean(self):
         exiger_positif_optionnel(self.cadence_nominale, "cadence_nominale", "La cadence", strict=True)
         exiger_positif_optionnel(self.valeur_acquisition, "valeur_acquisition", "La valeur d'acquisition")
+        if self.inducteur_amortissement:
+            from apps.couts.models import Inducteur
+            if self.inducteur_amortissement not in Inducteur.values or self.inducteur_amortissement in (
+                Inducteur.PALETTES_JOURS, Inducteur.KM, Inducteur.QUANTITE_LIVREE, Inducteur.AUCUN,
+            ):
+                raise ValidationError({"inducteur_amortissement": "Choisissez un inducteur de production (m³ d'eau, heures machine, bouteilles...)."})
         if self.poste_id:
             ligne = self.poste.ligne
             if self.usine_id and ligne.usine_id != self.usine_id:
@@ -524,7 +547,7 @@ class EtapeCircuit(ValidationAvantEnregistrement, models.Model):
             if self.circuit_id and self.poste.ligne.activite_id != self.circuit.activite_id:
                 raise ValidationError({"poste": f"Le poste {self.poste.code} est sur une ligne d'une autre activité."})
         if self.equipement_id:
-            if self.poste_id and self.equipement.poste_id and self.equipement.poste_id != self.poste_id:
+            if self.poste_id and self.equipement.poste_id and not self.equipement.realise(self.poste):
                 raise ValidationError({"equipement": f"La machine {self.equipement.code} n'est pas affectée à ce poste."})
             if self.circuit_id and self.equipement.activite_id and self.equipement.activite_id != self.circuit.activite_id:
                 raise ValidationError({"equipement": f"La machine {self.equipement.code} est dédiée à une autre activité."})

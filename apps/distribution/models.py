@@ -177,6 +177,13 @@ class PreparationLivraison(ValidationAvantEnregistrement, models.Model):
         if self.statut == StatutPreparation.SORTIE_MAGASIN:
             raise ValidationError("Une préparation sortie du magasin ne peut pas être supprimée (le stock a été mouvementé).")
 
+    def save(self, *args, **kwargs):
+        creation = self._state.adding
+        with transaction.atomic():
+            super().save(*args, **kwargs)
+            if creation:
+                self.commande.avancer_vers(StatutCommande.EN_PREPARATION)
+
     @transaction.atomic
     def confirmer_sortie(self, utilisateur):
         """
@@ -302,6 +309,8 @@ class BonLivraison(ValidationAvantEnregistrement, models.Model):
         Lève ValueError avec le motif sinon.
         """
         commande = self.commande
+        if commande.type_commande == TypeCommande.CONTRAT:
+            return   # client sous contrat : facturé après confirmation de réception
         facture = getattr(commande, "facture", None)
         if facture is None or facture.statut == StatutFacture.ANNULEE:
             raise ValueError(
@@ -346,6 +355,25 @@ class BonLivraison(ValidationAvantEnregistrement, models.Model):
         self.confirme_par = utilisateur
         self.date_livraison = timezone.now()
         self.save()
+        self.facturer_apres_livraison()
+
+    def facturer_apres_livraison(self):
+        """
+        Après la confirmation de réception : la commande passe « Livrée ».
+        Client sous contrat (Q70) : la facture est émise automatiquement
+        (lignes reprises de la commande, écriture comptable) ; comptant :
+        la facture existe déjà, la commande passe « Facturée ».
+        """
+        from apps.commercial.models import Facture
+        commande = self.commande
+        commande.avancer_vers(StatutCommande.LIVREE)
+        facture = Facture.objects.filter(commande=commande).exclude(statut=StatutFacture.ANNULEE).first()
+        if facture is None and commande.type_commande == TypeCommande.CONTRAT:
+            facture = Facture.objects.create(commande=commande)
+            facture.generer_lignes_depuis_commande()
+        if facture is not None:
+            commande.refresh_from_db()
+            commande.avancer_vers(StatutCommande.FACTUREE)
 
     def verifier_suppression(self):
         if self.statut == StatutLivraison.LIVREE or self.reclamations.exists():

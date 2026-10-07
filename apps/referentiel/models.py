@@ -1119,6 +1119,39 @@ class FicheTechnique(ValidationAvantEnregistrement, models.Model):
         self.date_validation = timezone.now()
         self.save()
 
+    @transaction.atomic
+    def mettre_a_jour_prix(self, prix, utilisateur):
+        """
+        Q26 : toute modification d'une recette en vigueur crée une nouvelle
+        version. Copie la fiche (paramètres, formats, composition) avec les
+        nouveaux prix {id matière: prix}, la valide et archive celle-ci.
+        Les OF existants gardent le prix de leur création.
+        """
+        from apps.core.validation import convertir_decimal
+        if self.statut != StatutFicheTechnique.VALIDEE:
+            raise ValueError("Seule une recette validée se met à jour par nouvelle version (en brouillon, modifiez-la).")
+        prix = {str(cle): valeur for cle, valeur in (prix or {}).items()}
+        lignes = list(self.composition.all())
+        inconnues = set(prix) - {str(ligne.matiere_id) for ligne in lignes}
+        if not prix or inconnues:
+            raise ValueError("Indiquez les nouveaux prix des éléments de la recette : {id matière: prix}.")
+        version = (FicheTechnique.objects.filter(article_id=self.article_id).aggregate(m=models.Max("version"))["m"] or 0) + 1
+        copie = FicheTechnique.objects.create(
+            article=self.article, version=version, cree_par=utilisateur,
+            **{champ: getattr(self, champ) for champ in self.CHAMPS_RECETTE + ("document_reference",)},
+        )
+        copie.formats_associes.set(self.formats_associes.all())
+        for ligne in lignes:
+            nouveau = prix.get(str(ligne.matiere_id))
+            CompositionFicheTechnique.objects.create(
+                fiche_technique=copie, matiere=ligne.matiere, quantite_necessaire=ligne.quantite_necessaire,
+                prix_unitaire=convertir_decimal(nouveau, "Le prix unitaire", strict=False) if nouveau is not None else ligne.prix_unitaire,
+                base_calcul=ligne.base_calcul, article_format=ligne.article_format, ordre_incorporation=ligne.ordre_incorporation,
+                role=ligne.role, etape=ligne.etape, perte_theorique_pct=ligne.perte_theorique_pct, unite=ligne.unite,
+            )
+        copie.valider(utilisateur)
+        return copie
+
     def mettre_en_test(self):
         """Brouillon -> En test (essais avant validation) ; la composition est alors figée."""
         if self.statut != StatutFicheTechnique.BROUILLON:
@@ -1188,6 +1221,8 @@ class FicheTechnique(ValidationAvantEnregistrement, models.Model):
             besoin = Decimal(ligne.quantite_necessaire) * base
             if ligne.perte_theorique_pct:
                 besoin = besoin * (Decimal(100) + Decimal(ligne.perte_theorique_pct)) / Decimal(100)
+            if ligne.unite and ligne.unite != ligne.matiere.unite_mesure:
+                besoin = ConversionUnite.convertir(besoin, ligne.unite, ligne.matiere.unite_mesure, ligne.matiere)
             resultat.append((ligne, besoin))
         return resultat
 
@@ -1230,6 +1265,11 @@ class CompositionFicheTechnique(ValidationAvantEnregistrement, models.Model):
     perte_theorique_pct = models.DecimalField(
         "Perte théorique (%)", max_digits=5, decimal_places=2, null=True, blank=True,
     )
+    unite = models.CharField(
+        "Unité de la quantité", max_length=10, choices=UniteMesure.choices, blank=True,
+        help_text="Unité de consommation (ex : G pour 20 g de stabilisant). Vide = unité de consommation de "
+                  "l'article, sinon son unité de stock. Les besoins de l'OF sont convertis en unité de stock.",
+    )
     prix_unitaire = models.DecimalField(
         "Prix unitaire de l'élément", max_digits=14, decimal_places=2, default=0,
         help_text="Prix d'une unité de la matière (ex : 1 000 FCFA le litre de ferment). Sert à chiffrer "
@@ -1257,7 +1297,7 @@ class CompositionFicheTechnique(ValidationAvantEnregistrement, models.Model):
         for champ in ("fiche_technique", "matiere", "article_format", "etape"):
             if valeur_en_base(self, champ) != getattr(self, f"{champ}_id"):
                 return False
-        for champ in ("quantite_necessaire", "base_calcul", "ordre_incorporation", "perte_theorique_pct", "role"):
+        for champ in ("quantite_necessaire", "base_calcul", "ordre_incorporation", "perte_theorique_pct", "role", "unite"):
             if valeur_en_base(self, champ) != getattr(self, champ):
                 return False
         return True
@@ -1282,8 +1322,18 @@ class CompositionFicheTechnique(ValidationAvantEnregistrement, models.Model):
                     f"{self.article_format.code} n'utilise pas cette recette : ajoutez-le d'abord aux formats associés."
                 )})
         mise_a_jour_prix = self.seul_le_prix_change()
-        if mise_a_jour_prix and self.fiche_technique.statut == StatutFicheTechnique.ARCHIVEE:
-            raise ValidationError("Cette fiche technique est archivée : ses prix ne se modifient plus.")
+        if mise_a_jour_prix and self.fiche_technique.statut != StatutFicheTechnique.BROUILLON:
+            raise ValidationError(
+                "Une recette en vigueur ne se modifie pas directement (Q26) : utilisez « mettre à jour les prix », "
+                "qui crée une nouvelle version et conserve l'historique."
+            )
+        if not self.unite and self.matiere_id and self.pk is None:   # lignes existantes : unité de stock
+            self.unite = self.matiere.unite_consommation or self.matiere.unite_mesure
+        if self.unite and self.matiere_id and self.unite != self.matiere.unite_mesure \
+                and ConversionUnite.facteur_entre(self.unite, self.matiere.unite_mesure, self.matiere) is None:
+            raise ValidationError({"unite": (
+                f"Aucune conversion de {self.unite} vers {self.matiere.unite_mesure} pour {self.matiere.code} : paramétrez-la."
+            )})
         if self.pk and not mise_a_jour_prix:
             ancienne_fiche = FicheTechnique.objects.filter(pk=valeur_en_base(self, "fiche_technique")).first()
             if ancienne_fiche and ancienne_fiche.statut != StatutFicheTechnique.BROUILLON:

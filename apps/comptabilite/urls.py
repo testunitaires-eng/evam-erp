@@ -8,5 +8,6 @@ router.register("clotures", views.ClotureViewSet, basename="cloture")
 router.register("comptes", views.CompteParametreViewSet, basename="compteparametre")
 router.register("seuils-controles", views.ParametreControleViewSet, basename="parametrecontrole")
 router.register("ecritures", views.EcritureComptableViewSet, basename="ecriturecomptable")
+router.register("regles-comptes", views.RegleCompteViewSet, basename="reglecompte")
 
 urlpatterns = router.urls

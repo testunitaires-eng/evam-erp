@@ -47,6 +47,10 @@ class BaseValidation(TestCase):
         self.client_evam = Client.objects.create(
             code="C1", nom="Client test", type_client="SOCIETE", encours_autorise=100000,
         )
+        # Tarif imposé : tarif public du produit de test.
+        from datetime import date
+        from apps.commercial.models import Tarif
+        Tarif.objects.create(article=self.produit, prix_unitaire=100, date_debut_validite=date(2020, 1, 1))
 
     # -- utilitaires -------------------------------------------------------
     def entree_stock(self, article, quantite, depot="Magasin principal"):
@@ -96,7 +100,7 @@ class CommercialTests(BaseValidation):
     def test_ligne_depassant_encours_non_enregistree(self):
         commande = self.commande(lignes=())
         r = self.api.post("/api/commercial/lignes-commande/", {
-            "commande": commande.id, "article": self.produit.id, "quantite": "10", "prix_unitaire": "50000",
+            "commande": commande.id, "article": self.produit.id, "quantite": "5000",   # 5 000 x 100 (tarif) > encours
         }, format="json")
         self.assert_refus(r)
         self.assertIn("Encours", str(r.data))
@@ -150,6 +154,9 @@ class CommercialTests(BaseValidation):
 
     def test_generer_lignes_tout_ou_rien(self):
         sans_fiscal = self.nouveau_pf(format="100 cl")
+        from datetime import date
+        from apps.commercial.models import Tarif
+        Tarif.objects.create(article=sans_fiscal, prix_unitaire=10, date_debut_validite=date(2020, 1, 1))
         commande = self.commande()
         LigneCommande.objects.create(commande=commande, article=sans_fiscal, quantite=1, prix_unitaire=10)
         commande.statut = "VALIDEE"
@@ -403,12 +410,14 @@ class LivraisonEtClientBloqueTests(BaseValidation):
         bon.refresh_from_db()
         self.assertEqual(bon.statut, "LIVREE")
 
-    def test_livraison_contrat_sur_facture_emise(self):
+    def test_contrat_facture_apres_confirmation_de_reception(self):
+        """Q70 : client sous contrat -> livraison -> confirmation de réception -> facture automatique."""
         commande, bon = self._bon_livraison(type_commande="CONTRAT")
-        url = f"/api/distribution/bons-livraison/{bon.id}/confirmer_livraison/"
-        self.assert_refus(self.api.post(url))
-        Facture.objects.create(commande=commande).generer_lignes_depuis_commande()
-        self.assertEqual(self.api.post(url).status_code, 200)
+        self.assert_refus(self.api.post("/api/commercial/factures/", {"commande": commande.id}, format="json"))
+        self.assertEqual(self.api.post(f"/api/distribution/bons-livraison/{bon.id}/confirmer_livraison/").status_code, 200)
+        commande.refresh_from_db()
+        self.assertEqual(commande.statut, "FACTUREE")
+        self.assertEqual(commande.facture.lignes_facture.count(), 1)
 
 
 class CompositionEtDemandeMatieresTests(BaseValidation):
@@ -982,7 +991,7 @@ class ComptabiliteTests(BaseValidation):
         facture.generer_lignes_depuis_commande()
         self.assertEqual(self.ecriture(facture), {
             ("411", self.client_evam.code, Decimal("1180.00"), Decimal("0")),
-            ("702", "", Decimal("0"), Decimal("1000.00")),
+            ("7020", "", Decimal("0"), Decimal("1000.00")),     # ventes Eau (règle paramétrée, Q63)
             ("4431", "", Decimal("0"), Decimal("180.00")),
         })
 
@@ -1296,8 +1305,13 @@ class ChiffrageMatieresTests(BaseValidation):
         ancien = self.api_rp.post("/api/production/ordres-fabrication/", {"article": self.yaourt.id, "quantite_a_produire": "4"}, format="json").data["id"]
         ligne = CompositionFicheTechnique.objects.get(fiche_technique=self.fiche, matiere=self.ferment)
         url = f"/api/referentiel/compositions/{ligne.id}/"
-        self.assertEqual(self.api.patch(url, {"prix_unitaire": "1100"}, format="json").status_code, 200)   # fiche validée : prix seul OK
+        self.assert_refus(self.api.patch(url, {"prix_unitaire": "1100"}, format="json"))                 # recette en vigueur : pas de modification directe
         self.assert_refus(self.api.patch(url, {"quantite_necessaire": "2"}, format="json"))              # quantité figée
+        r = self.api.post(f"/api/referentiel/fiches-techniques/{self.fiche.id}/mettre_a_jour_prix/",
+                          {"prix": {str(self.ferment.id): "1100"}}, format="json")                         # nouvelle version (Q26)
+        self.assertEqual((r.status_code, r.data["version"], r.data["statut"]), (201, 2, "VALIDEE"))
+        self.fiche.refresh_from_db()
+        self.assertEqual(self.fiche.statut, "ARCHIVEE")
         nouveau = self.api_rp.post("/api/production/ordres-fabrication/", {"article": self.yaourt.id, "quantite_a_produire": "4"}, format="json").data["id"]
         total = lambda of_id: Decimal(self.api_rp.get(f"/api/production/ordres-fabrication/{of_id}/").data["montant_total_matieres"])
         self.assertEqual((total(ancien), total(nouveau)), (Decimal("5200.00"), Decimal("5600.00")))

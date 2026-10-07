@@ -100,6 +100,10 @@ class ExportComptableViewSet(viewsets.ModelViewSet):
             date__gte=export.periode_debut, date__lte=export.periode_fin,
             journal__in=self.JOURNAUX_PAR_EXPORT[export.type_export],
         ).prefetch_related("lignes")
+        if export.format_fichier != models.FormatExport.SAGE_CSV:
+            reponse = exporter_generique(export, ecritures)
+            ecritures.filter(exportee_le__isnull=True).update(exportee_le=timezone.now())
+            return reponse
         reponse = HttpResponse(content_type="text/csv; charset=utf-8")
         reponse["Content-Disposition"] = (
             f'attachment; filename="export_{export.type_export.lower()}_{export.periode_debut}_{export.periode_fin}.csv"'
@@ -176,3 +180,58 @@ class ClotureViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         serializer.save(valide_par=self.request.user)
+
+
+COLONNES_EXPORT = ["journal", "date", "numero_ecriture", "piece", "compte", "compte_tiers", "libelle", "debit", "credit"]
+
+
+def exporter_generique(export, ecritures):
+    """
+    Export indépendant du logiciel comptable (Q65) : une ligne par ligne
+    d'écriture, colonnes stables, dates ISO (AAAA-MM-JJ), point décimal.
+    CSV (UTF-8, « ; »), Excel ou JSON.
+    """
+    import json
+    lignes = [
+        [ecriture.journal, ecriture.date.isoformat(), ecriture.numero, ecriture.piece, ligne.compte, ligne.compte_tiers,
+         ligne.libelle, f"{ligne.debit:.2f}", f"{ligne.credit:.2f}"]
+        for ecriture in ecritures for ligne in ecriture.lignes.all()
+    ]
+    nom = f"export_{export.type_export.lower()}_{export.periode_debut}_{export.periode_fin}"
+    if export.format_fichier == models.FormatExport.XLSX:
+        from decimal import Decimal
+        from apps.core.exports import classeur
+        return classeur([("Écritures", COLONNES_EXPORT, [l[:7] + [Decimal(l[7]), Decimal(l[8])] for l in lignes])], nom)
+    if export.format_fichier == models.FormatExport.JSON:
+        contenu = json.dumps({
+            "periode_debut": export.periode_debut.isoformat(), "periode_fin": export.periode_fin.isoformat(),
+            "type": export.type_export, "lignes": [dict(zip(COLONNES_EXPORT, l)) for l in lignes],
+        }, ensure_ascii=False, indent=1)
+        reponse = HttpResponse(contenu, content_type="application/json; charset=utf-8")
+        reponse["Content-Disposition"] = f'attachment; filename="{nom}.json"'
+        return reponse
+    reponse = HttpResponse(content_type="text/csv; charset=utf-8")
+    reponse["Content-Disposition"] = f'attachment; filename="{nom}.csv"'
+    reponse.write("\ufeff")   # BOM : ouverture correcte des accents dans un tableur
+    ecrivain = csv.writer(reponse, delimiter=";")
+    ecrivain.writerow(COLONNES_EXPORT)
+    ecrivain.writerows(lignes)
+    return reponse
+
+
+class RegleCompteViewSet(viewsets.ModelViewSet):
+    """Correspondance article / activité / catégorie / format -> compte (702x, 60x) : paramétrée par la DAF."""
+    queryset = models.RegleCompte.objects.select_related("article", "activite", "format", "unite_vente")
+    serializer_class = serializers.RegleCompteSerializer
+    permission_classes = [acces(lecture=(Profil.DIRECTION,), ecriture=(Profil.COMPTABILITE_DAF, Profil.ADMIN_SI))]
+    filterset_fields = ["sens", "activite", "type_article", "format", "actif"]
+
+    @action(detail=False, methods=["get"])
+    def simuler(self, request):
+        """GET .../regles-comptes/simuler/?article=<id> : comptes de vente et d'achat qui seront utilisés."""
+        from apps.referentiel.models import Article
+        from .ecritures import compte_d_achat, compte_de_vente
+        article = Article.objects.filter(pk=request.query_params.get("article")).first()
+        if article is None:
+            return Response({"erreur": "Paramètre « article » manquant ou inconnu."}, status=400)
+        return Response({"article": article.code, "compte_vente": compte_de_vente(article), "compte_achat": compte_d_achat(article)})

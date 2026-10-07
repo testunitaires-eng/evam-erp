@@ -44,6 +44,8 @@ router.register("lignes-commande", views.LigneCommandeViewSet, basename="ligneco
 router.register("factures", views.FactureViewSet, basename="facture")
 router.register("lignes-facture", views.LigneFactureViewSet, basename="lignefacture")
 router.register("avoirs", views.AvoirViewSet, basename="avoir")
+router.register("devis", views.DevisViewSet, basename="devis")
+router.register("lignes-devis", views.LigneDevisViewSet, basename="lignedevis")
 
 urlpatterns = [
     path("impayes/", views.impayes, name="impayes"),

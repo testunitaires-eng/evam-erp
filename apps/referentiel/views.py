@@ -128,6 +128,19 @@ class FicheTechniqueViewSet(HistoriqueMixin, viewsets.ModelViewSet):
         return Response(self.get_serializer(fiche).data, status=201)
 
     @action(detail=True, methods=["post"])
+    def mettre_a_jour_prix(self, request, pk=None):
+        """
+        POST .../fiches-techniques/{id}/mettre_a_jour_prix/ {"prix": {"<id matière>": "1100", ...}}
+        Nouvelle version validée avec les nouveaux prix ; l'ancienne est archivée (historique conservé).
+        """
+        fiche = self.get_object()
+        try:
+            copie = fiche.mettre_a_jour_prix(request.data.get("prix"), request.user)
+        except ValueError as erreur:
+            return Response({"erreur": str(erreur)}, status=400)
+        return Response(self.get_serializer(copie).data, status=201)
+
+    @action(detail=True, methods=["post"])
     def mettre_en_test(self, request, pk=None):
         """POST .../fiches-techniques/{id}/mettre_en_test/ : Brouillon -> En test (composition figée pendant l'essai)."""
         fiche = self.get_object()

@@ -36,6 +36,19 @@ class TourneeSerializer(ValidationModeleMixin, serializers.ModelSerializer):
 
 
 class PreparationLivraisonSerializer(ValidationModeleMixin, serializers.ModelSerializer):
+    # Le Magasinier ne lit pas les commandes : la préparation porte ce qu'il doit sortir.
+    commande_numero = serializers.CharField(source="commande.numero", read_only=True)
+    client_nom = serializers.CharField(source="commande.client.nom", read_only=True)
+    depot_nom = serializers.CharField(source="depot.nom", read_only=True, default=None)
+    lignes = serializers.SerializerMethodField()
+
+    def get_lignes(self, preparation):
+        """Articles à préparer (sans prix : le Magasinier n'en a pas besoin)."""
+        return [
+            {"article": l.article_id, "code": l.article.code, "designation": l.article.designation, "quantite": l.quantite}
+            for l in preparation.commande.lignes.all()
+        ]
+
     class Meta:
         model = models.PreparationLivraison
         fields = "__all__"

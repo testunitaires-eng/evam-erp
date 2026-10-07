@@ -12,6 +12,9 @@ from apps.core.serializers import ValidationModeleMixin
 from . import models
 
 class LotSerializer(ValidationModeleMixin, serializers.ModelSerializer):
+    article_code = serializers.CharField(source="article.code", read_only=True)
+    article_designation = serializers.CharField(source="article.designation", read_only=True)
+
     class Meta:
         model = models.Lot
         fields = "__all__"

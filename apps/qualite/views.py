@@ -15,12 +15,18 @@ from apps.comptes.permissions import role_required, lecture_seule_pour, acces
 from apps.comptes.models import Profil
 
 
+LECTEURS_LOTS = (Profil.DIRECTION, Profil.RESPONSABLE_PRODUCTION,)
+GESTION_LOTS = (Profil.RESPONSABLE_QUALITE, Profil.ADMIN_SI,)
+
+
 class LotViewSet(HistoriqueMixin, viewsets.ModelViewSet):
-    queryset = models.Lot.objects.all()
+    queryset = models.Lot.objects.select_related("article")
     serializer_class = serializers.LotSerializer
+    # Le Magasinier consulte les lots (lot d'une ligne de transfert, étiquettes),
+    # mais pas le rappel (clients livrés et leurs contacts).
     permission_classes = [acces(
-        lecture=(Profil.DIRECTION, Profil.RESPONSABLE_PRODUCTION,),
-        ecriture=(Profil.RESPONSABLE_QUALITE, Profil.ADMIN_SI,),
+        lecture=LECTEURS_LOTS + (Profil.MAGASINIER,),
+        ecriture=GESTION_LOTS,
     )]
     filterset_fields = ["article", "statut", "ordre_fabrication"]
     search_fields = ["numero_lot"]
@@ -103,7 +109,7 @@ class LotViewSet(HistoriqueMixin, viewsets.ModelViewSet):
                          for p in lot.palettes.select_related("depot", "emplacement")],
         })
 
-    @action(detail=True, methods=["get"])
+    @action(detail=True, methods=["get"], permission_classes=[acces(lecture=LECTEURS_LOTS, ecriture=GESTION_LOTS)])
     def rappel(self, request, pk=None):
         """
         GET /api/qualite/lots/{id}/rappel/

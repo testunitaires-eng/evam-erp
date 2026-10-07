@@ -111,6 +111,9 @@ class PlanProductionSerializer(ValidationModeleMixin, serializers.ModelSerialize
 
 class OrdreFabricationSerializer(SansDonneesFinancieresPourAgentMixin, ValidationModeleMixin, serializers.ModelSerializer):
     montant_total_matieres = serializers.DecimalField(max_digits=16, decimal_places=2, read_only=True)
+    # L'Agent Production ne lit pas les articles : le produit est porté par l'OF.
+    article_code = serializers.CharField(source="article.code", read_only=True)
+    article_designation = serializers.CharField(source="article.designation", read_only=True)
     activite_code = serializers.SerializerMethodField()
     usine_code = serializers.SerializerMethodField()
     ligne_code = serializers.CharField(source="ligne.code", read_only=True, default=None)
@@ -195,6 +198,10 @@ class ReservationMatiereSerializer(serializers.ModelSerializer):
 
 
 class BesoinMatierePrevuSerializer(SansDonneesFinancieresPourAgentMixin, ValidationModeleMixin, serializers.ModelSerializer):
+    of_numero = serializers.CharField(source="ordre_fabrication.numero", read_only=True)
+    matiere_code = serializers.CharField(source="matiere.code", read_only=True)
+    matiere_designation = serializers.CharField(source="matiere.designation", read_only=True)
+
     class Meta:
         model = models.BesoinMatierePrevu
         fields = "__all__"

@@ -7,6 +7,7 @@ Administrateur SI le peuvent ; les autres profils sont en lecture
 seule sur ce module.
 """
 
+from drf_spectacular.utils import extend_schema
 from rest_framework import viewsets
 from apps.core.views import HistoriqueMixin
 from rest_framework.decorators import action
@@ -79,8 +80,9 @@ class FicheTechniqueViewSet(HistoriqueMixin, viewsets.ModelViewSet):
     """
     queryset = models.FicheTechnique.objects.all()
     serializer_class = serializers.FicheTechniqueSerializer
+    # La Qualité lit les recettes pour son plan de contrôle (sans les prix).
     permission_classes = [acces(
-        lecture=(Profil.RESPONSABLE_PRODUCTION,),
+        lecture=(Profil.RESPONSABLE_PRODUCTION, Profil.RESPONSABLE_QUALITE,),
         ecriture=(Profil.ADMIN_SI,),
     )]
     filterset_fields = ["article", "statut"]
@@ -160,7 +162,8 @@ class FicheTechniqueViewSet(HistoriqueMixin, viewsets.ModelViewSet):
             return Response({"erreur": str(erreur)}, status=400)
         return Response(self.get_serializer(fiche).data)
 
-    @action(detail=True, methods=["get"])
+    # Simulation chiffrée : pas pour la Qualité.
+    @action(detail=True, methods=["get"], permission_classes=[acces(lecture=(Profil.RESPONSABLE_PRODUCTION,), ecriture=(Profil.ADMIN_SI,))])
     def simuler_besoins(self, request, pk=None):
         """
         GET .../fiches-techniques/{id}/simuler_besoins/?article=<id>&quantite=<q>
@@ -194,7 +197,7 @@ class CompositionFicheTechniqueViewSet(viewsets.ModelViewSet):
     queryset = models.CompositionFicheTechnique.objects.all()
     serializer_class = serializers.CompositionFicheTechniqueSerializer
     permission_classes = [acces(
-        lecture=(Profil.RESPONSABLE_PRODUCTION,),
+        lecture=(Profil.RESPONSABLE_PRODUCTION, Profil.RESPONSABLE_QUALITE,),
         ecriture=(Profil.ADMIN_SI,),
     )]
     filterset_fields = ["fiche_technique", "matiere"]
@@ -209,10 +212,19 @@ class FicheConditionnementViewSet(viewsets.ModelViewSet):
 
 
 
+@extend_schema(deprecated=True, description="Obsolète : remplacé par le plan de contrôle (/api/qualite/plan-controle/).")
 class ControleQualiteRequisViewSet(viewsets.ModelViewSet):
+    """
+    Ancienne liste des contrôles attendus (bloc 7 de la fiche article),
+    remplacée par le plan de contrôle du module qualité et utilisée par
+    aucun calcul : consultable, plus modifiable (Admin SI pour le ménage).
+    """
     queryset = models.ControleQualiteRequis.objects.all()
     serializer_class = serializers.ControleQualiteRequisSerializer
-    permission_classes = [role_required(Profil.RESPONSABLE_PRODUCTION, Profil.RESPONSABLE_QUALITE, Profil.ADMIN_SI)]
+    permission_classes = [acces(
+        lecture=(Profil.RESPONSABLE_PRODUCTION, Profil.RESPONSABLE_QUALITE,),
+        ecriture=(Profil.ADMIN_SI,),
+    )]
     filterset_fields = ["article", "moment", "obligatoire"]
 
 

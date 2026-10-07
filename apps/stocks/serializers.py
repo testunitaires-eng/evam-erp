@@ -54,7 +54,10 @@ class LigneInventaireSerializer(ValidationModeleMixin, serializers.ModelSerializ
 
 class LotMatiereSerializer(ValidationModeleMixin, serializers.ModelSerializer):
     article_code = serializers.CharField(source="article.code", read_only=True)
+    article_designation = serializers.CharField(source="article.designation", read_only=True)
     depot_nom = serializers.CharField(source="depot.nom", read_only=True)
+    # La Qualité ne lit pas les fournisseurs : le nom est porté par le lot.
+    fournisseur_nom = serializers.CharField(source="fournisseur.nom", read_only=True, default=None)
     est_perime = serializers.BooleanField(read_only=True)
 
     class Meta:

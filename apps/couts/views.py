@@ -2,6 +2,7 @@
 Le Responsable Production ne voit jamais ces données financières
 (règle explicite : "ne saisit jamais la valeur financière des matières")."""
 
+from drf_spectacular.utils import extend_schema
 from rest_framework import viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -20,6 +21,7 @@ class CoutMatiereViewSet(viewsets.ModelViewSet):
     filterset_fields = ["article"]
 
 
+@extend_schema(deprecated=True, description="Obsolète : remplacé par les charges des coûts en cascade (/api/couts/charges/).")
 class CoutEnergieViewSet(viewsets.ModelViewSet):
     queryset = models.CoutEnergie.objects.all()
     serializer_class = serializers.CoutEnergieSerializer
@@ -34,6 +36,7 @@ class CoutMainOeuvreViewSet(viewsets.ModelViewSet):
     filterset_fields = ["ordre_fabrication"]
 
 
+@extend_schema(deprecated=True, description="Obsolète : remplacé par /api/couts/cascade/amortissements/ (depuis les équipements).")
 class AmortissementViewSet(viewsets.ModelViewSet):
     queryset = models.Amortissement.objects.all()
     serializer_class = serializers.AmortissementSerializer

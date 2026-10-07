@@ -483,7 +483,7 @@ class BesoinMatierePrevuViewSet(viewsets.ReadOnlyModelViewSet):
     L'Agent Production consulte les besoins de SES OF uniquement (ceux où
     il est affecté) ; aucune donnée financière n'y figure.
     """
-    queryset = models.BesoinMatierePrevu.objects.all()
+    queryset = models.BesoinMatierePrevu.objects.select_related("ordre_fabrication", "matiere").order_by("id")
     serializer_class = serializers.BesoinMatierePrevuSerializer
     permission_classes = [acces(
         lecture=(
@@ -502,12 +502,15 @@ class BesoinMatierePrevuViewSet(viewsets.ReadOnlyModelViewSet):
 
     def list(self, request, *args, **kwargs):
         """Ajoute stock_disponible / manquant / situation (§5.5) à chaque ligne, sans les stocker en base."""
-        reponse = super().list(request, *args, **kwargs)
-        for item, obj in zip(reponse.data.get("results", reponse.data), self.filter_queryset(self.get_queryset())):
+        # Calculés sur les objets de LA page renvoyée (et non sur le début de la liste).
+        page = self.paginate_queryset(self.filter_queryset(self.get_queryset()))
+        objets = page if page is not None else list(self.filter_queryset(self.get_queryset()))
+        donnees = self.get_serializer(objets, many=True).data
+        for item, obj in zip(donnees, objets):
             item["stock_disponible"] = obj.stock_disponible()
             item["manquant"] = obj.manquant()
             item["situation"] = obj.situation()
-        return reponse
+        return self.get_paginated_response(donnees) if page is not None else Response(donnees)
 
 
 class DemandeMatiereViewSet(HistoriqueMixin, viewsets.ModelViewSet):

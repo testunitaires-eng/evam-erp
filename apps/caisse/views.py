@@ -210,9 +210,11 @@ class DecaissementViewSet(HistoriqueMixin, FiltreCaissierMixin, viewsets.ModelVi
     """§9.1/§9.2 : sortie de caisse autorisée, distincte d'un encaissement."""
     queryset = models.Decaissement.objects.all()
     serializer_class = serializers.DecaissementSerializer
+    # Seul le caissier de la session demande (règle du modèle) : la DAF et
+    # l'Admin SI consultent ; Direction et DAF décident par /autoriser/ et /refuser/.
     permission_classes = [acces(
-        lecture=(Profil.DIRECTION,),
-        ecriture=(Profil.CAISSIER, Profil.ADMIN_SI, Profil.COMPTABILITE_DAF,),
+        lecture=(Profil.DIRECTION, Profil.COMPTABILITE_DAF, Profil.ADMIN_SI,),
+        ecriture=(Profil.CAISSIER,),
     )]
     filterset_fields = ["session_caisse", "statut"]
     search_fields = ["numero"]

@@ -20,7 +20,32 @@ class ReclamationClientSerializer(ValidationModeleMixin, serializers.ModelSerial
         return valeur
 
 
+class ReclamationAReceptionnerSerializer(serializers.ModelSerializer):
+    """
+    Vue réduite d'une réclamation pour le Magasinier et la Qualité, qui ne
+    lisent pas les réclamations : de quoi rattacher un retour, sans prix
+    ni description.
+    """
+    client_nom = serializers.CharField(source="client.nom", read_only=True)
+    article_code = serializers.CharField(source="article.code", read_only=True)
+    article_designation = serializers.CharField(source="article.designation", read_only=True)
+    bon_livraison_numero = serializers.CharField(source="bon_livraison.numero", read_only=True, default=None)
+
+    class Meta:
+        model = models.ReclamationClient
+        fields = [
+            "id", "numero", "client", "client_nom", "article", "article_code", "article_designation",
+            "quantite", "bon_livraison_numero", "statut", "date_creation",
+        ]
+
+
 class RetourPhysiqueSerializer(ValidationModeleMixin, serializers.ModelSerializer):
+    reclamation_numero = serializers.CharField(source="reclamation.numero", read_only=True)
+    client_nom = serializers.CharField(source="reclamation.client.nom", read_only=True)
+    article_code = serializers.CharField(source="reclamation.article.code", read_only=True)
+    article_designation = serializers.CharField(source="reclamation.article.designation", read_only=True)
+    lot_numero = serializers.CharField(source="lot.numero_lot", read_only=True, default=None)
+
     class Meta:
         model = models.RetourPhysique
         fields = "__all__"
@@ -29,6 +54,10 @@ class RetourPhysiqueSerializer(ValidationModeleMixin, serializers.ModelSerialize
 
 
 class ControleRetourSerializer(ValidationModeleMixin, serializers.ModelSerializer):
+    reclamation_numero = serializers.CharField(source="retour_physique.reclamation.numero", read_only=True)
+    client_nom = serializers.CharField(source="retour_physique.reclamation.client.nom", read_only=True)
+    article_code = serializers.CharField(source="retour_physique.reclamation.article.code", read_only=True)
+
     class Meta:
         model = models.ControleRetour
         fields = "__all__"

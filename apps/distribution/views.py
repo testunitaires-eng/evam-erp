@@ -209,7 +209,9 @@ class TourneeViewSet(viewsets.ModelViewSet):
 
 
 class PreparationLivraisonViewSet(HistoriqueMixin, viewsets.ModelViewSet):
-    queryset = models.PreparationLivraison.objects.all()
+    queryset = models.PreparationLivraison.objects.select_related(
+        "commande__client", "depot",
+    ).prefetch_related("commande__lignes__article")
     serializer_class = serializers.PreparationLivraisonSerializer
     permission_classes = [acces(
         lecture=(Profil.DIRECTION,),

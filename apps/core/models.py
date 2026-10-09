@@ -16,7 +16,7 @@ class SequenceNumerotation(models.Model):
     Compteur par préfixe (ex: 'OF', 'LOT', 'CMD', 'FACT', 'BL', 'ENC').
     Une ligne par type de document.
     """
-    prefixe = models.CharField("Préfixe", max_length=10, unique=True)
+    prefixe = models.CharField("Préfixe", max_length=40, unique=True)
     dernier_numero = models.PositiveIntegerField("Dernier numéro utilisé", default=0)
 
     class Meta:

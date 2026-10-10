@@ -179,7 +179,10 @@ from rest_framework.decorators import api_view, permission_classes as drf_permis
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 
-LECTEURS_QUALITE = (Profil.DIRECTION, Profil.RESPONSABLE_PRODUCTION, Profil.AGENT_PRODUCTION, Profil.MAGASINIER, Profil.COMPTABILITE_DAF,)
+# Le Resp. Achats lit les non-conformités : il doit pouvoir ouvrir le
+# contrôle d'origine et l'instrument utilisé (lecture seule).
+LECTEURS_QUALITE = (Profil.DIRECTION, Profil.RESPONSABLE_PRODUCTION, Profil.AGENT_PRODUCTION, Profil.MAGASINIER, Profil.COMPTABILITE_DAF,
+                    Profil.RESPONSABLE_ACHATS,)
 PARAMETRAGE_QUALITE = acces(lecture=LECTEURS_QUALITE, ecriture=(Profil.RESPONSABLE_QUALITE, Profil.ADMIN_SI,))
 
 
@@ -293,7 +296,7 @@ class ResultatControleViewSet(viewsets.ModelViewSet):
     )
     serializer_class = serializers.ResultatControleSerializer
     permission_classes = [acces(
-        lecture=(Profil.DIRECTION, Profil.COMPTABILITE_DAF,),
+        lecture=(Profil.DIRECTION, Profil.COMPTABILITE_DAF, Profil.RESPONSABLE_ACHATS,),
         ecriture=(Profil.RESPONSABLE_QUALITE, Profil.RESPONSABLE_PRODUCTION, Profil.AGENT_PRODUCTION, Profil.MAGASINIER, Profil.ADMIN_SI,),
     )]
     filterset_class = ResultatControleFiltre

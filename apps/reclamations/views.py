@@ -30,7 +30,7 @@ PROFILS_RECONDITIONNEMENT = (Profil.RESPONSABLE_PRODUCTION, Profil.AGENT_PRODUCT
 
 
 class ReclamationClientViewSet(HistoriqueMixin, viewsets.ModelViewSet):
-    queryset = models.ReclamationClient.objects.all()
+    queryset = models.ReclamationClient.objects.select_related("retour_physique__controle")
     serializer_class = serializers.ReclamationClientSerializer
     permission_classes = [role_required(*PROFILS_RECLAMATION)]
     filterset_fields = ["client", "statut", "type_probleme", "produit_retourne"]

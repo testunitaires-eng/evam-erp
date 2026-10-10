@@ -7,6 +7,27 @@ from apps.core.serializers import ValidationModeleMixin
 from . import models
 
 class ReclamationClientSerializer(ValidationModeleMixin, serializers.ModelSerializer):
+    # Le Commercial et la Distribution ne lisent pas les retours ni les
+    # contrôles : état du retour recopié ici (la solution est refusée tant
+    # que le retour est « En quarantaine »).
+    retour_statut = serializers.CharField(source="retour_physique.statut", read_only=True, default=None)
+    retour_statut_libelle = serializers.CharField(source="retour_physique.get_statut_display", read_only=True, default=None)
+    retour_quantite = serializers.DecimalField(
+        source="retour_physique.quantite_retournee", max_digits=12, decimal_places=3, read_only=True, default=None,
+    )
+    retour_date_reception = serializers.DateTimeField(source="retour_physique.date_reception", read_only=True, default=None)
+    controle_resultat = serializers.CharField(source="retour_physique.controle.resultat", read_only=True, default=None)
+    controle_resultat_libelle = serializers.CharField(
+        source="retour_physique.controle.get_resultat_display", read_only=True, default=None,
+    )
+    solution_possible = serializers.SerializerMethodField()
+
+    def get_solution_possible(self, reclamation):
+        if reclamation.statut == models.StatutReclamation.CLOTUREE:
+            return False
+        retour = getattr(reclamation, "retour_physique", None)
+        return retour is None or retour.statut != models.StatutRetourPhysique.EN_QUARANTAINE
+
     class Meta:
         model = models.ReclamationClient
         fields = "__all__"

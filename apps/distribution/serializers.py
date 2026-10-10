@@ -30,6 +30,11 @@ class DepotSerializer(ValidationModeleMixin, serializers.ModelSerializer):
 
 
 class TourneeSerializer(ValidationModeleMixin, serializers.ModelSerializer):
+    # Le Chauffeur ne lit pas /vehicules/ ni /chauffeurs/ : libellés recopiés ici.
+    vehicule_immatriculation = serializers.CharField(source="vehicule.immatriculation", read_only=True)
+    vehicule_type = serializers.CharField(source="vehicule.type_vehicule", read_only=True)
+    chauffeur_nom = serializers.CharField(source="chauffeur.__str__", read_only=True)
+
     class Meta:
         model = models.Tournee
         fields = "__all__"
@@ -67,6 +72,9 @@ class BonLivraisonSerializer(ValidationModeleMixin, serializers.ModelSerializer)
     commande_numero = serializers.CharField(source="commande.numero", read_only=True)
     client_nom = serializers.CharField(source="commande.client.nom", read_only=True)
     client_adresse = serializers.CharField(source="commande.client.adresse", read_only=True)
+    tournee_numero = serializers.CharField(source="tournee.numero", read_only=True, default=None)
+    vehicule_immatriculation = serializers.CharField(source="tournee.vehicule.immatriculation", read_only=True, default=None)
+    chauffeur_nom = serializers.CharField(source="tournee.chauffeur.__str__", read_only=True, default=None)
     articles = serializers.SerializerMethodField()
     statut_paiement = serializers.SerializerMethodField()
 

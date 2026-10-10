@@ -38,7 +38,7 @@
 
 
 # class TourneeViewSet(viewsets.ModelViewSet):
-#     queryset = models.Tournee.objects.all()
+#     queryset = models.Tournee.objects.select_related("vehicule", "chauffeur__utilisateur")
 #     serializer_class = serializers.TourneeSerializer
 #     permission_classes = [lecture_seule_pour(Profil.RESPONSABLE_DISTRIBUTION, Profil.ADMIN_SI)]
 #     filterset_fields = ["chauffeur", "vehicule", "date_tournee"]
@@ -94,7 +94,7 @@
 
 
 # class BonLivraisonViewSet(viewsets.ModelViewSet):
-#     queryset = models.BonLivraison.objects.all()
+#     queryset = models.BonLivraison.objects.select_related("tournee__vehicule", "tournee__chauffeur__utilisateur")
 #     serializer_class = serializers.BonLivraisonSerializer
 #     permission_classes = [role_required(
 #         Profil.RESPONSABLE_DISTRIBUTION, Profil.CHAUFFEUR, Profil.ADMIN_SI,

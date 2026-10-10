@@ -43,7 +43,8 @@ class CodeFiscalViewSet(viewsets.ModelViewSet):
     queryset = models.CodeFiscal.objects.all()
     serializer_class = serializers.CodeFiscalSerializer
     permission_classes = [acces(
-        lecture=(Profil.DIRECTION, Profil.RESPONSABLE_PRODUCTION,),
+        # Le Commercial lit les taux pour estimer les taxes de l'aperçu de facture.
+        lecture=(Profil.DIRECTION, Profil.RESPONSABLE_PRODUCTION, Profil.COMMERCIAL,),
         ecriture=(Profil.COMPTABILITE_DAF, Profil.ADMIN_SI,),
     )]
     filterset_fields = ["actif", "exonere", "sfec_actif", "famille_fiscale"]
@@ -55,7 +56,8 @@ class FamilleFiscaleViewSet(viewsets.ModelViewSet):
     queryset = models.FamilleFiscale.objects.all()
     serializer_class = serializers.FamilleFiscaleSerializer
     permission_classes = [acces(
-        lecture=(Profil.DIRECTION, Profil.RESPONSABLE_PRODUCTION,),
+        # Le Commercial lit les taux pour estimer les taxes de l'aperçu de facture.
+        lecture=(Profil.DIRECTION, Profil.RESPONSABLE_PRODUCTION, Profil.COMMERCIAL,),
         ecriture=(Profil.COMPTABILITE_DAF, Profil.ADMIN_SI,),
     )]
     filterset_fields = ["actif"]

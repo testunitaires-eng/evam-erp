@@ -255,12 +255,20 @@ class DemandeComplementaireSerializer(ValidationModeleMixin, serializers.ModelSe
 
 
 class SortieMatiereSerializer(ValidationModeleMixin, serializers.ModelSerializer):
+    of_numero = serializers.CharField(source="ordre_fabrication.numero", read_only=True)
+    matiere_code = serializers.CharField(source="matiere.code", read_only=True)
+    matiere_designation = serializers.CharField(source="matiere.designation", read_only=True)
+
     class Meta:
         model = models.SortieMatiere
         fields = "__all__"
 
 
 class RetourMatiereSerializer(ValidationModeleMixin, serializers.ModelSerializer):
+    of_numero = serializers.CharField(source="ordre_fabrication.numero", read_only=True)
+    matiere_code = serializers.CharField(source="matiere.code", read_only=True)
+    matiere_designation = serializers.CharField(source="matiere.designation", read_only=True)
+
     class Meta:
         model = models.RetourMatiere
         fields = "__all__"

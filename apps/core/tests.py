@@ -1443,3 +1443,68 @@ class CoherenceRolesTests(BaseValidation):
         self.assertEqual(page_2["count"], 26)
         ligne = page_2["results"][0]
         self.assertEqual((ligne["matiere_code"], ligne["stock_disponible"], ligne["manquant"], ligne["situation"]), ("MP2", 7, 0, "Disponible"))
+
+    def test_chauffeur_voit_l_immatriculation(self):
+        """B-13 : la tournée et le BL du chauffeur portent le véhicule (il ne lit pas /vehicules/)."""
+        from apps.distribution.models import BonLivraison, Chauffeur, Tournee, Vehicule
+        utilisateur, chauffeur = self.client_pour(Profil.CHAUFFEUR)
+        tournee = Tournee.objects.create(
+            chauffeur=Chauffeur.objects.create(utilisateur=utilisateur),
+            vehicule=Vehicule.objects.create(immatriculation="AB-123"), date_tournee="2026-10-01",
+        )
+        self.entree_stock(self.produit, 100, depot="Dépôt produits finis")
+        commande = self.commande(statut="VALIDEE")
+        preparation = PreparationLivraison.objects.create(commande=commande, lancee_par=self.admin)
+        self.api.post(f"/api/distribution/preparations/{preparation.id}/confirmer_preparation/")
+        self.api.post(f"/api/distribution/preparations/{preparation.id}/confirmer_sortie/")
+        bon = BonLivraison.objects.create(commande=commande, tournee=tournee)
+        self.assertEqual(chauffeur.get("/api/distribution/vehicules/").status_code, 403)
+        self.assertEqual(chauffeur.get(f"/api/distribution/tournees/{tournee.id}/").data["vehicule_immatriculation"], "AB-123")
+        donnees = chauffeur.get(f"/api/distribution/bons-livraison/{bon.id}/").data
+        self.assertEqual((donnees["tournee_numero"], donnees["vehicule_immatriculation"]), (tournee.numero, "AB-123"))
+
+    def test_commercial_voit_l_etat_du_retour(self):
+        """B-14 : la réclamation porte l'état du retour physique (quarantaine = solution refusée)."""
+        from apps.reclamations.models import ReclamationClient
+        _, magasinier = self.client_pour(Profil.MAGASINIER)
+        _, commercial = self.client_pour(Profil.COMMERCIAL)
+        _, distribution = self.client_pour(Profil.RESPONSABLE_DISTRIBUTION)
+        reclamation = ReclamationClient.objects.create(
+            client=self.client_evam, article=self.produit, quantite=2, prix_unitaire=100,
+            type_probleme="PRODUIT_DEFECTUEUX", description="Bouteilles fuyantes", cree_par=self.admin,
+        )
+        url = f"/api/reclamations/reclamations/{reclamation.id}/"
+        donnees = commercial.get(url).data
+        self.assertEqual((donnees["retour_statut"], donnees["solution_possible"]), (None, True))
+        magasinier.post("/api/reclamations/retours-physiques/", {"reclamation": reclamation.id, "quantite_retournee": "2"}, format="json")
+        for api in (commercial, distribution):
+            donnees = api.get(url).data
+            self.assertEqual((donnees["retour_statut"], donnees["controle_resultat"], donnees["solution_possible"]),
+                             ("EN_QUARANTAINE", None, False))
+
+    def test_commercial_lit_les_taux_de_tva(self):
+        """B-15 : lecture seule des codes fiscaux pour l'aperçu de facture."""
+        _, commercial = self.client_pour(Profil.COMMERCIAL)
+        codes = commercial.get("/api/fiscalite/codes-fiscaux/").data["results"]
+        self.assertEqual(Decimal(codes[0]["taux_tva"]), Decimal(18))
+        self.assertEqual(commercial.get("/api/fiscalite/familles-fiscales/").status_code, 200)
+        self.assertEqual(commercial.patch(f"/api/fiscalite/codes-fiscaux/{self.code_fiscal.id}/", {"taux_tva": "0"}, format="json").status_code, 403)
+
+    def test_sorties_et_retours_matiere_portent_l_of(self):
+        """B-16."""
+        from apps.production.models import RetourMatiere
+        _, responsable = self.client_pour(Profil.RESPONSABLE_PRODUCTION)
+        self.entree_stock(self.matiere, 100)
+        of = OrdreFabrication.objects.create(article=self.produit, quantite_a_produire=10, responsable=self.admin)
+        SortieMatiere.objects.create(ordre_fabrication=of, matiere=self.matiere, quantite_sortie=20)
+        RetourMatiere.objects.create(ordre_fabrication=of, matiere=self.matiere, quantite_retournee=5)
+        for url in ("/api/production/sorties-matieres/", "/api/production/retours-matieres/"):
+            ligne = responsable.get(url).data["results"][0]
+            self.assertEqual((ligne["of_numero"], ligne["matiere_code"]), (of.numero, "MP1"))
+
+    def test_achats_lit_controles_et_instruments(self):
+        """B-17 : le Resp. Achats ouvre le contrôle et l'instrument d'une NC, en lecture seule."""
+        _, achats = self.client_pour(Profil.RESPONSABLE_ACHATS)
+        for url in ("/api/qualite/non-conformites/", "/api/qualite/controles-realises/", "/api/qualite/instruments/"):
+            self.assertEqual(achats.get(url).status_code, 200, url)
+        self.assertEqual(achats.post("/api/qualite/instruments/", {"designation": "pH-mètre"}, format="json").status_code, 403)

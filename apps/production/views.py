@@ -595,7 +595,7 @@ class DemandeComplementaireViewSet(HistoriqueMixin, AffectationAgentMixin, views
 #     permission_classes = [role_required(Profil.MAGASINIER, Profil.ADMIN_SI)]
 #     filterset_fields = ["ordre_fabrication", "matiere", "type_sortie"]
 class SortieMatiereViewSet(viewsets.ModelViewSet):
-    queryset = models.SortieMatiere.objects.all()
+    queryset = models.SortieMatiere.objects.select_related("ordre_fabrication", "matiere")
     serializer_class = serializers.SortieMatiereSerializer
     permission_classes = [acces(
         lecture=(Profil.RESPONSABLE_PRODUCTION, Profil.DIRECTION,),
@@ -615,7 +615,7 @@ class SortieMatiereViewSet(viewsets.ModelViewSet):
 #     permission_classes = [role_required(Profil.MAGASINIER, Profil.ADMIN_SI)]
 #     filterset_fields = ["ordre_fabrication", "matiere"]
 class RetourMatiereViewSet(viewsets.ModelViewSet):
-    queryset = models.RetourMatiere.objects.all()
+    queryset = models.RetourMatiere.objects.select_related("ordre_fabrication", "matiere")
     serializer_class = serializers.RetourMatiereSerializer
     permission_classes = [acces(
         lecture=(Profil.RESPONSABLE_PRODUCTION, Profil.DIRECTION,),

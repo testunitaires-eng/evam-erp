@@ -42,3 +42,7 @@ class PaletteAdmin(admin.ModelAdmin):
     search_fields = ("numero", "lot__numero_lot")
     list_select_related = ("lot", "depot", "emplacement", "cree_par")
     readonly_fields = ("numero", "cree_par", "date_creation")
+
+
+
+#jsdfsdfsd

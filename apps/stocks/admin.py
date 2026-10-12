@@ -33,3 +33,12 @@ class InventaireAdmin(admin.ModelAdmin):
 class LigneInventaireAdmin(admin.ModelAdmin):
     search_fields = ()
 
+
+
+@admin.register(models.Palette)
+class PaletteAdmin(admin.ModelAdmin):
+    list_display = ("numero", "lot", "depot", "emplacement", "quantite", "statut", "cree_par", "date_creation")
+    list_filter = ("statut", "depot")
+    search_fields = ("numero", "lot__numero_lot")
+    list_select_related = ("lot", "depot", "emplacement", "cree_par")
+    readonly_fields = ("numero", "cree_par", "date_creation")

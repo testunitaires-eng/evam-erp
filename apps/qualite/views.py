@@ -125,7 +125,10 @@ class LotViewSet(HistoriqueMixin, viewsets.ModelViewSet):
             "palettes_en_stock": list(lot.palettes.filter(statut="EN_STOCK").values_list("numero", flat=True)),
         })
 
-    @action(detail=True, methods=["post"])
+    # Le Magasinier n'est qu'en lecture sur les lots, mais il constitue les palettes.
+    @action(detail=True, methods=["post"], permission_classes=[acces(
+        ecriture=(Profil.MAGASINIER,) + GESTION_LOTS,
+    )])
     def palettiser(self, request, pk=None):
         """
         POST /api/qualite/lots/{id}/palettiser/  {"quantite_par_palette": 640} (facultatif)

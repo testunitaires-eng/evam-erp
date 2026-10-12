@@ -10,10 +10,12 @@ from datetime import date, timedelta
 from decimal import Decimal
 
 from django.utils import timezone
+from rest_framework.test import APIClient
 
 from apps.achats.models import (
     CommandeFournisseur, Fournisseur, LigneCommandeFournisseur, LigneReceptionAchat, ReceptionAchat, RetourFournisseur,
 )
+from apps.comptes.models import Profil, Utilisateur
 from apps.core.tests import BaseValidation
 from apps.couts import cascade
 from apps.couts.models import Charge
@@ -105,6 +107,12 @@ class PalettesTests(LotsProduitsFinisMixin, BaseValidation):
         etiquette = self.api.get(f"/api/stocks/palettes/{premiere.id}/etiquette/")
         self.assertEqual(etiquette["Content-Type"], "application/pdf")
         self.assertTrue(etiquette.content.startswith(b"%PDF"))
+
+    def test_le_magasinier_constitue_les_palettes(self):
+        magasinier = APIClient()
+        magasinier.force_authenticate(Utilisateur.objects.create_user("mag", password="x", profil=Profil.MAGASINIER))
+        r = magasinier.post(f"/api/qualite/lots/{self.lot.id}/palettiser/")
+        self.assertEqual(r.status_code, 201, r.content)
 
     def test_transfert_d_une_palette(self):
         self.api.post(f"/api/qualite/lots/{self.lot.id}/palettiser/")

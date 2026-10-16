@@ -12,6 +12,9 @@ router.register("couts-reels", views.CoutReelViewSet, basename="coutreel")
 router.register("natures", views.NatureCoutViewSet, basename="naturecout")
 router.register("charges", views.ChargeViewSet, basename="charge")
 router.register("repartitions", views.RepartitionCoutViewSet, basename="repartitioncout")
+router.register("factures", views.FactureChargeViewSet, basename="facturecharge")
+router.register("volumes-eau-sites", views.VolumeEauSiteViewSet, basename="volumeeausite")
+router.register("valeurs-cles", views.ValeurCleViewSet, basename="valeurcle")
 
 urlpatterns = [
     path("cascade/calculer/", views.calculer_periode, name="couts-calculer-periode"),
@@ -19,4 +22,5 @@ urlpatterns = [
     path("cascade/cout-revient/", views.cout_revient, name="couts-cout-revient"),
     path("cascade/eau-traitee/", views.cout_eau_traitee, name="couts-eau-traitee"),
     path("cascade/controle/", views.controle_double_compte, name="couts-controle"),
+    path("cascade/par-site/", views.cout_par_site, name="couts-par-site"),
 ] + router.urls

@@ -38,3 +38,22 @@ class CoutStandardAdmin(admin.ModelAdmin):
 class CoutReelAdmin(admin.ModelAdmin):
     search_fields = ()
 
+
+
+@admin.register(models.FactureCharge)
+class FactureChargeAdmin(admin.ModelAdmin):
+    list_display = ("numero", "reference", "periode", "montant_total")
+    list_filter = ("periode",)
+    search_fields = ("numero", "reference", "fournisseur")
+
+
+@admin.register(models.VolumeEauSite)
+class VolumeEauSiteAdmin(admin.ModelAdmin):
+    list_display = ("periode", "usine", "volume_m3", "statut_donnee", "source")
+    list_filter = ("periode", "usine", "statut_donnee")
+
+
+@admin.register(models.ValeurCle)
+class ValeurCleAdmin(admin.ModelAdmin):
+    list_display = ("inducteur", "usine", "activite", "valeur", "date_debut", "source")
+    list_filter = ("inducteur", "usine")

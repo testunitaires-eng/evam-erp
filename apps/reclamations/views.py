@@ -114,7 +114,7 @@ class CoutRetourPerteViewSet(viewsets.ModelViewSet):
     détruit (le reste - quantité, coût reconditionnement - est rempli
     automatiquement par le circuit).
     """
-    queryset = models.CoutRetourPerte.objects.all()
+    queryset = models.CoutRetourPerte.objects.select_related("reclamation")
     serializer_class = serializers.CoutRetourPerteSerializer
     permission_classes = [acces(
         lecture=(Profil.DIRECTION,),

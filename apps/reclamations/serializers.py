@@ -95,6 +95,8 @@ class ReconditionnementSerializer(ValidationModeleMixin, serializers.ModelSerial
 
 
 class CoutRetourPerteSerializer(ValidationModeleMixin, serializers.ModelSerializer):
+    reclamation_numero = serializers.CharField(source="reclamation.numero", read_only=True)
+
     class Meta:
         model = models.CoutRetourPerte
         fields = "__all__"

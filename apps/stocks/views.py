@@ -213,7 +213,7 @@ class TransfertStockViewSet(HistoriqueMixin, viewsets.ModelViewSet):
     Bons de transfert (stock usine -> dépôt extérieur...) : le Magasinier
     prépare et expédie ; le dépôt confirme la réception.
     """
-    queryset = models.TransfertStock.objects.select_related("depot_source", "depot_destination").prefetch_related("lignes")
+    queryset = models.TransfertStock.objects.select_related("depot_source", "depot_destination").prefetch_related("lignes__article", "lignes__lot")
     serializer_class = serializers.TransfertStockSerializer
     permission_classes = [acces(
         lecture=(Profil.DIRECTION, Profil.RESPONSABLE_DISTRIBUTION, Profil.COMMERCIAL, Profil.COMPTABILITE_DAF,),
@@ -275,7 +275,7 @@ class TransfertStockViewSet(HistoriqueMixin, viewsets.ModelViewSet):
 
 
 class LigneTransfertViewSet(viewsets.ModelViewSet):
-    queryset = models.LigneTransfert.objects.select_related("article", "transfert")
+    queryset = models.LigneTransfert.objects.select_related("article", "transfert", "lot")
     serializer_class = serializers.LigneTransfertSerializer
     permission_classes = [acces(
         lecture=(Profil.DIRECTION, Profil.RESPONSABLE_DISTRIBUTION, Profil.COMMERCIAL,),

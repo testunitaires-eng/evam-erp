@@ -70,6 +70,7 @@ class LotMatiereSerializer(ValidationModeleMixin, serializers.ModelSerializer):
 class LigneTransfertSerializer(ValidationModeleMixin, serializers.ModelSerializer):
     """Ligne libre (article, quantité, lot éventuel) ou palette entière (tout est repris de la palette)."""
     article_code = serializers.CharField(source="article.code", read_only=True)
+    lot_numero = serializers.CharField(source="lot.numero_lot", read_only=True, default=None)
 
     class Meta:
         model = models.LigneTransfert

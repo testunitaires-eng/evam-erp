@@ -123,6 +123,7 @@ class PhaseEtape(models.TextChoices):
     AMONT = "AMONT", "Eau : captage, traitement, stockage process"
     PREPARATION = "PREPARATION", "Préparation du produit"
     CONDITIONNEMENT = "CONDITIONNEMENT", "Remplissage et conditionnement"
+    SITE = "SITE", "Utilités et frais du site (transverses)"
     APRES_PRODUCTION = "APRES_PRODUCTION", "Après production (hors coût de production)"
 
 

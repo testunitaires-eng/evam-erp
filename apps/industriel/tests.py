@@ -9,11 +9,12 @@ Lancer : python manage.py test apps.industriel
 from datetime import date, timedelta
 from decimal import Decimal
 
+from django.core.exceptions import ValidationError
 from django.utils import timezone
 
 from apps.core.tests import BaseValidation
 from apps.couts import cascade
-from apps.couts.models import Charge, NatureCout, RepartitionCout
+from apps.couts.models import Charge, NatureCout, RepartitionCout, ValeurCle, VolumeEauSite
 from apps.industriel.models import Activite, Circuit, EtapeCircuit, EtapeStandard, Ligne, Usine
 from apps.production.models import (
     ConsommationLotMatiere, EtapeProduction, OrdreFabrication, ParametreProduction, RetourMatiere, SortieMatiere,
@@ -352,8 +353,8 @@ class QualiteModuleTests(QualiteBase):
         self.assertEqual(kpi["non_conformites"]["bloquantes_ouvertes"], 1)
 
 
-class CoutsCascadeTests(BaseValidation):
-    """Exemple du document : forage commun réparti au volume d'eau, puis aux OF, puis à l'unité."""
+class CoutsBase(BaseValidation):
+    """Deux OF clôturés (Eau 6 000 L, Jus 2 000 L) et la nature « forage »."""
 
     def setUp(self):
         super().setUp()
@@ -377,6 +378,10 @@ class CoutsCascadeTests(BaseValidation):
         OrdreFabrication.objects.filter(pk=of.pk).update(statut="CLOTURE", date_fin=timezone.now())
         of.refresh_from_db()
         return of
+
+
+class CoutsCascadeTests(CoutsBase):
+    """Exemple du document : forage commun réparti au volume d'eau, puis aux OF, puis à l'unité."""
 
     def test_cascade_forage_jusqu_a_l_unite(self):
         charge = Charge.objects.create(nature=self.forage, periode=self.periode, montant=Decimal("10000"), source="Facture SBEE 42")
@@ -429,6 +434,119 @@ class CoutsCascadeTests(BaseValidation):
         eau = {ligne["activite"]: ligne for ligne in self.api.get("/api/couts/cascade/eau-traitee/", {"periode": self.periode}).data}
         self.assertEqual(eau["EAU"]["cout_par_m3"], Decimal("1000"))      # 6 000 pour 6 m³
         self.assertTrue(self.api.get("/api/couts/cascade/controle/", {"periode": self.periode}).data["conforme"])
+
+
+class CoutsSitesTests(CoutsBase):
+    """Schémas client : niveau site (forage commun, charges d'un site, infrastructures), facture découpée, synthèse par site."""
+
+    def setUp(self):
+        super().setUp()
+        self.yaourt = self.nouveau_pf(famille="Yaourt", format="1 L", unite="Pack de 6", parfum="Fraise")
+        fiche = FicheTechnique.objects.create(article=self.yaourt, version=1, cree_par=self.admin)
+        CompositionFicheTechnique.objects.create(fiche_technique=fiche, matiere=self.matiere, quantite_necessaire=1)
+        fiche.valider(self.admin)
+        self.of_yaourt = self.of_cloture(self.yaourt, 1000, litres=1000)
+        self.us_eau, self.us_jy = Usine.objects.get(code="US-EAU"), Usine.objects.get(code="US-JY")
+        self.jus_act, self.yaourt_act = Activite.objects.get(code="JUS"), Activite.objects.get(code="YAOURT")
+
+    def repartition(self, charge, niveau, **filtres):
+        return RepartitionCout.objects.get(charge=charge, niveau=niveau, **filtres)
+
+    def test_charge_d_un_site_reste_sur_ses_activites(self):
+        nature = NatureCout.objects.get(libelle__startswith="Électricité utilités du site")   # litres produits
+        charge = Charge.objects.create(nature=nature, periode=self.periode, montant=Decimal("900"), usine=self.us_jy)
+        resultat = cascade.calculer_periode(self.periode)
+        self.assertEqual(resultat["anomalies_double_compte"], [])
+        charge.refresh_from_db()
+        self.assertEqual(charge.statut_repartition, "REPARTIE")
+        self.assertEqual(self.repartition(charge, "SITE").montant, Decimal("900.00"))
+        self.assertEqual(self.repartition(charge, "ACTIVITE", activite=self.jus_act).montant, Decimal("600.00"))     # 2 000 L sur 3 000
+        self.assertEqual(self.repartition(charge, "ACTIVITE", activite=self.yaourt_act).montant, Decimal("300.00"))
+        self.assertFalse(RepartitionCout.objects.filter(charge=charge, ordre_fabrication=self.of_eau).exists())
+
+    def test_charge_de_site_refuse_une_activite_d_un_autre_site(self):
+        nature = NatureCout.objects.get(libelle__startswith="Électricité utilités du site")
+        with self.assertRaises(ValidationError):
+            Charge.objects.create(nature=nature, periode=self.periode, montant=100, usine=self.us_jy, activite=Activite.objects.get(code="EAU"))
+
+    def test_forage_reparti_selon_les_volumes_des_sites(self):
+        VolumeEauSite.objects.create(periode=self.periode, usine=self.us_eau, volume_m3=7, source="Compteur C1")
+        VolumeEauSite.objects.create(periode=self.periode, usine=self.us_jy, volume_m3=3, statut_donnee="ESTIME",
+                                     justification="Estimation validée par la DAF (débit x temps de pompage).")
+        charge = Charge.objects.create(nature=self.forage, periode=self.periode, montant=Decimal("10000"))
+        resultat = cascade.calculer_periode(self.periode)
+        self.assertEqual(resultat["anomalies_double_compte"], [])
+        self.assertEqual(self.repartition(charge, "SITE", usine=self.us_eau).montant, Decimal("7000.00"))
+        self.assertEqual(self.repartition(charge, "SITE", usine=self.us_jy).montant, Decimal("3000.00"))
+        self.assertEqual(self.repartition(charge, "SITE", usine=self.us_jy).statut, "ESTIME")
+        # Site Eau mono-activité ; site Jus & Yaourt au volume d'eau des OF (2 000 L / 1 000 L).
+        self.assertEqual(self.repartition(charge, "OF", ordre_fabrication=self.of_eau).montant, Decimal("7000.00"))
+        self.assertEqual(self.repartition(charge, "OF", ordre_fabrication=self.of_jus).montant, Decimal("2000.00"))
+        self.assertEqual(self.repartition(charge, "OF", ordre_fabrication=self.of_yaourt).montant, Decimal("1000.00"))
+        self.assertEqual(self.repartition(charge, "OF", ordre_fabrication=self.of_jus).statut, "ESTIME")
+
+        synthese = self.api.get("/api/couts/cascade/par-site/", {"periode": self.periode}).data
+        sites = {site["usine"]: site for site in synthese["sites"]}
+        self.assertEqual(sites["US-EAU"]["electricite"], Decimal("7000.00"))
+        self.assertEqual(sites["US-JY"]["electricite"], Decimal("3000.00"))
+        jus = next(a for a in sites["US-JY"]["activites"] if a["activite"] == "JUS")
+        self.assertEqual(jus["descendu_aux_of"], Decimal("2000.00"))
+
+    def test_volume_d_eau_manquant_pour_un_site(self):
+        VolumeEauSite.objects.create(periode=self.periode, usine=self.us_eau, volume_m3=7)
+        charge = Charge.objects.create(nature=self.forage, periode=self.periode, montant=Decimal("10000"))
+        cascade.calculer_periode(self.periode)
+        charge.refresh_from_db()
+        self.assertEqual(charge.statut_repartition, "NON_REPARTIE")
+        self.assertIn("US-JY", charge.motif_non_repartition)
+
+    def test_cle_de_site_s_arrete_a_l_activite_sans_cle_vers_les_of(self):
+        debut = date(2000, 1, 1)
+        ValeurCle.objects.create(inducteur="SURFACE_M2", usine=self.us_eau, valeur=600, date_debut=debut)
+        ValeurCle.objects.create(inducteur="SURFACE_M2", usine=self.us_jy, activite=self.jus_act, valeur=250, date_debut=debut)
+        ValeurCle.objects.create(inducteur="SURFACE_M2", usine=self.us_jy, activite=self.yaourt_act, valeur=150, date_debut=debut)
+        nature = NatureCout.objects.get(libelle__startswith="Électricité commune des infrastructures")
+        charge = Charge.objects.create(nature=nature, periode=self.periode, montant=Decimal("1000"))
+        resultat = cascade.calculer_periode(self.periode)
+        self.assertEqual(resultat["anomalies_double_compte"], [])
+        charge.refresh_from_db()
+        self.assertEqual(charge.statut_repartition, "PARTIELLE")
+        self.assertEqual(self.repartition(charge, "SITE", usine=self.us_jy).montant, Decimal("400.00"))
+        self.assertEqual(self.repartition(charge, "ACTIVITE", activite=self.jus_act).montant, Decimal("250.00"))
+        self.assertFalse(charge.repartitions.filter(niveau="OF").exists())
+        # Décision du client : descente aux OF au volume produit.
+        nature.inducteur_of = "LITRES_PRODUITS"
+        nature.save()
+        cascade.calculer_periode(self.periode)
+        charge.refresh_from_db()
+        self.assertEqual(charge.statut_repartition, "REPARTIE")
+        self.assertEqual(self.repartition(charge, "OF", ordre_fabrication=self.of_eau).montant, Decimal("600.00"))
+
+    def test_facture_d_electricite_decoupee(self):
+        facture = self.api.post("/api/couts/factures/", {
+            "reference": "SBEE 2026-0042", "periode": self.periode, "montant_total": "10000",
+        }, format="json")
+        self.assertEqual(facture.status_code, 201, facture.content)
+        url = f"/api/couts/factures/{facture.data['id']}/ventiler/"
+        utilites = NatureCout.objects.get(libelle__startswith="Électricité utilités du site")
+        infra = NatureCout.objects.get(libelle__startswith="Électricité commune des infrastructures")
+        parts = [
+            {"nature": self.forage.pk, "montant": "6000"},
+            {"nature": utilites.pk, "montant": "2500", "usine": self.us_jy.pk},
+            {"nature": infra.pk, "montant": "1000"},
+        ]
+        refus = self.api.post(url, {"parts": parts}, format="json")
+        self.assertEqual(refus.status_code, 400)
+        self.assertFalse(Charge.objects.filter(facture_id=facture.data["id"]).exists())
+        parts[2]["montant"] = "1500"
+        r = self.api.post(url, {"parts": parts}, format="json")
+        self.assertEqual(r.status_code, 200, r.content)
+        self.assertTrue(r.data["est_ventilee"])
+        self.assertEqual(len(r.data["parts"]), 3)
+        self.assertEqual(cascade.calculer_periode(self.periode)["factures_incompletes"], [])
+        Charge.objects.filter(facture_id=facture.data["id"], nature=infra).delete()
+        incompletes = cascade.calculer_periode(self.periode)["factures_incompletes"]
+        self.assertEqual(incompletes[0]["reste_a_ventiler"], Decimal("1500.00"))
 
 
 class RecommandationsFrontendTests(QualiteBase):

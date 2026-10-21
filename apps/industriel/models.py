@@ -46,6 +46,13 @@ class Activite(ValidationAvantEnregistrement, models.Model):
     )
     designation = models.CharField("Désignation", max_length=100, unique=True)
     regles_specifiques = models.TextField("Règles spécifiques", blank=True)
+    litres_equivalents_par_unite = models.DecimalField(
+        "Litres équivalents par unité produite", max_digits=8, decimal_places=4, default=1,
+        help_text=(
+            "Partage d'une charge commune entre activités au prorata de la production : l'Eau et le Jus se "
+            "comptent en litres, le Yaourt en kg, ramenés en litres équivalents (convention : 1 kg = 1 L)."
+        ),
+    )
     actif = models.BooleanField("Actif", default=True)
 
     class Meta:
@@ -65,6 +72,8 @@ class Activite(ValidationAvantEnregistrement, models.Model):
         self.designation = (self.designation or "").strip()
         if not self.designation:
             raise ValidationError({"designation": "La désignation de l'activité est obligatoire."})
+        if self.litres_equivalents_par_unite is not None and self.litres_equivalents_par_unite <= 0:
+            raise ValidationError({"litres_equivalents_par_unite": "Le coefficient doit être supérieur à 0."})
 
 
 class Usine(ValidationAvantEnregistrement, models.Model):
@@ -123,6 +132,7 @@ class PhaseEtape(models.TextChoices):
     AMONT = "AMONT", "Eau : captage, traitement, stockage process"
     PREPARATION = "PREPARATION", "Préparation du produit"
     CONDITIONNEMENT = "CONDITIONNEMENT", "Remplissage et conditionnement"
+    SITE = "SITE", "Utilités et frais du site (transverses)"
     APRES_PRODUCTION = "APRES_PRODUCTION", "Après production (hors coût de production)"
 
 

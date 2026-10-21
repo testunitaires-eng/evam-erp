@@ -393,7 +393,9 @@ class CoutReel(models.Model):
 # =====================================================================
 
 class Inducteur(models.TextChoices):
-    VOLUME_EAU_M3 = "VOLUME_EAU_M3", "Volume d'eau (m³)"
+    QUANTITE_PRODUITE = "QUANTITE_PRODUITE", "Quantité produite (L pour l'Eau et le Jus, kg pour le Yaourt)"
+    VOLUME_EAU_BRUTE_M3 = "VOLUME_EAU_BRUTE_M3", "Volume d'eau brute captée (m³, compteurs)"
+    VOLUME_EAU_M3 = "VOLUME_EAU_M3", "Volume d'eau traitée utilisée par les OF (m³)"
     BOUTEILLES = "BOUTEILLES", "Nombre de bouteilles / pots produits"
     PACKS = "PACKS", "Nombre de packs / cartons"
     PALETTES = "PALETTES", "Nombre de palettes"
@@ -408,16 +410,44 @@ class Inducteur(models.TextChoices):
     QUANTITE_LIVREE = "QUANTITE_LIVREE", "Quantité livrée"
     PALETTES_LIVREES = "PALETTES_LIVREES", "Palettes livrées"
     LITRES_LIVRES = "LITRES_LIVRES", "Volume livré (litres)"
+    SURFACE_M2 = "SURFACE_M2", "Surface occupée (m²)"
+    EFFECTIF = "EFFECTIF", "Effectif (personnes)"
+    TEMPS_UTILISATION_H = "TEMPS_UTILISATION_H", "Temps d'utilisation (h)"
+    VOLUME_OCCUPE_M3 = "VOLUME_OCCUPE_M3", "Volume occupé (m³)"
+    EMPLACEMENTS_PALETTES = "EMPLACEMENTS_PALETTES", "Emplacements de palettes occupés"
+    CHIFFRE_AFFAIRES = "CHIFFRE_AFFAIRES", "Chiffre d'affaires HT"
+    QUANTITE_VENDUE = "QUANTITE_VENDUE", "Quantité vendue (unités facturées)"
     AUCUN = "AUCUN", "Aucun (charge directe uniquement)"
 
 
+# Clés « de site » (schéma électricité, cas D) : elles ne se mesurent pas sur
+# un OF mais par usine et par activité (ValeurCle). Elles répartissent une
+# charge commune entre les sites puis entre les activités d'un site ; la
+# descente aux OF utilise ensuite NatureCout.inducteur_of.
+CLES_DE_SITE = (
+    Inducteur.SURFACE_M2, Inducteur.EFFECTIF, Inducteur.TEMPS_UTILISATION_H,
+    Inducteur.VOLUME_OCCUPE_M3, Inducteur.EMPLACEMENTS_PALETTES,
+)
+# Clés qui ne se mesurent pas sur un OF : la descente activité -> OF
+# utilise NatureCout.inducteur_of (sinon la charge s'arrête à l'activité).
+CLES_SANS_VALEUR_OF = CLES_DE_SITE + (Inducteur.VOLUME_EAU_BRUTE_M3,)
+CLES_HORS_PRODUCTION = (
+    Inducteur.PALETTES_JOURS, Inducteur.KM, Inducteur.QUANTITE_LIVREE, Inducteur.PALETTES_LIVREES, Inducteur.LITRES_LIVRES,
+    Inducteur.CHIFFRE_AFFAIRES, Inducteur.QUANTITE_VENDUE,
+)
+
+
 UNITES_INDUCTEURS = {
+    Inducteur.QUANTITE_PRODUITE: "L / kg", Inducteur.VOLUME_EAU_BRUTE_M3: "m³ d'eau brute",
+    Inducteur.VOLUME_OCCUPE_M3: "m³", Inducteur.EMPLACEMENTS_PALETTES: "emplacements",
+    Inducteur.CHIFFRE_AFFAIRES: "CA HT", Inducteur.QUANTITE_VENDUE: "unités vendues",
     Inducteur.VOLUME_EAU_M3: "m³", Inducteur.BOUTEILLES: "unités", Inducteur.PACKS: "packs",
     Inducteur.PALETTES: "palettes", Inducteur.LITRES_PRODUITS: "L", Inducteur.HEURES_MACHINE: "h",
     Inducteur.HEURES_MO: "h", Inducteur.KWH: "kWh", Inducteur.ANALYSES_PONDEREES: "analyses pondérées",
     Inducteur.TEMPS_CHANGEMENT_SERIE: "min",
     Inducteur.PALETTES_JOURS: "palettes-jours", Inducteur.KM: "km", Inducteur.QUANTITE_LIVREE: "unités livrées",
     Inducteur.PALETTES_LIVREES: "palettes livrées", Inducteur.LITRES_LIVRES: "litres livrés",
+    Inducteur.SURFACE_M2: "m²", Inducteur.EFFECTIF: "personnes", Inducteur.TEMPS_UTILISATION_H: "h",
     Inducteur.AUCUN: "",
 }
 
@@ -426,7 +456,8 @@ class CategorieCout(models.TextChoices):
     PRODUCTION = "PRODUCTION", "Coût de production"
     STOCKAGE = "STOCKAGE", "Stockage produit fini (hors production)"
     DISTRIBUTION = "DISTRIBUTION", "Distribution (hors production)"
-    HORS_COUT = "HORS_COUT", "Frais généraux non incorporés"
+    COMMERCIAL = "COMMERCIAL", "Commercialisation : points de vente, caisses (hors production)"
+    HORS_COUT = "HORS_COUT", "Frais généraux non incorporés (siège, direction, comptabilité)"
 
 
 class Traitement(models.TextChoices):
@@ -461,6 +492,18 @@ class NatureCout(ValidationAvantEnregistrement, models.Model):
     categorie_economique = models.CharField("Catégorie économique", max_length=20, choices=CategorieEconomique.choices, default=CategorieEconomique.AUTRE)
     traitement = models.CharField("Traitement", max_length=10, choices=Traitement.choices, default=Traitement.INDIRECT)
     inducteur = models.CharField("Clé / inducteur", max_length=30, choices=Inducteur.choices)
+    inducteur_of = models.CharField(
+        "Clé de l'activité vers les OF", max_length=30, choices=Inducteur.choices, blank=True,
+        help_text=(
+            "Répartition de la part d'une activité entre ses OF (règle client : quantité produite, L ou kg). "
+            "Vide = la clé ci-dessus ; pour une clé qui ne se mesure pas sur un OF (surface, eau brute...), "
+            "vide = la charge s'arrête à l'activité."
+        ),
+    )
+    activite = models.ForeignKey(
+        "industriel.Activite", verbose_name="Activité par défaut", on_delete=models.PROTECT, null=True, blank=True,
+        related_name="+", help_text="Affectation directe (ex : traitement de l'eau -> Eau) quand la charge ne précise ni activité, ni site, ni OF.",
+    )
     justification = models.TextField("Justification de la clé", blank=True)
     date_debut = models.DateField("Valide à partir du", null=True, blank=True)
     date_fin = models.DateField("Valide jusqu'au", null=True, blank=True)
@@ -487,10 +530,22 @@ class NatureCout(ValidationAvantEnregistrement, models.Model):
         if self.traitement == Traitement.INDIRECT and self.inducteur == Inducteur.AUCUN \
                 and self.categorie != CategorieCout.HORS_COUT:
             raise ValidationError({"inducteur": "Une charge indirecte se répartit avec un inducteur (pas de clé arbitraire)."})
-        if self.categorie == CategorieCout.PRODUCTION and self.inducteur in (
-            Inducteur.PALETTES_JOURS, Inducteur.KM, Inducteur.QUANTITE_LIVREE, Inducteur.PALETTES_LIVREES, Inducteur.LITRES_LIVRES,
-        ):
+        if self.categorie == CategorieCout.PRODUCTION and self.inducteur in CLES_HORS_PRODUCTION:
             raise ValidationError({"inducteur": "Cet inducteur sert au stockage ou à la distribution, pas au coût de production."})
+        if self.inducteur_of:
+            if self.categorie != CategorieCout.PRODUCTION:
+                raise ValidationError({"inducteur_of": "La clé vers les OF ne concerne que les charges de production."})
+            if self.inducteur_of in CLES_SANS_VALEUR_OF or self.inducteur_of in CLES_HORS_PRODUCTION or self.inducteur_of == Inducteur.AUCUN:
+                raise ValidationError({"inducteur_of": "Choisissez une clé mesurée sur les OF (quantité produite, litres, bouteilles, heures...)."})
+        if self.activite_id and self.categorie not in (CategorieCout.PRODUCTION, CategorieCout.STOCKAGE,
+                                                        CategorieCout.DISTRIBUTION, CategorieCout.COMMERCIAL):
+            raise ValidationError({"activite": "Les frais généraux ne s'affectent pas à une activité."})
+        if self.categorie != CategorieCout.PRODUCTION and self.inducteur in CLES_SANS_VALEUR_OF + (Inducteur.QUANTITE_PRODUITE,):
+            raise ValidationError({"inducteur": "Cette clé sert au coût de production."})
+        if self.categorie == CategorieCout.COMMERCIAL and self.inducteur not in (
+            Inducteur.CHIFFRE_AFFAIRES, Inducteur.QUANTITE_VENDUE, Inducteur.QUANTITE_LIVREE, Inducteur.AUCUN,
+        ):
+            raise ValidationError({"inducteur": "La commercialisation se répartit au chiffre d'affaires ou aux quantités vendues / livrées."})
         if self.categorie == CategorieCout.STOCKAGE and self.inducteur not in (Inducteur.PALETTES_JOURS, Inducteur.QUANTITE_LIVREE, Inducteur.AUCUN):
             raise ValidationError({"inducteur": "Le stockage se répartit en palettes-jours (ou quantité livrée)."})
         if self.categorie == CategorieCout.DISTRIBUTION and self.inducteur not in (
@@ -526,6 +581,14 @@ class Charge(ValidationAvantEnregistrement, models.Model):
     activite = models.ForeignKey(
         "industriel.Activite", verbose_name="Activité", on_delete=models.PROTECT, null=True, blank=True, related_name="charges",
         help_text="Vide = charge commune à plusieurs activités (répartie par l'inducteur).",
+    )
+    usine = models.ForeignKey(
+        "industriel.Usine", verbose_name="Site / usine", on_delete=models.PROTECT, null=True, blank=True, related_name="charges",
+        help_text="Charge propre à un site (ex : chambres froides du site Jus & Yaourt) : répartie entre les seules activités de ce site.",
+    )
+    facture = models.ForeignKey(
+        "FactureCharge", verbose_name="Facture d'origine", on_delete=models.CASCADE, null=True, blank=True, related_name="parts",
+        help_text="Part d'une facture découpée (ex : forage / site Eau / site Jus & Yaourt / infrastructures).",
     )
     equipement = models.ForeignKey("industriel.Equipement", verbose_name="Équipement", on_delete=models.PROTECT, null=True, blank=True, related_name="charges")
     ordre_fabrication = models.ForeignKey(
@@ -568,6 +631,27 @@ class Charge(ValidationAvantEnregistrement, models.Model):
             if self.activite_id and self.activite_id != self.equipement.activite_id:
                 raise ValidationError({"activite": f"{self.equipement.code} est dédié à l'activité {self.equipement.activite.code}."})
             self.activite_id = self.equipement.activite_id   # équipement dédié : charge directe de l'activité
+        if self.nature_id and self.nature.activite_id and not (
+            self.activite_id or self.usine_id or self.ordre_fabrication_id or self.tournee_id
+        ):
+            self.activite_id = self.nature.activite_id   # affectation directe paramétrée (ex : traitement de l'eau -> Eau)
+        if self.usine_id:
+            activites_usine = set(self.usine.activites.values_list("pk", flat=True))
+            if self.activite_id and self.activite_id not in activites_usine:
+                raise ValidationError({"usine": f"L'activité {self.activite.code} n'est pas produite sur le site {self.usine.code}."})
+            if self.ordre_fabrication_id and self.ordre_fabrication.activite and self.ordre_fabrication.activite.pk not in activites_usine:
+                raise ValidationError({"usine": f"L'OF {self.ordre_fabrication.numero} n'est pas une production du site {self.usine.code}."})
+            if self.tournee_id:
+                raise ValidationError({"usine": "Une charge de tournée ne se rattache pas à un site de production."})
+        if self.facture_id:
+            facture = self.facture
+            if self.periode != facture.periode:
+                raise ValidationError({"periode": f"La facture {facture.numero} porte sur la période {facture.periode}."})
+            autres = facture.parts.exclude(pk=self.pk).aggregate(t=models.Sum("montant"))["t"] or 0
+            if self.montant is not None and autres + self.montant > facture.montant_total:
+                raise ValidationError({"montant": (
+                    f"La facture {facture.numero} fait {facture.montant_total} : il reste {facture.montant_total - autres} à ventiler."
+                )})
         if self.ordre_fabrication_id:
             of = self.ordre_fabrication
             if of.statut == "ANNULE":
@@ -583,7 +667,214 @@ class Charge(ValidationAvantEnregistrement, models.Model):
             raise ValidationError({"ordre_fabrication": "Charge directe sans inducteur : précisez l'OF ou l'activité concernée."})
 
 
+class FactureCharge(ValidationAvantEnregistrement, models.Model):
+    """
+    Facture à découper (schéma « coût total d'électricité ») : une facture
+    SBEE se ventile en forage commun (A), site Eau (B), site Jus & Yaourt (C)
+    et infrastructures communes (D). Chaque part est une Charge ; la somme
+    des parts doit être égale au montant de la facture.
+    """
+    numero = models.CharField("N° interne", max_length=30, unique=True, editable=False)
+    reference = models.CharField("Référence de la facture", max_length=100, help_text="Ex : facture SBEE n° 1234.")
+    fournisseur = models.CharField("Fournisseur", max_length=150, blank=True)
+    periode = models.CharField("Période", max_length=7, help_text="AAAA-MM")
+    montant_total = models.DecimalField("Montant total", max_digits=16, decimal_places=2)
+    date_facture = models.DateField("Date de la facture", null=True, blank=True)
+    observations = models.TextField("Observations", blank=True)
+    saisi_par = models.ForeignKey("comptes.Utilisateur", verbose_name="Saisi par", on_delete=models.PROTECT, null=True, blank=True, related_name="+")
+    date_saisie = models.DateTimeField("Saisie le", auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Facture à ventiler"
+        verbose_name_plural = "Factures à ventiler"
+        ordering = ["-periode", "-pk"]
+
+    def __str__(self):
+        return f"{self.numero} - {self.reference} {self.periode} : {self.montant_total}"
+
+    def save(self, *args, **kwargs):
+        if not self.numero:
+            from apps.core.models import generer_numero
+            self.numero = generer_numero("FCH")
+        super().save(*args, **kwargs)
+
+    @property
+    def montant_ventile(self):
+        return self.parts.aggregate(t=models.Sum("montant"))["t"] or 0
+
+    @property
+    def reste_a_ventiler(self):
+        return self.montant_total - self.montant_ventile
+
+    @property
+    def est_ventilee(self):
+        return self.reste_a_ventiler == 0
+
+    def clean(self):
+        exiger_positif(self.montant_total, "montant_total", "Le montant de la facture")
+        if not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", self.periode or ""):
+            raise ValidationError({"periode": "La période doit être au format AAAA-MM (ex : 2026-09)."})
+        if self.pk:
+            ventile = Charge.objects.filter(facture_id=self.pk).aggregate(t=models.Sum("montant"))["t"] or 0
+            if self.montant_total is not None and ventile > self.montant_total:
+                raise ValidationError({"montant_total": f"Les parts déjà ventilées font {ventile}."})
+            if Charge.objects.filter(facture_id=self.pk).exclude(periode=self.periode).exists():
+                raise ValidationError({"periode": "Des parts sont déjà ventilées sur une autre période : ventilez à nouveau la facture."})
+
+
+class VolumeEauSite(ValidationAvantEnregistrement, models.Model):
+    """
+    Relevé du compteur d'eau brute captée au forage commun, par activité
+    (ou par site entier), sur la période. Clé de répartition du forage
+    (« volume d'eau brute captée ») : forage -> sites -> activités.
+    La valeur d'un site est celle de sa ligne sans activité, à défaut la
+    somme de ses activités.
+    """
+    periode = models.CharField("Période", max_length=7, help_text="AAAA-MM")
+    usine = models.ForeignKey("industriel.Usine", verbose_name="Site / usine", on_delete=models.PROTECT, related_name="volumes_eau")
+    activite = models.ForeignKey(
+        "industriel.Activite", verbose_name="Activité", on_delete=models.PROTECT, null=True, blank=True, related_name="+",
+        help_text="Compteur de l'activité. Vide = compteur du site entier.",
+    )
+    volume_m3 = models.DecimalField("Volume d'eau (m³)", max_digits=14, decimal_places=3)
+    statut_donnee = models.CharField("Donnée", max_length=10, choices=StatutDonnee.choices, default=StatutDonnee.REEL)
+    source = models.CharField("Source", max_length=200, blank=True, help_text="Ex : relevé du compteur forage -> site Eau.")
+    justification = models.TextField("Justification (si estimé)", blank=True)
+    saisi_par = models.ForeignKey("comptes.Utilisateur", verbose_name="Saisi par", on_delete=models.PROTECT, null=True, blank=True, related_name="+")
+    date_saisie = models.DateTimeField("Saisi le", auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Volume d'eau brute (compteur)"
+        verbose_name_plural = "Volumes d'eau brute (compteurs)"
+        ordering = ["-periode", "usine", "activite"]
+        constraints = [models.UniqueConstraint(fields=["periode", "usine", "activite"], name="volume_eau_unique_par_compteur_et_periode")]
+
+    def __str__(self):
+        cible = self.usine.code + (f" / {self.activite.code}" if self.activite_id else "")
+        return f"{cible} {self.periode} : {self.volume_m3} m³"
+
+    def clean(self):
+        exiger_positif(self.volume_m3, "volume_m3", "Le volume", strict=False)
+        if not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", self.periode or ""):
+            raise ValidationError({"periode": "La période doit être au format AAAA-MM (ex : 2026-09)."})
+        if self.statut_donnee == StatutDonnee.ESTIME and not (self.justification or "").strip():
+            raise ValidationError({"justification": "Une estimation doit être justifiée (méthode, auteur de la validation)."})
+        if self.activite_id and self.usine_id and not self.usine.activites.filter(pk=self.activite_id).exists():
+            raise ValidationError({"activite": f"L'activité {self.activite.code} n'est pas produite sur le site {self.usine.code}."})
+        if VolumeEauSite.objects.filter(periode=self.periode, usine_id=self.usine_id, activite_id=self.activite_id).exclude(pk=self.pk).exists():
+            raise ValidationError({"usine": f"Ce compteur est déjà relevé sur {self.periode} : modifiez le relevé."})
+
+
+class ValeurCle(ValidationAvantEnregistrement, models.Model):
+    """
+    Valeur d'une clé de site (surface, effectif, temps d'utilisation,
+    volume occupé, emplacements de palettes) pour
+    une usine, ou pour une activité d'une usine, à partir d'une date. La
+    valeur en vigueur pour une période est la plus récente avant sa fin.
+    Activité vide = valeur du site entier.
+    """
+    inducteur = models.CharField("Clé", max_length=30, choices=[(c.value, c.label) for c in CLES_DE_SITE])
+    usine = models.ForeignKey("industriel.Usine", verbose_name="Site / usine", on_delete=models.PROTECT, related_name="valeurs_cles")
+    activite = models.ForeignKey(
+        "industriel.Activite", verbose_name="Activité", on_delete=models.PROTECT, null=True, blank=True, related_name="+",
+        help_text="Vide = valeur du site entier.",
+    )
+    valeur = models.DecimalField("Valeur", max_digits=14, decimal_places=3)
+    date_debut = models.DateField("Valable à partir du")
+    source = models.CharField("Source", max_length=200, blank=True, help_text="Ex : plan des bâtiments, registre du personnel.")
+    saisi_par = models.ForeignKey("comptes.Utilisateur", verbose_name="Saisi par", on_delete=models.PROTECT, null=True, blank=True, related_name="+")
+
+    class Meta:
+        verbose_name = "Valeur de clé de site"
+        verbose_name_plural = "Valeurs des clés de site"
+        ordering = ["inducteur", "usine", "activite", "-date_debut"]
+        constraints = [models.UniqueConstraint(
+            fields=["inducteur", "usine", "activite", "date_debut"], name="valeur_cle_unique",
+        )]
+
+    def __str__(self):
+        cible = f"{self.usine.code}" + (f" / {self.activite.code}" if self.activite_id else "")
+        return f"{self.get_inducteur_display()} {cible} : {self.valeur} (depuis le {self.date_debut})"
+
+    def clean(self):
+        exiger_positif(self.valeur, "valeur", "La valeur", strict=False)
+        if self.activite_id and self.usine_id and not self.usine.activites.filter(pk=self.activite_id).exists():
+            raise ValidationError({"activite": f"L'activité {self.activite.code} n'est pas produite sur le site {self.usine.code}."})
+        # La contrainte d'unicité ne voit pas les doublons quand l'activité est vide (NULL).
+        if ValeurCle.objects.filter(
+            inducteur=self.inducteur, usine_id=self.usine_id, activite_id=self.activite_id, date_debut=self.date_debut,
+        ).exclude(pk=self.pk).exists():
+            raise ValidationError({"date_debut": "Une valeur existe déjà pour cette clé, ce site / cette activité et cette date."})
+
+
+class ReleveElectricite(ValidationAvantEnregistrement, models.Model):
+    """
+    Consommation électrique d'une étape sur la période (compteur, ou
+    estimation validée). Une facture d'électricité se répartit par étape au
+    prorata de ces kWh (« consommation réelle si mesurable ; sinon clé
+    définie » : à défaut de relevés, la DAF ventile la facture elle-même).
+    """
+    periode = models.CharField("Période", max_length=7, help_text="AAAA-MM")
+    etape = models.ForeignKey("industriel.EtapeStandard", verbose_name="Étape", on_delete=models.PROTECT, related_name="+")
+    nature = models.ForeignKey(
+        NatureCout, verbose_name="Élément de coût", on_delete=models.PROTECT, null=True, blank=True, related_name="+",
+        help_text="Vide = l'élément « Énergie » de l'étape. À préciser si l'étape en a plusieurs (ex : chambre froide).",
+    )
+    usine = models.ForeignKey("industriel.Usine", verbose_name="Site / usine", on_delete=models.PROTECT, null=True, blank=True, related_name="+")
+    activite = models.ForeignKey("industriel.Activite", verbose_name="Activité", on_delete=models.PROTECT, null=True, blank=True, related_name="+")
+    facture = models.ForeignKey(
+        FactureCharge, verbose_name="Facture", on_delete=models.CASCADE, null=True, blank=True, related_name="releves",
+        help_text="Vide = relevé de la période, valable pour la facture d'électricité de la période.",
+    )
+    kwh = models.DecimalField("Consommation (kWh)", max_digits=14, decimal_places=3)
+    statut_donnee = models.CharField("Donnée", max_length=10, choices=StatutDonnee.choices, default=StatutDonnee.REEL)
+    source = models.CharField("Source", max_length=200, blank=True, help_text="Ex : compteur C3 atelier soufflage.")
+    justification = models.TextField("Justification (si estimé)", blank=True)
+    saisi_par = models.ForeignKey("comptes.Utilisateur", verbose_name="Saisi par", on_delete=models.PROTECT, null=True, blank=True, related_name="+")
+    date_saisie = models.DateTimeField("Saisi le", auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Relevé d'électricité par étape"
+        verbose_name_plural = "Relevés d'électricité par étape"
+        ordering = ["-periode", "etape__ordre_reference"]
+
+    def __str__(self):
+        return f"{self.etape.libelle} {self.periode} : {self.kwh} kWh"
+
+    def nature_energie(self):
+        """Élément de coût de la part : celui du relevé, sinon l'unique élément « Énergie » de production de l'étape."""
+        if self.nature_id:
+            return self.nature
+        natures = list(NatureCout.objects.filter(
+            etape_id=self.etape_id, categorie=CategorieCout.PRODUCTION,
+            categorie_economique=CategorieEconomique.ENERGIE, actif=True,
+        )[:2])
+        if len(natures) != 1:
+            raise ValidationError({"nature": (
+                f"L'étape {self.etape.libelle} a {'plusieurs' if natures else 'aucun'} élément(s) de coût « Énergie » : "
+                "précisez l'élément de coût du relevé."
+            )})
+        return natures[0]
+
+    def clean(self):
+        exiger_positif(self.kwh, "kwh", "La consommation", strict=False)
+        if not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", self.periode or ""):
+            raise ValidationError({"periode": "La période doit être au format AAAA-MM (ex : 2026-09)."})
+        if self.statut_donnee == StatutDonnee.ESTIME and not (self.justification or "").strip():
+            raise ValidationError({"justification": "Une estimation doit être justifiée (méthode, auteur de la validation)."})
+        if self.nature_id:
+            if self.nature.etape_id != self.etape_id:
+                raise ValidationError({"nature": f"« {self.nature.libelle} » n'est pas un élément de coût de l'étape {self.etape.libelle}."})
+            if self.nature.categorie != CategorieCout.PRODUCTION:
+                raise ValidationError({"nature": "Un relevé d'électricité par étape porte sur un coût de production."})
+        if self.facture_id and self.facture.periode != self.periode:
+            raise ValidationError({"periode": f"La facture {self.facture.numero} porte sur {self.facture.periode}."})
+        if self.activite_id and self.usine_id and not self.usine.activites.filter(pk=self.activite_id).exists():
+            raise ValidationError({"activite": f"L'activité {self.activite.code} n'est pas produite sur le site {self.usine.code}."})
+
+
 class NiveauRepartition(models.TextChoices):
+    SITE = "SITE", "Site / usine"
     ACTIVITE = "ACTIVITE", "Activité"
     OF = "OF", "Ordre de fabrication"
     PRODUIT = "PRODUIT", "Produit / format"
@@ -600,6 +891,7 @@ class RepartitionCout(models.Model):
     charge = models.ForeignKey(Charge, verbose_name="Charge", on_delete=models.CASCADE, related_name="repartitions")
     parent = models.ForeignKey("self", verbose_name="Niveau supérieur", on_delete=models.CASCADE, null=True, blank=True, related_name="enfants")
     niveau = models.CharField("Niveau", max_length=10, choices=NiveauRepartition.choices)
+    usine = models.ForeignKey("industriel.Usine", verbose_name="Site / usine", on_delete=models.PROTECT, null=True, blank=True, related_name="+")
     activite = models.ForeignKey("industriel.Activite", verbose_name="Activité", on_delete=models.PROTECT, null=True, blank=True, related_name="+")
     ordre_fabrication = models.ForeignKey(OrdreFabrication, verbose_name="OF", on_delete=models.CASCADE, null=True, blank=True, related_name="repartitions_couts")
     article = models.ForeignKey(Article, verbose_name="Produit / format", on_delete=models.PROTECT, null=True, blank=True, related_name="+")
@@ -624,5 +916,5 @@ class RepartitionCout(models.Model):
         ordering = ["charge", "niveau", "pk"]
 
     def __str__(self):
-        cible = self.ordre_fabrication or self.article or self.activite
+        cible = self.ordre_fabrication or self.article or self.activite or self.usine
         return f"{self.charge.numero} -> {self.get_niveau_display()} {cible} : {self.montant}"

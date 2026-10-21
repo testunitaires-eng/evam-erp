@@ -15,6 +15,7 @@ router.register("repartitions", views.RepartitionCoutViewSet, basename="repartit
 router.register("factures", views.FactureChargeViewSet, basename="facturecharge")
 router.register("volumes-eau-sites", views.VolumeEauSiteViewSet, basename="volumeeausite")
 router.register("valeurs-cles", views.ValeurCleViewSet, basename="valeurcle")
+router.register("releves-electricite", views.ReleveElectriciteViewSet, basename="releveelectricite")
 
 urlpatterns = [
     path("cascade/calculer/", views.calculer_periode, name="couts-calculer-periode"),

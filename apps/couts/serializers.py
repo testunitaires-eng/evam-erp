@@ -67,6 +67,7 @@ class CoutReelSerializer(ValidationModeleMixin, serializers.ModelSerializer):
 
 class NatureCoutSerializer(ValidationModeleMixin, serializers.ModelSerializer):
     etape_libelle = serializers.CharField(source="etape.libelle", read_only=True, default=None)
+    activite_code = serializers.CharField(source="activite.code", read_only=True, default=None)
 
     class Meta:
         model = models.NatureCout
@@ -125,6 +126,7 @@ class FactureChargeSerializer(ValidationModeleMixin, serializers.ModelSerializer
 
 class VolumeEauSiteSerializer(ValidationModeleMixin, serializers.ModelSerializer):
     usine_code = serializers.CharField(source="usine.code", read_only=True)
+    activite_code = serializers.CharField(source="activite.code", read_only=True, default=None)
 
     class Meta:
         model = models.VolumeEauSite
@@ -142,3 +144,15 @@ class ValeurCleSerializer(ValidationModeleMixin, serializers.ModelSerializer):
         fields = "__all__"
         read_only_fields = ["saisi_par"]
         validators = []
+
+
+class ReleveElectriciteSerializer(ValidationModeleMixin, serializers.ModelSerializer):
+    etape_libelle = serializers.CharField(source="etape.libelle", read_only=True)
+    nature_libelle = serializers.CharField(source="nature.libelle", read_only=True, default=None)
+    usine_code = serializers.CharField(source="usine.code", read_only=True, default=None)
+    activite_code = serializers.CharField(source="activite.code", read_only=True, default=None)
+
+    class Meta:
+        model = models.ReleveElectricite
+        fields = "__all__"
+        read_only_fields = ["saisi_par"]

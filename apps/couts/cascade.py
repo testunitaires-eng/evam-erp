@@ -15,11 +15,14 @@ Exemple du document de référence :
 Niveau site (schémas « coût total d'électricité » et « cascade globale ») :
     - charge rattachée à une usine : répartie entre les seules activités
       de ce site (ex : chambres froides Jus & Yaourt, jamais sur l'Eau) ;
-    - forage commun : réparti d'abord entre les sites selon les volumes
-      d'eau saisis par site (VolumeEauSite), s'il y en a pour la période ;
-    - clé de site (surface, effectif, temps d'utilisation) : répartie
-      entre sites puis activités selon ValeurCle, puis aux OF seulement si
-      NatureCout.inducteur_of est renseignée (décision du client).
+    - forage commun : réparti entre les sites puis les activités selon le
+      volume d'eau brute captée relevé aux compteurs (VolumeEauSite) ;
+    - clé de site (surface, volume occupé...) : répartie entre sites puis
+      activités selon ValeurCle ;
+    - de l'activité aux OF : NatureCout.inducteur_of (règle client :
+      quantité produite, litres pour l'Eau et le Jus, kg pour le Yaourt).
+Entre activités, la quantité produite est comptée en litres équivalents
+(Activite.litres_equivalents_par_unite) : on n'additionne pas des L et des kg.
 """
 
 from datetime import date, timedelta
@@ -30,7 +33,7 @@ from django.db.models import Q, Sum
 
 from apps.production.models import OrdreFabrication
 from .models import (
-    CLES_DE_SITE, Charge, CategorieCout, Inducteur, NiveauRepartition, RepartitionCout, StatutDonnee, StatutRepartition,
+    CLES_DE_SITE, CLES_SANS_VALEUR_OF, Charge, CategorieCout, Inducteur, NiveauRepartition, RepartitionCout, StatutDonnee, StatutRepartition,
     UNITES_INDUCTEURS,
 )
 
@@ -61,7 +64,7 @@ def valeur_inducteur(of, inducteur, etape=None):
     """
     from apps.couts.models import CoutMainOeuvre
     formats = of.quantites_par_format()   # {article: quantité bonne} (un ou plusieurs formats)
-    if inducteur in (Inducteur.BOUTEILLES, Inducteur.PACKS, Inducteur.PALETTES, Inducteur.LITRES_PRODUITS):
+    if inducteur in INDUCTEURS_PAR_FORMAT:
         total, nature = Decimal(0), "CALCULE"
         for article, quantite in formats.items():
             valeur, nature_format, _ = valeur_format(article, quantite, inducteur)
@@ -151,8 +154,21 @@ def charges_changements_serie(periode):
             charge.save()
 
 
+INDUCTEURS_PAR_FORMAT = (
+    Inducteur.BOUTEILLES, Inducteur.PACKS, Inducteur.PALETTES, Inducteur.LITRES_PRODUITS, Inducteur.QUANTITE_PRODUITE,
+)
+
+
+def unite_production(article):
+    return "kg" if article.unite_contenance == "KG" else "L"
+
+
 def valeur_format(article, quantite, inducteur):
     """Valeur d'un inducteur de volume pour un format : (valeur | None, nature, libellé)."""
+    if inducteur == Inducteur.QUANTITE_PRODUITE:
+        if article.contenance and article.unite_contenance in ("L", "KG"):
+            return article.en_contenance(quantite), "CALCULE", unite_production(article)
+        return None, None, "L / kg"
     if inducteur == Inducteur.BOUTEILLES:
         return article.en_unites(quantite), "CALCULE", "bouteilles / pots"
     if inducteur == Inducteur.PACKS:
@@ -171,7 +187,7 @@ def cle_entre_formats(formats, inducteur):
     litres) ; sinon les litres produits (volume réellement traité), à défaut
     les bouteilles / pots. Retourne ([(article, valeur)], libellé).
     """
-    if inducteur in (Inducteur.BOUTEILLES, Inducteur.PACKS, Inducteur.PALETTES, Inducteur.LITRES_PRODUITS):
+    if inducteur in INDUCTEURS_PAR_FORMAT:
         parts = [(article, valeur_format(article, quantite, inducteur)[0]) for article, quantite in formats.items()]
         if all(valeur for _, valeur in parts):
             return parts, valeur_format(next(iter(formats)), 1, inducteur)[2]
@@ -283,6 +299,28 @@ def valeur_cle_site(inducteur, usine, periode, activite=None):
     return None if not valeurs or None in valeurs else sum(valeurs, Decimal(0))
 
 
+def volume_eau_brute(usine, periode, activite=None):
+    """
+    Volume d'eau brute relevé au compteur : (m³ | None, estimé). Sans
+    activité : le compteur du site, à défaut la somme des compteurs de
+    toutes ses activités.
+    """
+    from .models import VolumeEauSite
+    releves = {r.activite_id: r for r in VolumeEauSite.objects.filter(periode=periode, usine=usine)}
+    if activite is not None:
+        releve = releves.get(activite.pk)
+        return (releve.volume_m3, releve.statut_donnee == StatutDonnee.ESTIME) if releve else (None, False)
+    if None in releves:
+        return releves[None].volume_m3, releves[None].statut_donnee == StatutDonnee.ESTIME
+    activites = list(usine.activites.filter(actif=True))
+    if not activites or any(a.pk not in releves for a in activites):
+        return None, False
+    return (
+        sum((releves[a.pk].volume_m3 for a in activites), Decimal(0)),
+        any(releves[a.pk].statut_donnee == StatutDonnee.ESTIME for a in activites),
+    )
+
+
 def _parts_sites(charge):
     """
     Niveau site d'une charge commune : (parts [(usine, valeur)] | None, estimé, motif d'échec).
@@ -300,24 +338,28 @@ def _parts_sites(charge):
             return None, False, f"« {libelle} » non saisie pour le site : {', '.join(manquants)} (valeurs des clés de site)."
         parts = [(usine, valeur) for usine, valeur in valeurs if valeur > 0]
         return (parts, False, None) if parts else (None, False, f"« {libelle} » nulle pour tous les sites.")
-    if inducteur == Inducteur.VOLUME_EAU_M3:
-        volumes = {v.usine_id: v for v in VolumeEauSite.objects.filter(periode=periode)}
-        if not volumes:
-            return None, False, None   # pas de volume par site : volumes d'eau des OF
-        manquants = [usine.code for usine in usines if usine.pk not in volumes]
+    if inducteur == Inducteur.VOLUME_EAU_BRUTE_M3:
+        if not VolumeEauSite.objects.filter(periode=periode).exists():
+            return None, False, f"Aucun relevé des compteurs d'eau brute pour {periode} : le forage ne peut pas être réparti."
+        volumes = [(usine, *volume_eau_brute(usine, periode)) for usine in usines]
+        manquants = [usine.code for usine, volume, _ in volumes if volume is None]
         if manquants:
             return None, False, (
-                f"Volumes d'eau par site saisis pour {periode} mais pas pour : {', '.join(manquants)}. "
-                "Saisissez un volume (même nul) pour chaque site."
+                f"Compteurs d'eau brute non relevés pour {periode} : {', '.join(manquants)} "
+                "(un relevé par activité, ou un relevé du site ; même nul)."
             )
-        parts = [(usine, volumes[usine.pk].volume_m3) for usine in usines if volumes[usine.pk].volume_m3 > 0]
-        estime = any(volumes[usine.pk].statut_donnee == StatutDonnee.ESTIME for usine in usines)
-        return (parts, estime, None) if parts else (None, False, f"Volumes d'eau par site nuls pour {periode}.")
+        parts = [(usine, volume) for usine, volume, _ in volumes if volume > 0]
+        estime = any(est for _, _, est in volumes)
+        return (parts, estime, None) if parts else (None, False, f"Volumes d'eau brute nuls pour {periode}.")
     return None, False, None
 
 
 def _parts_activites(activites, periode, inducteur, etape):
-    """[(activité, somme de l'inducteur sur ses OF clôturés)] et la nature des valeurs (MESURE / CALCULE / ESTIME)."""
+    """
+    [(activité, somme de l'inducteur sur ses OF clôturés)] et la nature des
+    valeurs (MESURE / CALCULE / ESTIME). La quantité produite est ramenée en
+    litres équivalents pour comparer l'Eau / le Jus (L) et le Yaourt (kg).
+    """
     parts, natures = [], set()
     for activite in activites:
         total = Decimal(0)
@@ -326,9 +368,17 @@ def _parts_activites(activites, periode, inducteur, etape):
             if valeur:
                 total += valeur
                 natures.add(nature_cle)
+        if inducteur == Inducteur.QUANTITE_PRODUITE:
+            total *= activite.litres_equivalents_par_unite
         if total > 0:
             parts.append((activite, total))
     return parts, natures
+
+
+def libelle_cle_activites(inducteur):
+    if inducteur == Inducteur.QUANTITE_PRODUITE:
+        return "quantité produite en litres équivalents (L ; kg x coefficient de l'activité)"
+    return Inducteur(inducteur).label
 
 
 def _site_vers_activites(charge, ligne_site, estime_amont):
@@ -350,6 +400,15 @@ def _site_vers_activites(charge, ligne_site, estime_amont):
             return [], f"site {usine.code} : « {Inducteur(inducteur).label} » non saisie pour {', '.join(manquants)}"
         parts = [(a, valeur) for a, valeur in valeurs if valeur > 0]
         source_cle = "valeurs des clés de site"
+    elif inducteur == Inducteur.VOLUME_EAU_BRUTE_M3:
+        valeurs = [(a, *volume_eau_brute(usine, periode, a)) for a in activites]
+        manquants = [a.code for a, valeur, _ in valeurs if valeur is None]
+        if manquants:
+            return [], f"site {usine.code} : compteur d'eau brute non relevé pour {', '.join(manquants)}"
+        parts = [(a, valeur) for a, valeur, _ in valeurs if valeur > 0]
+        if any(est for _, _, est in valeurs):
+            natures.add("ESTIME")
+        source_cle = "compteurs d'eau brute par activité"
     else:
         parts, natures = _parts_activites(activites, periode, inducteur, nature.etape)
         source_cle = "OF clôturés de chaque activité"
@@ -362,7 +421,7 @@ def _site_vers_activites(charge, ligne_site, estime_amont):
             valeur_cle_totale=total, valeur_cle_part=valeur,
             statut=_statut(charge, "ESTIME" if estime_amont or "ESTIME" in natures else None),
             source=f"{charge.source} ; clé : {source_cle}".strip(" ;"),
-            justification=f"Part du site {usine.code} répartie entre ses activités au prorata de : {Inducteur(inducteur).label}.",
+            justification=f"Part du site {usine.code} répartie entre ses activités au prorata de : {libelle_cle_activites(inducteur)}.",
         )
         for activite, valeur, montant in ventilation
     ], None
@@ -407,7 +466,7 @@ def _repartir_production(charge):
             lignes_site = None
             if parts:
                 total, ventilation = ventiler(charge.montant, parts)
-                source_cle = "valeurs des clés de site" if inducteur in CLES_DE_SITE else "volumes d'eau saisis par site"
+                source_cle = "valeurs des clés de site" if inducteur in CLES_DE_SITE else "compteurs d'eau brute"
                 lignes_site = [
                     _ligne(
                         charge, NiveauRepartition.SITE, montant, valeur / total, usine=usine,
@@ -431,7 +490,7 @@ def _repartir_production(charge):
                     charge, NiveauRepartition.ACTIVITE, montant, valeur / total, activite=activite, usine=usine_de(activite),
                     valeur_cle_totale=total, valeur_cle_part=valeur,
                     statut=_statut(charge, "ESTIME" if "ESTIME" in natures else None),
-                    justification=f"Charge commune répartie entre activités au prorata de : {Inducteur(inducteur).label}.",
+                    justification=f"Charge commune répartie entre activités au prorata de : {libelle_cle_activites(inducteur)}.",
                 )
                 for activite, valeur, montant in ventilation
             ]
@@ -443,15 +502,15 @@ def _repartir_production(charge):
                 if reste:
                     restes.append(reste)
 
-    # 2. Niveau OF, puis produit / pack / unité. Une clé de site ne se
-    # mesure pas sur un OF : la descente utilise la clé « vers les OF ».
-    inducteur_of, etape_of = inducteur, etape
-    if inducteur in CLES_DE_SITE:
-        inducteur_of, etape_of = nature.inducteur_of, None
+    # 2. Niveau OF, puis produit / pack / unité, avec la clé « vers les OF »
+    # (règle client : quantité produite) ; à défaut, la clé de la charge si
+    # elle se mesure sur un OF.
+    inducteur_of = nature.inducteur_of or ("" if inducteur in CLES_SANS_VALEUR_OF else inducteur)
+    etape_of = etape if inducteur_of == inducteur else None
     for ligne_activite in lignes_activite:
         code = ligne_activite.activite.code
         if not inducteur_of:
-            restes.append(f"{code} : pas de clé vers les OF (incorporation au coût des OF non activée)")
+            restes.append(f"{code} : pas de clé vers les OF pour « {Inducteur(inducteur).label} » (renseignez-la sur l'élément de coût)")
             continue
         parts = []
         for of in ofs_de_la_periode(periode, ligne_activite.activite):
@@ -466,7 +525,8 @@ def _repartir_production(charge):
             ligne_of = _ligne(
                 charge, NiveauRepartition.OF, montant, valeur / total, parent=ligne_activite,
                 activite=ligne_activite.activite, ordre_fabrication=of,
-                inducteur=inducteur_of, unite_cle=UNITES_INDUCTEURS.get(inducteur_of, ""),
+                inducteur=inducteur_of,
+                unite_cle=unite_production(of.article) if inducteur_of == Inducteur.QUANTITE_PRODUITE else UNITES_INDUCTEURS.get(inducteur_of, ""),
                 valeur_cle_totale=total, valeur_cle_part=valeur,
                 statut=_statut(charge, "ESTIME" if estime_amont else nature_cle),
                 source=f"{charge.source} ; clé : {source}".strip(" ;"),
@@ -516,8 +576,25 @@ def quantites_livrees(periode, tournee=None):
     return resultat
 
 
+def ventes_periode(periode):
+    """{article: (unités vendues, CA HT)} des factures non annulées émises dans la période."""
+    from apps.commercial.models import LigneFacture
+    debut, fin = bornes(periode)
+    resultat = {}
+    for ligne in LigneFacture.objects.filter(
+        facture__date_emission__date__gte=debut, facture__date_emission__date__lt=fin,
+    ).exclude(facture__statut="ANNULEE").select_related("article"):
+        unites, ca = resultat.get(ligne.article, (Decimal(0), Decimal(0)))
+        resultat[ligne.article] = (unites + ligne.article.en_unites(ligne.quantite), ca + ligne.montant_ht)
+    return resultat
+
+
 def _repartir_hors_production(charge):
-    """Stockage et distribution : répartis par produit, hors coût de production."""
+    """
+    Stockage, distribution et commercialisation : répartis par produit, hors
+    coût de production, puis ramenés aux unités VENDUES de la période (ce
+    sont des coûts de la vente, pas de la fabrication).
+    """
     from apps.distribution.models import Tournee
     nature, periode = charge.nature, charge.periode
     inducteur = nature.inducteur
@@ -543,6 +620,14 @@ def _repartir_hors_production(charge):
             if valeur:
                 parts.append((article, valeur))
         source = f"bons de livraison livrés ({UNITES_INDUCTEURS[inducteur]})"
+    elif inducteur in (Inducteur.CHIFFRE_AFFAIRES, Inducteur.QUANTITE_VENDUE):
+        parts = [
+            (article, ca if inducteur == Inducteur.CHIFFRE_AFFAIRES else unites)
+            for article, (unites, ca) in ventes_periode(periode).items()
+            if not charge.activite_id or article.activite_id == charge.activite_id
+        ]
+        parts = [(article, valeur) for article, valeur in parts if valeur > 0]
+        source = f"factures de la période ({UNITES_INDUCTEURS[inducteur]})"
     elif inducteur == Inducteur.KM:
         debut, fin = bornes(periode)
         tournees = [charge.tournee] if charge.tournee_id else list(Tournee.objects.filter(date_tournee__gte=debut, date_tournee__lt=fin))
@@ -566,18 +651,18 @@ def _repartir_hors_production(charge):
     for of in ofs_de_la_periode(periode):
         for article, quantite in of.quantites_par_format().items():
             produites[article.pk] = produites.get(article.pk, Decimal(0)) + quantite
+    vendues = {article.pk: unites for article, (unites, _) in ventes_periode(periode).items()}
     for article, valeur, montant in ventilation:
-        quantite = produites.get(article.pk)
-        unites = article.en_unites(quantite) if quantite else None
+        unites = vendues.get(article.pk)
         _ligne(
             charge, NiveauRepartition.ARTICLE, montant, valeur / total, activite=article.activite, article=article,
             valeur_cle_totale=total, valeur_cle_part=valeur, statut=_statut(charge),
-            quantite_produite=quantite, cout_par_unite=(montant / unites) if unites else None,
-            cout_par_pack=(montant / article.en_packs(quantite)) if quantite else None,
+            quantite_produite=produites.get(article.pk), cout_par_unite=(montant / unites) if unites else None,
+            cout_par_pack=(montant / (unites / Decimal(article.unites_par_pack or 1))) if unites else None,
             source=f"{charge.source} ; clé : {source}".strip(" ;"),
             justification=(
                 f"{nature.get_categorie_display()} : hors coût de production, réparti par produit au prorata de "
-                f"{Inducteur(inducteur).label} ; ramené aux unités produites de la période."
+                f"{Inducteur(inducteur).label} ; ramené aux unités vendues de la période."
             ),
         )
     return StatutRepartition.REPARTIE, ""
@@ -657,10 +742,11 @@ def generer_amortissements(periode, utilisateur=None):
     """
     Charges d'amortissement de la période à partir des équipements
     (valeur / durée), rattachées à l'étape de leur poste : dédiées à
-    l'activité de l'équipement, sinon communes (réparties au volume d'eau
-    en amont, aux heures machine ailleurs). Idempotent.
+    l'activité de l'équipement ; forage : réparti à l'eau brute captée ;
+    autre machine commune : entre les activités de son site, aux heures
+    machine. Descente aux OF : quantité produite. Idempotent.
     """
-    from apps.industriel.models import Equipement, PhaseEtape
+    from apps.industriel.models import Equipement
     from .models import CategorieEconomique, NatureCout, Traitement
     debut, fin = bornes(periode)
     creees = []
@@ -672,24 +758,24 @@ def generer_amortissements(periode, utilisateur=None):
             if mois >= equipement.duree_amortissement_mois:
                 continue
         etape = equipement.poste.etape if equipement.poste_id else None
-        amont = etape is not None and etape.phase == PhaseEtape.AMONT
-        inducteur = equipement.inducteur_amortissement or (Inducteur.VOLUME_EAU_M3 if amont else Inducteur.HEURES_MACHINE)
+        forage = equipement.type_equipement == "FORAGE" or (etape is not None and etape.code == "CAPTAGE")
+        inducteur = equipement.inducteur_amortissement or (Inducteur.VOLUME_EAU_BRUTE_M3 if forage else Inducteur.HEURES_MACHINE)
         # Une seule charge par équipement, même s'il réalise plusieurs postes (pas de double compte, Q56).
         nature, _ = NatureCout.objects.get_or_create(
             libelle=f"Amortissement {etape.libelle if etape else 'équipements'} ({Inducteur(inducteur).label})", etape=etape,
             categorie=CategorieCout.PRODUCTION,
             defaults={
                 "categorie_economique": CategorieEconomique.AMORTISSEMENT, "traitement": Traitement.INDIRECT,
-                "inducteur": inducteur,
-                "justification": "Amortissement mensuel imputé selon l'usage réel de l'équipement (inducteur paramétré).",
+                "inducteur": inducteur, "inducteur_of": Inducteur.QUANTITE_PRODUITE,
+                "justification": "Amortissement mensuel imputé selon l'usage réel de l'équipement, puis aux OF selon la quantité produite.",
             },
         )
         source = f"Amortissement {equipement.code}"
         if Charge.objects.filter(periode=periode, equipement=equipement, nature=nature, source=source).exists():
             continue
-        # Machine commune à un site (hors forage et traitement d'eau, communs
-        # aux deux sites) : répartie entre les seules activités de son site.
-        commune_au_site = not equipement.activite_id and not amont and equipement.type_equipement != "FORAGE"
+        # Machine commune à un site (hors forage, commun aux deux sites) :
+        # répartie entre les seules activités de son site.
+        commune_au_site = not equipement.activite_id and not forage
         creees.append(Charge.objects.create(
             nature=nature, periode=periode, equipement=equipement, activite=equipement.activite,
             usine=equipement.usine if commune_au_site else None,
@@ -726,12 +812,23 @@ def cout_eau_traitee(periode):
 
 def cout_revient(periode):
     """
-    Coût de revient par OF de la période (production) et par produit
-    (production + stockage + distribution = coût de revient complet).
+    Coût de revient (précision client) = coût de production des quantités
+    réellement produites + coût de distribution (stockage produit fini,
+    logistique / livraison, commercialisation). Par OF de la période et par
+    produit. Le coût de production unitaire se calcule sur les unités
+    produites, les coûts de distribution sur les unités vendues.
     """
     from apps.industriel.models import EtapeStandard
     from .models import CoutReel
+    hors_production = ("stockage", "distribution", "commercialisation")
     par_of, par_article = [], {}
+
+    def produit(article):
+        return par_article.setdefault(article.pk, {
+            "article": article.code, "designation": article.designation, "unites": Decimal(0), "unites_vendues": Decimal(0),
+            "production": Decimal(0), **{cle: Decimal(0) for cle in hors_production},
+        })
+
     for of in ofs_de_la_periode(periode):
         cout, _ = CoutReel.objects.get_or_create(ordre_fabrication=of)
         article = of.article
@@ -762,26 +859,24 @@ def cout_revient(periode):
             ],
         })
         for l in ventilation:
-            donnees = par_article.setdefault(l["article"].pk, {
-                "article": l["article"].code, "designation": l["article"].designation, "unites": Decimal(0),
-                "production": Decimal(0), "stockage": Decimal(0), "distribution": Decimal(0),
-            })
+            donnees = produit(l["article"])
             donnees["unites"] += l["unites"]
             donnees["production"] += l["cout"]
+    cles = {CategorieCout.STOCKAGE: "stockage", CategorieCout.DISTRIBUTION: "distribution", CategorieCout.COMMERCIAL: "commercialisation"}
     for ligne in RepartitionCout.objects.filter(charge__periode=periode, niveau=NiveauRepartition.ARTICLE).select_related("article", "charge__nature"):
-        donnees = par_article.setdefault(ligne.article_id, {
-            "article": ligne.article.code, "designation": ligne.article.designation, "unites": Decimal(0),
-            "production": Decimal(0), "stockage": Decimal(0), "distribution": Decimal(0),
-        })
-        cle = "stockage" if ligne.charge.nature.categorie == CategorieCout.STOCKAGE else "distribution"
-        donnees[cle] += ligne.montant
+        produit(ligne.article)[cles.get(ligne.charge.nature.categorie, "distribution")] += ligne.montant
+    for article, (unites, _) in ventes_periode(periode).items():
+        if article.pk in par_article:
+            par_article[article.pk]["unites_vendues"] = unites
     for donnees in par_article.values():
-        unites = donnees["unites"]
-        for cle in ("production", "stockage", "distribution"):
-            donnees[f"{cle}_par_unite"] = (donnees[cle] / unites) if unites else None
-        complet = donnees["production"] + donnees["stockage"] + donnees["distribution"]
-        donnees["cout_revient_complet"] = complet
-        donnees["cout_revient_complet_par_unite"] = (complet / unites) if unites else None
+        unites, vendues = donnees["unites"], donnees["unites_vendues"]
+        donnees["production_par_unite"] = (donnees["production"] / unites) if unites else None
+        for cle in hors_production:
+            donnees[f"{cle}_par_unite"] = (donnees[cle] / vendues) if vendues else None
+        donnees["cout_distribution"] = sum((donnees[cle] for cle in hors_production), Decimal(0))
+        donnees["cout_revient_complet"] = donnees["production"] + donnees["cout_distribution"]
+        par_unite = [donnees["production_par_unite"]] + [donnees[f"{cle}_par_unite"] for cle in hors_production if donnees[cle]]
+        donnees["cout_revient_complet_par_unite"] = None if None in par_unite else sum(par_unite, Decimal(0))
     non_reparties = Charge.objects.filter(periode=periode, statut_repartition__in=("NON_REPARTIE", "PARTIELLE"))
     return {
         "periode": periode, "ofs": par_of, "produits": list(par_article.values()),
@@ -791,6 +886,44 @@ def cout_revient(periode):
         ],
         "etapes": list(EtapeStandard.objects.values_list("libelle", flat=True)),
     }
+
+
+def _texte(nombre):
+    """200.000 -> « 200 », 12.500 -> « 12.5 » (sans notation scientifique)."""
+    texte = format(nombre, "f")
+    return texte.rstrip("0").rstrip(".") if "." in texte else texte
+
+
+def ventiler_facture_par_etape(facture, utilisateur=None):
+    """
+    Facture d'électricité -> une part par étape au prorata des kWh relevés
+    (relevés rattachés à la facture, sinon ceux de la période sans facture).
+    Remplace les parts existantes. Lève ValidationError si aucun relevé.
+    """
+    from django.core.exceptions import ValidationError
+    from .models import ReleveElectricite
+    releves = list(ReleveElectricite.objects.filter(facture=facture).select_related("etape", "nature"))
+    if not releves:
+        releves = list(ReleveElectricite.objects.filter(periode=facture.periode, facture__isnull=True).select_related("etape", "nature"))
+    releves = [r for r in releves if r.kwh > 0]
+    if not releves:
+        raise ValidationError(
+            f"Aucun relevé d'électricité par étape pour {facture.periode} : saisissez les kWh des compteurs, "
+            "ou ventilez la facture vous-même (clé définie)."
+        )
+    natures = {r.pk: r.nature_energie() for r in releves}
+    _, ventilation = ventiler(facture.montant_total, [(r, r.kwh) for r in releves])
+    total_kwh = sum((r.kwh for r in releves), Decimal(0))
+    with transaction.atomic():
+        facture.parts.all().delete()
+        for releve, kwh, montant in ventilation:
+            Charge.objects.create(
+                facture=facture, nature=natures[releve.pk], periode=facture.periode, montant=montant,
+                usine=releve.usine, activite=releve.activite, statut_donnee=releve.statut_donnee,
+                source=f"{facture.reference} ; {_texte(kwh)} kWh sur {_texte(total_kwh)} ({releve.source or 'relevé'})".strip(),
+                saisi_par=utilisateur,
+            )
+    return facture
 
 
 def _somme(lignes):

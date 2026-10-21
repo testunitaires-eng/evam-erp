@@ -49,7 +49,7 @@ class FactureChargeAdmin(admin.ModelAdmin):
 
 @admin.register(models.VolumeEauSite)
 class VolumeEauSiteAdmin(admin.ModelAdmin):
-    list_display = ("periode", "usine", "volume_m3", "statut_donnee", "source")
+    list_display = ("periode", "usine", "activite", "volume_m3", "statut_donnee", "source")
     list_filter = ("periode", "usine", "statut_donnee")
 
 
@@ -57,3 +57,9 @@ class VolumeEauSiteAdmin(admin.ModelAdmin):
 class ValeurCleAdmin(admin.ModelAdmin):
     list_display = ("inducteur", "usine", "activite", "valeur", "date_debut", "source")
     list_filter = ("inducteur", "usine")
+
+
+@admin.register(models.ReleveElectricite)
+class ReleveElectriciteAdmin(admin.ModelAdmin):
+    list_display = ("periode", "etape", "nature", "usine", "activite", "kwh", "statut_donnee", "source")
+    list_filter = ("periode", "etape", "statut_donnee")

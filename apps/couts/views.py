@@ -231,13 +231,27 @@ class FactureChargeViewSet(viewsets.ModelViewSet):
             raise erreur_django_vers_drf(erreur)
         return Response(self.get_serializer(self.get_queryset().get(pk=facture.pk)).data)
 
+    @action(detail=True, methods=["post"])
+    def repartir_par_etape(self, request, pk=None):
+        """
+        POST .../factures/{id}/repartir_par_etape/
+        Une part par étape au prorata des kWh relevés aux compteurs (relevés
+        d'électricité). Sans relevé : ventilez la facture vous-même (/ventiler/).
+        """
+        facture = self.get_object()
+        try:
+            cascade.ventiler_facture_par_etape(facture, request.user)
+        except DjangoValidationError as erreur:
+            raise erreur_django_vers_drf(erreur)
+        return Response(self.get_serializer(self.get_queryset().get(pk=facture.pk)).data)
+
 
 class VolumeEauSiteViewSet(viewsets.ModelViewSet):
-    """Volume d'eau livré par le forage à chaque site (compteur ou estimation validée) : clé du forage commun."""
-    queryset = models.VolumeEauSite.objects.select_related("usine")
+    """Relevés des compteurs d'eau brute captée, par activité ou par site : clé du forage commun."""
+    queryset = models.VolumeEauSite.objects.select_related("usine", "activite")
     serializer_class = serializers.VolumeEauSiteSerializer
     permission_classes = [PROFILS_COUTS]
-    filterset_fields = ["periode", "usine", "statut_donnee"]
+    filterset_fields = ["periode", "usine", "activite", "statut_donnee"]
 
     def perform_create(self, serializer):
         serializer.save(saisi_par=self.request.user)
@@ -262,3 +276,14 @@ def cout_par_site(request):
     if periode is None:
         return Response({"erreur": "Indiquez « periode » au format AAAA-MM."}, status=400)
     return Response(cascade.cout_par_site(periode))
+
+
+class ReleveElectriciteViewSet(viewsets.ModelViewSet):
+    """kWh par étape relevés aux compteurs : clé de répartition de la facture d'électricité par étape."""
+    queryset = models.ReleveElectricite.objects.select_related("etape", "nature", "usine", "activite")
+    serializer_class = serializers.ReleveElectriciteSerializer
+    permission_classes = [PROFILS_COUTS]
+    filterset_fields = ["periode", "etape", "usine", "activite", "facture", "statut_donnee"]
+
+    def perform_create(self, serializer):
+        serializer.save(saisi_par=self.request.user)

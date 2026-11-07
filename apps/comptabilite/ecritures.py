@@ -12,6 +12,7 @@ Schémas (comptes paramétrables, voir CompteParametre) :
 - Décaissement       : D 658 Charges diverses (ou 411 Client si remboursement) / C 571 Caisse
 - Avoir utilisé      : D 709 Rabais accordés / C 411 Client
 - Réception d'achat  : D 60x Achats (selon la nature de l'article) / C 401 Fournisseur
+- Retour fournisseur : contre-passation de la réception : D 401 Fournisseur / C 60x Achats
 - Ventes comptoir    : particuliers au comptant -> pas d'écriture par facture ni par
                        encaissement, mais une SYNTHÈSE à la clôture de la session de
                        caisse : D 571 (ou banque / Mobile Money) / C 702x, C taxes
@@ -228,4 +229,25 @@ def ecrire_reception(ligne_reception):
     return passer_ecriture(ligne_reception, Journal.ACHATS, commande.numero, libelle, [
         (compte_d_achat(ligne_commande.article), "", libelle, montant, 0),
         (compte(CleCompte.FOURNISSEURS), commande.fournisseur.code, libelle, 0, montant),
+    ])
+
+
+def ecrire_retour_fournisseur(retour):
+    """
+    Marchandise reçue puis renvoyée : on annule la dette fournisseur et
+    l'achat correspondants, au prix de la ligne de commande (même unité
+    que la quantité retournée, comme à la réception).
+    """
+    commande = retour.reception.commande
+    ligne_commande = commande.lignes.filter(article_id=retour.article_id).first()
+    if ligne_commande is None:
+        raise ValidationError(f"Aucune ligne de la commande {commande.numero} pour {retour.article.code} : retour non chiffrable.")
+    montant = Decimal(retour.quantite_retournee) * Decimal(ligne_commande.prix_unitaire)
+    libelle = (
+        f"Retour fournisseur {commande.numero} - {retour.article.code} x {retour.quantite_retournee} "
+        f"({retour.get_motif_display()}) - {commande.fournisseur.nom}"
+    )
+    return passer_ecriture(retour, Journal.ACHATS, commande.numero, libelle, [
+        (compte(CleCompte.FOURNISSEURS), commande.fournisseur.code, libelle, montant, 0),
+        (compte_d_achat(retour.article), "", libelle, 0, montant),
     ])

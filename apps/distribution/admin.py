@@ -19,11 +19,6 @@ class ChauffeurAdmin(admin.ModelAdmin):
     search_fields = ()
 
 
-@admin.register(models.Depot)
-class DepotAdmin(admin.ModelAdmin):
-    search_fields = ()
-
-
 @admin.register(models.Tournee)
 class TourneeAdmin(admin.ModelAdmin):
     search_fields = ()
@@ -37,9 +32,3 @@ class PreparationLivraisonAdmin(admin.ModelAdmin):
 @admin.register(models.BonLivraison)
 class BonLivraisonAdmin(admin.ModelAdmin):
     search_fields = ()
-
-
-@admin.register(models.TransfertDepot)
-class TransfertDepotAdmin(admin.ModelAdmin):
-    search_fields = ()
-

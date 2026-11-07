@@ -147,8 +147,9 @@ Reproduit le circuit à deux acteurs du cahier des charges (§12.3) :
 - Magasinier : prépare, confirme la sortie magasin.
 - Chauffeur : accès restreint à ses tournées et livraisons affectées.
 
-TransfertDepot est géré par le Magasinier (mouvement de stock entre
-dépôts, cohérent avec ses autres droits).
+Les dépôts et les transferts entre dépôts sont gérés par le module
+stocks (/api/stocks/depots/ et /api/stocks/transferts/), qui crée les
+mouvements de stock correspondants.
 """
 
 from rest_framework import viewsets
@@ -172,15 +173,6 @@ class VehiculeViewSet(viewsets.ModelViewSet):
 class ChauffeurViewSet(viewsets.ModelViewSet):
     queryset = models.Chauffeur.objects.all()
     serializer_class = serializers.ChauffeurSerializer
-    permission_classes = [acces(
-        lecture=(Profil.DIRECTION,),
-        ecriture=(Profil.RESPONSABLE_DISTRIBUTION, Profil.ADMIN_SI,),
-    )]
-
-
-class DepotViewSet(viewsets.ModelViewSet):
-    queryset = models.Depot.objects.all()
-    serializer_class = serializers.DepotSerializer
     permission_classes = [acces(
         lecture=(Profil.DIRECTION,),
         ecriture=(Profil.RESPONSABLE_DISTRIBUTION, Profil.ADMIN_SI,),
@@ -335,10 +327,3 @@ class BonLivraisonViewSet(HistoriqueMixin, viewsets.ModelViewSet):
         from apps.core.pdf import telecharger
         objet = self.get_object()
         return documents.bon_livraison(objet, request.user).reponse(f"bon-livraison-{objet.numero}", telecharger(request))
-
-
-class TransfertDepotViewSet(viewsets.ModelViewSet):
-    queryset = models.TransfertDepot.objects.all()
-    serializer_class = serializers.TransfertDepotSerializer
-    permission_classes = [role_required(Profil.MAGASINIER, Profil.ADMIN_SI)]
-    filterset_fields = ["depot_source", "depot_destination", "statut"]

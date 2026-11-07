@@ -23,12 +23,6 @@ class ChauffeurSerializer(ValidationModeleMixin, serializers.ModelSerializer):
         fields = "__all__"
 
 
-class DepotSerializer(ValidationModeleMixin, serializers.ModelSerializer):
-    class Meta:
-        model = models.Depot
-        fields = "__all__"
-
-
 class TourneeSerializer(ValidationModeleMixin, serializers.ModelSerializer):
     # Le Chauffeur ne lit pas /vehicules/ ni /chauffeurs/ : libellés recopiés ici.
     vehicule_immatriculation = serializers.CharField(source="vehicule.immatriculation", read_only=True)
@@ -95,10 +89,3 @@ class BonLivraisonSerializer(ValidationModeleMixin, serializers.ModelSerializer)
                 "La livraison est confirmée uniquement par le Responsable Distribution (action /confirmer_livraison/)."
             )
         return valeur
-
-
-class TransfertDepotSerializer(ValidationModeleMixin, serializers.ModelSerializer):
-    class Meta:
-        model = models.TransfertDepot
-        fields = "__all__"
-

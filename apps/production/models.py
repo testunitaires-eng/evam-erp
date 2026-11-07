@@ -1323,6 +1323,7 @@ class OrdreFabrication(ValidationAvantEnregistrement, models.Model):
             # Association automatique du circuit validé le plus précis.
             from apps.industriel.models import circuit_pour
             self.circuit = circuit_pour(self.article, self.ligne)
+        ancien_statut = None if creation else valeur_en_base(self, "statut")
         with transaction.atomic():
             if not self.numero:
                 self.numero = generer_numero("OF")
@@ -1332,6 +1333,10 @@ class OrdreFabrication(ValidationAvantEnregistrement, models.Model):
                 # en brouillon (voir clean) : les besoins doivent suivre.
                 self.besoins_matieres.all().delete()
                 self._calculer_besoins_matieres()
+            if recalcul or ancien_statut != self.statut:
+                # Matières manquantes -> besoin d'achat (un seul par matière, voir achats).
+                from apps.achats.models import synchroniser_besoins_of
+                synchroniser_besoins_of(self)
 
     def clean(self):
         """
@@ -1713,6 +1718,8 @@ class OrdreFabrication(ValidationAvantEnregistrement, models.Model):
         """Besoins recalculés (ajout / retrait d'un format tant que l'OF est en brouillon)."""
         self.besoins_matieres.all().delete()
         self._calculer_besoins_matieres()
+        from apps.achats.models import synchroniser_besoins_of
+        synchroniser_besoins_of(self)
 
     @property
     def montant_total_matieres(self):
@@ -2927,6 +2934,9 @@ class ReservationMatiere(models.Model):
             cls._ajuster_stock(reservation.matiere, reservation.depot, -reservation.quantite_restante)
             reservation.quantite_restante = 0
             reservation.save(update_fields=["quantite_restante"])
+        # Le stock libéré redevient disponible : les besoins d'achat suivent.
+        from apps.achats.models import synchroniser_besoins_of
+        synchroniser_besoins_of(of)
 
 
 

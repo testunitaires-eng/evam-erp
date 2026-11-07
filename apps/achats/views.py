@@ -231,7 +231,7 @@ class BesoinApprovisionnementViewSet(viewsets.ModelViewSet):
         lecture=(Profil.DIRECTION, Profil.MAGASINIER, Profil.COMPTABILITE_DAF,),
         ecriture=(Profil.RESPONSABLE_ACHATS, Profil.ADMIN_SI,),
     )]
-    filterset_fields = ["article", "origine", "satisfait"]
+    filterset_fields = ["article", "origine", "satisfait", "ordres_fabrication"]
 
     @action(detail=True, methods=["post"])
     def creer_demande(self, request, pk=None):
@@ -259,10 +259,15 @@ class DemandeAchatViewSet(HistoriqueMixin, viewsets.ModelViewSet):
     def perform_create(self, serializer):
         serializer.save(demandeur=self.request.user)
 
+    @staticmethod
+    def _peut_traiter(utilisateur):
+        """Approuver/rejeter : Responsable Achat, ou Administrateur SI (accès total)."""
+        return utilisateur.is_superuser or utilisateur.profil in PROFILS_ACHATS
+
     @action(detail=True, methods=["post"])
     def approuver(self, request, pk=None):
-        """POST /api/achats/demandes/{id}/approuver/ - réservé au Responsable Achat."""
-        if request.user.profil != Profil.RESPONSABLE_ACHATS and not request.user.is_superuser:
+        """POST /api/achats/demandes/{id}/approuver/ - Responsable Achat ou Administrateur SI."""
+        if not self._peut_traiter(request.user):
             return Response({"erreur": "Seul le Responsable Achat peut approuver une demande."}, status=403)
         demande = self.get_object()
         try:
@@ -273,8 +278,8 @@ class DemandeAchatViewSet(HistoriqueMixin, viewsets.ModelViewSet):
 
     @action(detail=True, methods=["post"])
     def rejeter(self, request, pk=None):
-        """POST /api/achats/demandes/{id}/rejeter/ - réservé au Responsable Achat."""
-        if request.user.profil != Profil.RESPONSABLE_ACHATS and not request.user.is_superuser:
+        """POST /api/achats/demandes/{id}/rejeter/ - Responsable Achat ou Administrateur SI."""
+        if not self._peut_traiter(request.user):
             return Response({"erreur": "Seul le Responsable Achat peut rejeter une demande."}, status=403)
         demande = self.get_object()
         try:

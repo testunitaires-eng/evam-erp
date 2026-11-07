@@ -21,9 +21,8 @@ valider avec le client, chacune documentée sur place) :
 """
 
 from datetime import date
-from django.db.models import Sum, F, Count
+from django.db.models import Sum
 from rest_framework.decorators import api_view, permission_classes as drf_permission_classes, action
-from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework import viewsets
 from apps.comptes.permissions import role_required, acces
@@ -125,30 +124,6 @@ def _bloc_commercial():
         "produit_le_plus_vendu": produit_top["article__code"] if produit_top else None,
         "client_principal": client_top["client__nom"] if client_top else None,
     }
-
-
-# def _bloc_caisse():
-#     """§12.2.4 - Caisse."""
-#     from apps.caisse.models import SessionCaisse, Encaissement, EcartCaisse
-
-#     aujourd_hui = date.today()
-#     encaissements_jour = Encaissement.objects.filter(
-#         date_encaissement__date=aujourd_hui
-#     ).aggregate(total=Sum("montant"))["total"] or 0
-
-#     sessions_jour = SessionCaisse.objects.filter(date_ouverture__date=aujourd_hui)
-#     solde_theorique = sessions_jour.aggregate(total=Sum("solde_ouverture"))["total"] or 0
-#     solde_theorique = float(solde_theorique) + float(encaissements_jour)
-
-#     ecarts_jour = EcartCaisse.objects.filter(
-#         session_caisse__in=sessions_jour
-#     ).aggregate(total=Sum("montant_ecart"))["total"] or 0
-
-#     return {
-#         "encaissements_jour": encaissements_jour,
-#         "solde_theorique": round(solde_theorique, 2),
-#         "ecart_caisse": ecarts_jour,
-#     }
 
 
 def _bloc_caisse():

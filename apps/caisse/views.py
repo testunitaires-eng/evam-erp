@@ -13,14 +13,9 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from apps.core.validation import METHODES_CREATION_LECTURE
 from . import models, serializers
-from apps.comptes.permissions import role_required , lecture_seule_pour, acces
+from apps.comptes.permissions import acces
 from apps.comptes.models import Profil, Utilisateur
 
-
-# class CaisseViewSet(viewsets.ModelViewSet):
-#     queryset = models.Caisse.objects.all()
-#     serializer_class = serializers.CaisseSerializer
-#     permission_classes = [role_required(Profil.ADMIN_SI)]
 
 PROFILS_SUPERVISION_CAISSE = (Profil.ADMIN_SI, Profil.COMPTABILITE_DAF, Profil.DIRECTION)
 
@@ -201,9 +196,6 @@ class EcartCaisseViewSet(
             "Un écart se justifie au moment de la clôture : "
             "POST /api/caisse/sessions/{id}/cloturer/ avec solde_compte et justification."
         )}, status=400)
-
-
-
 
 
 class DecaissementViewSet(HistoriqueMixin, FiltreCaissierMixin, viewsets.ModelViewSet):

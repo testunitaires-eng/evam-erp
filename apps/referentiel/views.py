@@ -13,16 +13,9 @@ from apps.core.views import HistoriqueMixin
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from . import models, serializers
-from apps.comptes.permissions import role_required, lecture_seule_pour, acces
+from apps.comptes.permissions import role_required, acces
 from apps.comptes.models import Profil
 
-
-# class ArticleViewSet(viewsets.ModelViewSet):
-#     queryset = models.Article.objects.all()
-#     serializer_class = serializers.ArticleSerializer
-#     permission_classes = [lecture_seule_pour(Profil.RESPONSABLE_PRODUCTION, Profil.ADMIN_SI)]
-#     filterset_fields = ["type_article", "famille", "actif"]
-#     search_fields = ["code", "designation"]
 
 class ArticleViewSet(viewsets.ModelViewSet):
     queryset = models.Article.objects.all()
@@ -43,33 +36,6 @@ class ArticleViewSet(viewsets.ModelViewSet):
         """Idem si un article devient produit fini après coup."""
         article = serializer.save()
         article.creer_fiche_technique_brouillon(self.request.user)
-
-# class FicheTechniqueViewSet(viewsets.ModelViewSet):
-#     queryset = models.FicheTechnique.objects.all()
-#     serializer_class = serializers.FicheTechniqueSerializer
-#     permission_classes = [role_required(Profil.RESPONSABLE_PRODUCTION, Profil.ADMIN_SI)]
-#     filterset_fields = ["article", "statut"]
-
-#     @action(detail=True, methods=["post"])
-#     def valider(self, request, pk=None):
-#         """
-#         POST /api/referentiel/fiches-techniques/{id}/valider/
-#         Fait passer la fiche de BROUILLON à VALIDEE.
-#         """
-#         fiche = self.get_object()
-#         try:
-#             fiche.valider(request.user)
-#         except ValueError as erreur:
-#             return Response({"erreur": str(erreur)}, status=400)
-#         return Response(self.get_serializer(fiche).data)
-
-
-
-# class FicheTechniqueViewSet(viewsets.ModelViewSet):
-#     queryset = models.FicheTechnique.objects.all()
-#     serializer_class = serializers.FicheTechniqueSerializer
-#     permission_classes = [role_required(Profil.RESPONSABLE_PRODUCTION, Profil.ADMIN_SI)]
-#     filterset_fields = ["article", "statut"]
 
 
 class FicheTechniqueViewSet(HistoriqueMixin, viewsets.ModelViewSet):
@@ -210,8 +176,6 @@ class FicheConditionnementViewSet(viewsets.ModelViewSet):
     filterset_fields = ["article"]
 
 
-
-
 @extend_schema(deprecated=True, description="Obsolète : remplacé par le plan de contrôle (/api/qualite/plan-controle/).")
 class ControleQualiteRequisViewSet(viewsets.ModelViewSet):
     """
@@ -226,10 +190,6 @@ class ControleQualiteRequisViewSet(viewsets.ModelViewSet):
         ecriture=(Profil.ADMIN_SI,),
     )]
     filterset_fields = ["article", "moment", "obligatoire"]
-
-
-
-
 
 
 class FamilleArticleViewSet(viewsets.ModelViewSet):
@@ -278,7 +238,6 @@ class UniteVenteArticleViewSet(viewsets.ModelViewSet):
     )]
     filterset_fields = ["actif"]
     search_fields = ["nom"]
-
 
 
 class ConversionUniteViewSet(viewsets.ModelViewSet):

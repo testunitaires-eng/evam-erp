@@ -262,3 +262,149 @@ class RemunerationEtPointageTests(BasePersonnel):
         historique = self.api.get(f"/api/personnel/pointages/{Pointage.objects.get(ouvrier=a).id}/").data
         self.assertEqual((historique["statut"], historique["valide_par"]), ("VALIDE", self.admin.id))
 
+
+
+class PaieTests(BasePersonnel):
+    """Phase 3 : états de paie, validation DAF, paiement en espèces, coûts des OF."""
+    OCTOBRE = date(2026, 10, 15)     # octobre 2026 : 22 jours ouvrables (lundi-vendredi)
+
+    def setUp(self):
+        super().setUp()
+        from apps.caisse.models import Caisse, SessionCaisse
+        def utilisateur(profil):
+            u = Utilisateur.objects.create_user(profil.lower(), password="x", profil=profil)
+            api = APIClient()
+            api.force_authenticate(u)
+            return u, api
+        self.rh, self.api_rh = utilisateur(Profil.RH)
+        self.daf, self.api_daf = utilisateur(Profil.COMPTABILITE_DAF)
+        self.caissier, self.api_caisse = utilisateur(Profil.CAISSIER)
+        from apps.caisse.models import Encaissement
+        from apps.commercial.models import Facture
+        caisse = Caisse.objects.create(nom="Caisse paie", caissier=self.caissier)
+        session = SessionCaisse.objects.create(caisse=caisse, caissier=self.caissier, solde_ouverture=0)
+        # Argent en caisse : une vente encaissée en espèces (le solde d'ouverture est automatique).
+        self.client_evam.encours_autorise = 1000000
+        self.client_evam.save()
+        facture = Facture.objects.create(commande=self.commande(lignes=((2500, 100),), statut="VALIDEE"))
+        facture.generer_lignes_depuis_commande()
+        Encaissement.objects.create(session_caisse=session, facture=facture, montant=250000, mode_paiement="ESPECES")
+        self.permanent = self.ouvrier(entree=date(2026, 9, 1))
+        ConditionRemuneration.objects.create(ouvrier=self.permanent, mode="MENSUEL", montant=220000, date_effet=date(2026, 9, 1))
+        self.of = OrdreFabrication.objects.create(article=self.produit, quantite_a_produire=1, responsable=self.admin, date_prevue=date(2026, 10, 8))
+        Affectation.objects.create(ouvrier=self.permanent, etape=self.remplissage, ordre_fabrication=self.of, date_fin=date(2026, 10, 8))
+
+    def pointer(self, ouvrier, jour, presence="PRESENT", valider=True, **champs):
+        pointage = Pointage.objects.create(ouvrier=ouvrier, date=jour, presence=presence, **champs)
+        if valider:
+            pointage.valider(self.rh)
+        return pointage
+
+    def pointer_octobre(self):
+        self.pointer(self.permanent, date(2026, 10, 5), "ABSENT")                                       # retenu : 1
+        self.pointer(self.permanent, date(2026, 10, 6), "ABSENT", absence_justifiee=True, motif_absence="Maladie")
+        self.pointer(self.permanent, date(2026, 10, 7), "DEMI_JOURNEE")                                 # retenu : 0,5
+        self.pointer(self.permanent, date(2026, 10, 8), ordre_fabrication=self.of)                      # sur l'OF
+
+    def preparer(self, periodicite="MENSUELLE", jour=None):
+        r = self.api_rh.post("/api/personnel/etats-paie/preparer/", {"periodicite": periodicite, "date": str(jour or self.OCTOBRE)}, format="json")
+        self.assertEqual(r.status_code, 201, r.content)
+        return r.data
+
+    def test_salaire_mensuel_retenue_au_prorata(self):
+        from apps.personnel.models import EtatPaie
+        self.pointer_octobre()
+        resultat = self.preparer()
+        self.assertEqual(resultat["erreurs"], {})
+        etat = EtatPaie.objects.get()
+        # 220 000 / 22 = 10 000 par jour ouvrable ; 1,5 jour d'absence non justifiée retenu.
+        self.assertEqual((etat.date_debut, etat.date_fin), (date(2026, 10, 1), date(2026, 10, 31)))
+        self.assertEqual((etat.montant, etat.jours_absence_retenus, etat.jours_non_pointes, etat.jours_travailles),
+                         (Decimal("205000"), Decimal("1.5"), 18, Decimal("1.5")))
+        self.assertEqual(self.preparer()["etats"], [])                               # pas de doublon
+
+    def test_journalier_hebdomadaire_et_entree_en_cours_de_mois(self):
+        from apps.personnel.models import EtatPaie
+        temporaire = self.ouvrier("TEMPORAIRE", fin=date(2026, 12, 31), entree=date(2026, 10, 1))
+        ConditionRemuneration.objects.create(ouvrier=temporaire, mode="JOURNALIER", montant=5000,
+                                             periodicite_paie="HEBDOMADAIRE", date_effet=date(2026, 10, 1))
+        self.pointer(temporaire, date(2026, 10, 12))
+        self.pointer(temporaire, date(2026, 10, 13), "DEMI_JOURNEE")
+        self.pointer(temporaire, date(2026, 10, 17))                                  # samedi travaillé : payé
+        self.preparer("HEBDOMADAIRE", date(2026, 10, 14))
+        etat = EtatPaie.objects.get(ouvrier=temporaire)
+        self.assertEqual((etat.date_debut, etat.date_fin, etat.montant), (date(2026, 10, 12), date(2026, 10, 18), Decimal("12500")))
+        self.assertFalse(EtatPaie.objects.filter(ouvrier=self.permanent).exists())  # payé au mois
+        # Entrée le jeudi 15/10 : seuls les jours ouvrables sous contrat comptent (12 sur 22).
+        nouveau = self.ouvrier(entree=date(2026, 10, 15))
+        ConditionRemuneration.objects.create(ouvrier=nouveau, mode="MENSUEL", montant=220000, date_effet=date(2026, 10, 15))
+        self.preparer()
+        self.assertEqual(EtatPaie.objects.get(ouvrier=nouveau).montant, Decimal("120000"))
+
+    def test_pointages_non_valides_bloquent_la_preparation(self):
+        self.pointer(self.permanent, date(2026, 10, 5), valider=False)
+        resultat = self.preparer()
+        self.assertEqual(resultat["etats"], [])
+        self.assertIn("non validé", resultat["erreurs"][self.permanent.matricule][0])
+
+    def test_circuit_complet_rh_daf_caisse(self):
+        from apps.caisse.models import Decaissement
+        from apps.comptabilite.ecritures import ecritures_de
+        from apps.couts.models import CoutMainOeuvre
+        from apps.personnel.models import EtatPaie
+        self.pointer_octobre()
+        etat_id = self.preparer()["etats"][0]["id"]
+        url = f"/api/personnel/etats-paie/{etat_id}"
+        self.assertEqual(self.api_rh.post(f"{url}/valider/").status_code, 403)                   # le RH ne valide pas
+        self.assertEqual(self.api_caisse.get(f"{url}/").status_code, 404)                        # pas encore à payer
+        r = self.api_daf.post(f"{url}/valider/")
+        self.assertEqual((r.status_code, r.data["statut"]), (200, "VALIDE"), r.content)
+        etat = EtatPaie.objects.get()
+        lignes = {(l.compte, l.compte_tiers, l.debit, l.credit) for e in ecritures_de(etat) for l in e.lignes.all()}
+        self.assertEqual(lignes, {("661", "", Decimal("205000.00"), Decimal("0")),
+                                  ("422", self.permanent.matricule, Decimal("0"), Decimal("205000.00"))})
+        cout = CoutMainOeuvre.objects.get(etat_paie=etat)                                         # 1 jour sur l'OF
+        self.assertEqual((cout.ordre_fabrication, cout.heures, cout.cout_horaire), (self.of, Decimal("8"), Decimal("1250")))
+        # Période arrêtée : plus de pointage ni de nouveau taux sur octobre.
+        with self.assertRaisesMessage(ValidationError, "déjà validé"):
+            self.pointer(self.permanent, date(2026, 10, 9))
+        with self.assertRaisesMessage(ValidationError, "déjà arrêtée"):
+            ConditionRemuneration.objects.create(ouvrier=self.permanent, mode="MENSUEL", montant=250000, date_effet=date(2026, 10, 20))
+        # Paiement en espèces.
+        self.assertEqual(self.api_daf.post(f"{url}/payer/").status_code, 403)
+        r = self.api_caisse.post(f"{url}/payer/")
+        self.assertEqual(r.status_code, 200, r.content)
+        self.assertEqual(r.data["statut"], "PAYE")
+        decaissement = Decaissement.objects.get()
+        self.assertEqual((decaissement.statut, decaissement.montant, decaissement.autorise_par), ("EFFECTUE", Decimal("205000"), self.daf))
+        lignes = {(l.compte, l.compte_tiers, l.debit, l.credit) for e in ecritures_de(decaissement) for l in e.lignes.all()}
+        self.assertEqual(lignes, {("422", self.permanent.matricule, Decimal("205000.00"), Decimal("0")),
+                                  ("571", "", Decimal("0"), Decimal("205000.00"))})
+        self.assertEqual(self.api_caisse.post(f"{url}/payer/").status_code, 400)                # pas deux fois
+        r = self.api_rh.get("/api/personnel/etats-paie/emargement/?date_debut=2026-10-01&date_fin=2026-10-31")
+        self.assertEqual((r.status_code, r["Content-Type"]), (200, "application/pdf"))
+
+    def test_annulation_et_pointages_modifies_depuis_la_preparation(self):
+        from apps.comptabilite.ecritures import ecritures_de
+        from apps.couts.models import CoutMainOeuvre
+        from apps.personnel.models import EtatPaie
+        self.pointer_octobre()
+        etat_id = self.preparer()["etats"][0]["id"]
+        url = f"/api/personnel/etats-paie/{etat_id}"
+        self.pointer(self.permanent, date(2026, 10, 9), "ABSENT")                                # après préparation
+        r = self.api_daf.post(f"{url}/valider/")
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("recalculer", r.data["erreur"])
+        self.assertEqual(self.api_rh.post(f"{url}/recalculer/").data["montant"], "195000.00")
+        self.assertEqual(self.api_daf.post(f"{url}/valider/").status_code, 200)
+        self.assertEqual(self.api_daf.post(f"{url}/annuler/", {}, format="json").status_code, 400)   # motif obligatoire
+        r = self.api_daf.post(f"{url}/annuler/", {"motif": "Erreur de taux"}, format="json")
+        self.assertEqual((r.status_code, r.data["statut"]), (200, "ANNULE"), r.content)
+        etat = EtatPaie.objects.get()
+        soldes = {}
+        for ligne in (l for e in ecritures_de(etat) for l in e.lignes.all()):
+            soldes[ligne.compte] = soldes.get(ligne.compte, 0) + ligne.debit - ligne.credit
+        self.assertEqual(soldes, {"661": 0, "422": 0})                                           # contre-passé
+        self.assertFalse(CoutMainOeuvre.objects.exists())
+        self.assertEqual(len(self.preparer()["etats"]), 1)                                       # nouvelle paie possible
+        self.assertEqual(self.api_rh.delete(f"/api/personnel/etats-paie/{EtatPaie.objects.get(statut='BROUILLON').id}/").status_code, 204)

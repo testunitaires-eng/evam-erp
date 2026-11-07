@@ -8,6 +8,8 @@ Répartition des rôles (les ouvriers eux-mêmes n'ont jamais de compte) :
 - Direction, Comptabilité/DAF : consultation (la DAF voit la rémunération) ;
 - Agent Production (chef d'équipe) : consultation des ouvriers, affectations
   et pointages.
+- Paie : le RH prépare les états, la DAF (ou la Direction) les valide ou
+  les annule, le caissier les paie en espèces.
 L'Administrateur SI a accès à tout.
 """
 
@@ -17,9 +19,9 @@ from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
-from rest_framework import viewsets
+from rest_framework import mixins, viewsets
 from rest_framework.decorators import action
-from rest_framework.exceptions import ValidationError
+from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.response import Response
 
 from apps.comptes.models import Profil
@@ -38,6 +40,12 @@ PERMISSIONS_REMUNERATION = acces(
     lecture=(Profil.COMPTABILITE_DAF, Profil.DIRECTION),
     ecriture=(Profil.RH, Profil.ADMIN_SI),
 )
+PERMISSIONS_PAIE = acces(
+    ecriture=(Profil.RH, Profil.COMPTABILITE_DAF, Profil.DIRECTION, Profil.CAISSIER, Profil.ADMIN_SI),
+)
+PROFILS_PREPARATION_PAIE = (Profil.RH, Profil.ADMIN_SI)
+PROFILS_VALIDATION_PAIE = (Profil.COMPTABILITE_DAF, Profil.DIRECTION)   # ils autorisent aussi le décaissement
+PROFILS_PAIEMENT = (Profil.CAISSIER,)
 PERMISSIONS_POINTAGES = acces(
     lecture=(Profil.RESPONSABLE_PRODUCTION, Profil.COMPTABILITE_DAF, Profil.DIRECTION, Profil.AGENT_PRODUCTION),
     ecriture=(Profil.RH, Profil.ADMIN_SI),
@@ -228,3 +236,100 @@ class PointageViewSet(viewsets.ModelViewSet):
         if erreurs:
             return Response({"erreurs": erreurs}, status=400)
         return Response(self.get_serializer(enregistres, many=True).data, status=201)
+
+
+def exiger_profil(request, profils, action):
+    if not (request.user.is_superuser or request.user.profil in profils):
+        raise PermissionDenied(f"Votre profil ne peut pas {action}.")
+
+
+class EtatPaieViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, mixins.DestroyModelMixin, viewsets.GenericViewSet):
+    """
+    États de paie. Filtres : ?ouvrier=, ?statut=, ?periodicite=, ?date_debut=, ?date_fin=.
+    Le caissier ne voit que les états à payer ou payés. Supprimer : état préparé seulement (RH).
+    """
+    queryset = models.EtatPaie.objects.select_related("ouvrier", "decaissement")
+    serializer_class = serializers.EtatPaieSerializer
+    permission_classes = [PERMISSIONS_PAIE]
+    filterset_fields = ["ouvrier", "statut", "periodicite", "date_debut", "date_fin"]
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        if self.request.user.profil == Profil.CAISSIER and not self.request.user.is_superuser:
+            queryset = queryset.filter(statut__in=(models.StatutEtatPaie.VALIDE, models.StatutEtatPaie.PAYE))
+        return queryset
+
+    def perform_destroy(self, instance):
+        exiger_profil(self.request, PROFILS_PREPARATION_PAIE, "supprimer un état de paie")
+        instance.delete()
+
+    def _action(self, request, profils, libelle, methode, *args):
+        exiger_profil(request, profils, libelle)
+        etat = self.get_object()
+        try:
+            methode(etat, *args)
+        except ValueError as erreur:
+            return Response({"erreur": str(erreur)}, status=400)
+        return Response(self.get_serializer(etat).data)
+
+    @action(detail=False, methods=["post"])
+    def preparer(self, request):
+        """
+        POST /api/personnel/etats-paie/preparer/ {"periodicite": "MENSUELLE"|"HEBDOMADAIRE", "date": "AAAA-MM-JJ"}
+        Prépare les états de la période contenant la date (RH).
+        """
+        exiger_profil(request, PROFILS_PREPARATION_PAIE, "préparer la paie")
+        periodicite = request.data.get("periodicite")
+        if periodicite not in models.PeriodicitePaie.values:
+            raise ValidationError({"periodicite": "HEBDOMADAIRE ou MENSUELLE."})
+        try:
+            jour = Date.fromisoformat(request.data.get("date") or str(timezone.localdate()))
+        except ValueError:
+            raise ValidationError({"date": "Date attendue au format AAAA-MM-JJ."})
+        crees, erreurs = models.EtatPaie.preparer(periodicite, jour, request.user)
+        return Response({"etats": self.get_serializer(crees, many=True).data, "erreurs": erreurs}, status=201)
+
+    @action(detail=True, methods=["post"])
+    def recalculer(self, request, pk=None):
+        """POST .../etats-paie/{id}/recalculer/ (RH, état préparé)."""
+        return self._action(request, PROFILS_PREPARATION_PAIE, "recalculer la paie", models.EtatPaie.recalculer)
+
+    @action(detail=True, methods=["post"])
+    def valider(self, request, pk=None):
+        """POST .../etats-paie/{id}/valider/ (DAF ou Direction)."""
+        return self._action(request, PROFILS_VALIDATION_PAIE, "valider la paie", models.EtatPaie.valider, request.user)
+
+    @action(detail=True, methods=["post"])
+    def annuler(self, request, pk=None):
+        """POST .../etats-paie/{id}/annuler/ {"motif": "..."} (DAF ou Direction, état validé non payé)."""
+        return self._action(request, PROFILS_VALIDATION_PAIE, "annuler la paie", models.EtatPaie.annuler,
+                            request.user, request.data.get("motif", ""))
+
+    @action(detail=True, methods=["post"])
+    def payer(self, request, pk=None):
+        """POST .../etats-paie/{id}/payer/ (caissier, session de caisse ouverte)."""
+        return self._action(request, PROFILS_PAIEMENT, "payer la paie", models.EtatPaie.payer, request.user)
+
+    @action(detail=False, methods=["get"])
+    def emargement(self, request):
+        """
+        GET .../etats-paie/emargement/?date_debut=AAAA-MM-JJ&date_fin=AAAA-MM-JJ[&periodicite=]
+        (ou ?ids=1,2,3) : fiche d'émargement PDF des états validés ou payés.
+        """
+        from apps.core import documents
+        from apps.core.pdf import telecharger
+        etats = self.get_queryset().filter(statut__in=(models.StatutEtatPaie.VALIDE, models.StatutEtatPaie.PAYE))
+        if request.query_params.get("ids"):
+            etats = etats.filter(pk__in=[i for i in request.query_params["ids"].split(",") if i.strip().isdigit()])
+        else:
+            debut, fin = date_du_parametre(request, "date_debut"), date_du_parametre(request, "date_fin")
+            if not (debut and fin):
+                raise ValidationError({"date_debut": "Indiquez date_debut et date_fin, ou ids."})
+            etats = etats.filter(date_debut__gte=debut, date_fin__lte=fin)
+            if request.query_params.get("periodicite"):
+                etats = etats.filter(periodicite=request.query_params["periodicite"])
+        etats = etats.order_by("ouvrier__nom", "ouvrier__prenom")
+        if not etats.exists():
+            raise ValidationError({"etats": "Aucun état de paie validé ou payé pour cette sélection."})
+        return documents.etat_emargement(etats, request.user).reponse("emargement-paie", telecharger(request))
+

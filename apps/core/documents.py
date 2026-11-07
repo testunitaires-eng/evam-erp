@@ -293,3 +293,30 @@ def devis(devis, utilisateur=None):
                          libelle_lettres="Arrêté le présent devis à la somme de")
     document.avec_texte(devis.conditions)
     return document.avec_signatures("Bon pour accord - le client (date, signature)", f"Pour {document.entreprise.raison_sociale}")
+
+
+def etat_emargement(etats, utilisateur=None):
+    """
+    Paie des ouvriers en espèces : un état par ligne (matricule, nom,
+    période, jours, montant) avec une case de signature que l'ouvrier
+    remplit à la remise de l'argent.
+    """
+    etats = list(etats)
+    debut = min(e.date_debut for e in etats)
+    fin = max(e.date_fin for e in etats)
+    document = DocumentPDF("ÉMARGEMENT PAIE", f"{date_fr(debut)} - {date_fr(fin)}", fin, utilisateur)
+    document.avec_tiers(
+        "Paie des ouvriers", [f"Période du {date_fr(debut)} au {date_fr(fin)}", f"{len(etats)} ouvrier(s)"],
+        "Paiement", ["En espèces, contre signature", "Statuts : " + ", ".join(sorted({e.get_statut_display() for e in etats}))],
+    )
+    lignes = [
+        [e.ouvrier.matricule, e.ouvrier.nom_complet, f"{date_fr(e.date_debut)} - {date_fr(e.date_fin)}",
+         nombre(e.jours_travailles), montant(e.montant), ""]
+        for e in etats
+    ]
+    document.avec_lignes(["Matricule", "Nom et prénom", "Période", "Jours", "Montant", "Signature"], lignes,
+                         [24, None, 38, 14, 26, 34], colonnes_nombres=(3, 4))
+    total = sum((e.montant for e in etats), Decimal(0))
+    document.avec_totaux([("Total à payer (FCFA)", montant(total))], en_lettres_de=total,
+                         libelle_lettres="Arrêté le présent état à la somme de")
+    return document.avec_signatures("Le RH", "La DAF", "Le caissier")

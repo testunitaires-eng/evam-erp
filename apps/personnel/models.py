@@ -25,12 +25,16 @@ le Responsable Production / l'Administrateur SI.
   à l'OF de son affectation. Saisi puis validé par le RH ; un pointage
   validé ne change plus.
 
-Phases suivantes : états de paie (retenue au prorata des absences non
-justifiées pour un salaire mensuel), validation par la DAF, écriture
-comptable, paiement en espèces par la caisse, coût par OF.
+- EtatPaie : la paie d'un ouvrier pour une période (semaine du lundi au
+  dimanche, ou mois civil), calculée jour par jour sur les pointages
+  validés. Préparé par le RH -> validé par la DAF (écriture D 661 / C 422,
+  coût de main-d'œuvre des OF) -> payé en espèces par le caissier
+  (décaissement de caisse, écriture D 422 / C 571).
 """
 
-from decimal import Decimal
+import calendar
+from datetime import timedelta
+from decimal import ROUND_HALF_UP, Decimal
 
 from django.core.exceptions import ValidationError
 from django.db import models, transaction
@@ -337,6 +341,12 @@ class ConditionRemuneration(ValidationAvantEnregistrement, models.Model):
             raise ValidationError({"montant": "Le montant doit être strictement positif."})
         if self.ouvrier_id and self.date_effet:
             ouvrier = self.ouvrier
+            paie = paie_arretee(self.ouvrier_id, self.date_effet, jusqu_a_la_fin=True)
+            if paie:
+                raise ValidationError({"date_effet": (
+                    f"La paie de {ouvrier.nom_complet} est déjà arrêtée jusqu'au {paie.date_fin:%d/%m/%Y} ({paie.numero}) : "
+                    "choisissez une date d'effet postérieure."
+                )})
             if self.date_effet < ouvrier.date_entree:
                 raise ValidationError({"date_effet": f"{ouvrier.nom_complet} n'entre chez EVAM que le {ouvrier.date_entree:%d/%m/%Y}."})
             if ouvrier.date_fin_contrat and self.date_effet > ouvrier.date_fin_contrat:
@@ -354,8 +364,22 @@ class ConditionRemuneration(ValidationAvantEnregistrement, models.Model):
                 )
 
     def verifier_suppression(self):
-        if self._pointages_valides_couverts().exists():
-            raise ValidationError("Cette condition s'applique déjà à des pointages validés : elle ne peut pas être supprimée.")
+        if self._pointages_valides_couverts().exists() or paie_arretee(self.ouvrier_id, self.date_effet, jusqu_a_la_fin=True):
+            raise ValidationError("Cette condition s'applique déjà à des pointages validés ou à une paie arrêtée : elle ne peut pas être supprimée.")
+
+
+def paie_arretee(ouvrier_id, date, jusqu_a_la_fin=False):
+    """
+    État de paie validé ou payé couvrant `date` (ou, si jusqu_a_la_fin,
+    se terminant à partir de `date`) : la période est arrêtée, ses
+    pointages et taux ne changent plus.
+    """
+    etats = EtatPaie.objects.filter(
+        ouvrier_id=ouvrier_id, statut__in=(StatutEtatPaie.VALIDE, StatutEtatPaie.PAYE), date_fin__gte=date,
+    )
+    if not jusqu_a_la_fin:
+        etats = etats.filter(date_debut__lte=date)
+    return etats.order_by("-date_fin").first()
 
 
 class Presence(models.TextChoices):
@@ -436,6 +460,9 @@ class Pointage(ValidationAvantEnregistrement, models.Model):
         if not self.ouvrier_id or not self.date:
             return
         ouvrier = self.ouvrier
+        paie = paie_arretee(self.ouvrier_id, self.date)
+        if paie:
+            raise ValidationError({"date": f"La paie de {ouvrier.nom_complet} est déjà {paie.get_statut_display().lower()} pour ce jour ({paie.numero})."})
         if self.date > timezone.localdate():
             raise ValidationError({"date": "On ne pointe pas un jour à venir."})
         if self.date < ouvrier.date_entree or (ouvrier.date_fin_contrat and self.date > ouvrier.date_fin_contrat):
@@ -476,3 +503,273 @@ class Pointage(ValidationAvantEnregistrement, models.Model):
         # Mise à jour ciblée : pas de nouveau contrôle de saisie ; l'historique
         # du changement de statut est enregistré par ValidationAvantEnregistrement.
         self.save(update_fields=["statut", "valide_par", "date_validation"])
+
+
+# --- Paie ---------------------------------------------------------------------
+
+HEURES_PAR_JOUR = Decimal("8")      # journée standard : convertit les jours pointés en heures pour les coûts des OF
+JOURS_OUVRABLES = range(0, 5)        # du lundi (0) au vendredi (4)
+
+
+def periode_de_paie(periodicite, jour):
+    """Période contenant `jour` : semaine du lundi au dimanche, ou mois civil."""
+    if periodicite == PeriodicitePaie.HEBDOMADAIRE:
+        debut = jour - timedelta(days=jour.weekday())
+        return debut, debut + timedelta(days=6)
+    return jour.replace(day=1), jour.replace(day=calendar.monthrange(jour.year, jour.month)[1])
+
+
+def jours_ouvrables_du_mois(jour):
+    debut, fin = periode_de_paie(PeriodicitePaie.MENSUELLE, jour)
+    return sum(1 for n in range((fin - debut).days + 1) if (debut + timedelta(days=n)).weekday() in JOURS_OUVRABLES)
+
+
+class StatutEtatPaie(models.TextChoices):
+    BROUILLON = "BROUILLON", "Préparé (RH)"
+    VALIDE = "VALIDE", "Validé (DAF)"
+    PAYE = "PAYE", "Payé"
+    ANNULE = "ANNULE", "Annulé"
+
+
+class EtatPaie(ValidationAvantEnregistrement, models.Model):
+    """
+    Ce qui est dû à un ouvrier pour une période, calculé JOUR PAR JOUR
+    avec la condition de rémunération en vigueur ce jour-là :
+    - taux journalier : taux x part de journée pointée (présent 1,
+      demi-journée 0,5), week-end compris s'il a travaillé ;
+    - salaire mensuel : chaque jour ouvrable (lundi-vendredi) sous contrat
+      vaut salaire / jours ouvrables du mois, moins la part d'absence non
+      justifiée ; un jour ouvrable non pointé est payé (salaire fixe) mais
+      signalé (jours_non_pointes). Entrée / sortie en cours de mois :
+      seuls les jours sous contrat comptent.
+    Pas d'heures supplémentaires, de primes ni de charges sociales.
+    Montant arrondi au franc. Tous les pointages de la période doivent
+    être validés.
+    """
+    TRANSITIONS = {
+        StatutEtatPaie.BROUILLON: {StatutEtatPaie.VALIDE},
+        StatutEtatPaie.VALIDE: {StatutEtatPaie.PAYE, StatutEtatPaie.ANNULE},
+    }
+
+    numero = models.CharField("Numéro", max_length=30, unique=True, editable=False)
+    ouvrier = models.ForeignKey(Ouvrier, verbose_name="Ouvrier", on_delete=models.PROTECT, related_name="etats_paie")
+    periodicite = models.CharField("Paie", max_length=15, choices=PeriodicitePaie.choices)
+    date_debut = models.DateField("Du")
+    date_fin = models.DateField("Au")
+    jours_travailles = models.DecimalField("Jours travaillés", max_digits=6, decimal_places=1, default=0, editable=False)
+    jours_absence_retenus = models.DecimalField(
+        "Jours d'absence retenus", max_digits=6, decimal_places=1, default=0, editable=False,
+        help_text="Absences non justifiées retenues sur un salaire mensuel.",
+    )
+    jours_non_pointes = models.PositiveIntegerField(
+        "Jours ouvrables non pointés", default=0, editable=False,
+        help_text="Salaire mensuel : jours payés faute de pointage (à vérifier).",
+    )
+    montant = models.DecimalField("Montant à payer (FCFA)", max_digits=12, decimal_places=2, default=0, editable=False)
+    statut = models.CharField("Statut", max_length=12, choices=StatutEtatPaie.choices, default=StatutEtatPaie.BROUILLON)
+    prepare_par = models.ForeignKey(Utilisateur, verbose_name="Préparé par", on_delete=models.PROTECT, null=True, blank=True, related_name="+")
+    valide_par = models.ForeignKey(Utilisateur, verbose_name="Validé par", on_delete=models.PROTECT, null=True, blank=True, related_name="+")
+    date_validation = models.DateTimeField("Validé le", null=True, blank=True)
+    decaissement = models.OneToOneField(
+        "caisse.Decaissement", verbose_name="Décaissement (paiement)", on_delete=models.PROTECT,
+        null=True, blank=True, related_name="etat_paie",
+    )
+    date_paiement = models.DateTimeField("Payé le", null=True, blank=True)
+    motif_annulation = models.CharField("Motif d'annulation", max_length=255, blank=True)
+    date_creation = models.DateTimeField("Préparé le", auto_now_add=True)
+
+    class Meta:
+        verbose_name = "État de paie"
+        verbose_name_plural = "États de paie"
+        ordering = ["-date_debut", "ouvrier__nom"]
+
+    def __str__(self):
+        return f"{self.numero} - {self.ouvrier.nom_complet} ({self.date_debut:%d/%m/%Y} - {self.date_fin:%d/%m/%Y})"
+
+    # -- calcul ----------------------------------------------------------------
+    def calculer(self):
+        """
+        Met à jour jours et montant ; retourne la répartition par OF
+        {of_id: [jours, montant]} des jours pointés sur un OF.
+        """
+        ouvrier = self.ouvrier
+        debut = max(self.date_debut, ouvrier.date_entree)
+        fin = min(self.date_fin, ouvrier.date_fin_contrat or self.date_fin)
+        pointages = {p.date: p for p in ouvrier.pointages.filter(date__gte=debut, date__lte=fin)}
+        non_valides = sorted(d for d, p in pointages.items() if p.statut != StatutPointage.VALIDE)
+        if non_valides:
+            raise ValidationError(
+                f"{ouvrier.nom_complet} : {len(non_valides)} pointage(s) non validé(s) sur la période "
+                f"(dont le {non_valides[0]:%d/%m/%Y}) : validez-les d'abord."
+            )
+        conditions = list(ouvrier.conditions_remuneration.order_by("date_effet"))
+        total, travailles, absences, non_pointes, par_of = Decimal(0), Decimal(0), Decimal(0), 0, {}
+        jour = debut
+        while jour <= fin:
+            condition = next((c for c in reversed(conditions) if c.date_effet <= jour), None)
+            pointage = pointages.get(jour)
+            fraction = pointage.fraction_jour if pointage else Decimal(0)
+            travailles += fraction
+            a_payer = Decimal(0)
+            if condition is None:
+                if fraction:
+                    raise ValidationError(
+                        f"{ouvrier.nom_complet} : aucune condition de rémunération en vigueur le {jour:%d/%m/%Y}."
+                    )
+            elif condition.mode == ModeRemuneration.JOURNALIER:
+                a_payer = condition.montant * fraction
+            elif jour.weekday() in JOURS_OUVRABLES:
+                if pointage is None:
+                    non_pointes += 1
+                    absence = Decimal(0)
+                else:
+                    absence = Decimal(0) if pointage.absence_justifiee else 1 - fraction
+                absences += absence
+                a_payer = condition.montant / jours_ouvrables_du_mois(jour) * (1 - absence)
+            if a_payer and pointage is not None and pointage.ordre_fabrication_id:
+                repartition = par_of.setdefault(pointage.ordre_fabrication_id, [Decimal(0), Decimal(0)])
+                repartition[0] += fraction
+                repartition[1] += a_payer
+            total += a_payer
+            jour += timedelta(days=1)
+        self.jours_travailles, self.jours_absence_retenus, self.jours_non_pointes = travailles, absences, non_pointes
+        self.montant = total.quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+        return par_of
+
+    # -- règles ----------------------------------------------------------------
+    def save(self, *args, **kwargs):
+        if not self.numero:
+            self.numero = generer_code_unique(EtatPaie, "PAIE", champ="numero")
+        super().save(*args, **kwargs)
+
+    def clean(self):
+        from apps.core.validation import verifier_transition
+        ancien_statut = valeur_en_base(self, "statut")
+        if ancien_statut in (StatutEtatPaie.PAYE, StatutEtatPaie.ANNULE):
+            raise ValidationError(f"L'état de paie {self.numero} est {self.get_statut_display().lower()} : il ne change plus.")
+        verifier_transition(ancien_statut, self.statut, self.TRANSITIONS, "statut de l'état de paie", initial=StatutEtatPaie.BROUILLON)
+        if self.pk and any(valeur_en_base(self, c) != getattr(self, f"{c}_id" if c == "ouvrier" else c)
+                           for c in ("ouvrier", "periodicite", "date_debut", "date_fin")):
+            raise ValidationError("L'ouvrier et la période d'un état de paie ne changent pas : supprimez-le et préparez-en un autre.")
+        if self.date_debut and self.date_fin and self.date_fin < self.date_debut:
+            raise ValidationError({"date_fin": "La fin de période ne peut pas précéder son début."})
+        if self.ouvrier_id and self.date_debut and self.date_fin and self.statut != StatutEtatPaie.ANNULE:
+            autre = EtatPaie.objects.filter(
+                ouvrier_id=self.ouvrier_id, date_debut__lte=self.date_fin, date_fin__gte=self.date_debut,
+            ).exclude(pk=self.pk).exclude(statut=StatutEtatPaie.ANNULE).first()
+            if autre:
+                raise ValidationError(f"{self.ouvrier.nom_complet} a déjà un état de paie sur cette période : {autre.numero}.")
+
+    def verifier_suppression(self):
+        if self.statut != StatutEtatPaie.BROUILLON:
+            raise ValidationError("Seul un état de paie préparé (non validé) peut être supprimé ; sinon, annulez-le.")
+
+    # -- circuit ---------------------------------------------------------------
+    @classmethod
+    @transaction.atomic
+    def preparer(cls, periodicite, jour, utilisateur):
+        """
+        RH : prépare les états de la période contenant `jour` pour tous les
+        ouvriers payés à cette périodicité, sous contrat sur la période et
+        sans état déjà préparé. Retourne (états créés, erreurs par ouvrier).
+        Un ouvrier sans rien à payer (journalier sans jour pointé) est ignoré.
+        """
+        debut, fin = periode_de_paie(periodicite, jour)
+        crees, erreurs = [], {}
+        ouvriers = Ouvrier.objects.filter(date_entree__lte=fin).filter(
+            models.Q(date_fin_contrat__isnull=True) | models.Q(date_fin_contrat__gte=debut),
+        ).exclude(etats_paie__in=cls.objects.filter(date_debut__lte=fin, date_fin__gte=debut).exclude(statut=StatutEtatPaie.ANNULE))
+        for ouvrier in ouvriers.distinct():
+            condition = ouvrier.condition_au(fin) or ouvrier.condition_au(debut)
+            if condition is None or condition.periodicite_paie != periodicite:
+                continue
+            etat = cls(ouvrier=ouvrier, periodicite=periodicite, date_debut=debut, date_fin=fin, prepare_par=utilisateur)
+            try:
+                etat.calculer()
+            except ValidationError as erreur:
+                erreurs[ouvrier.matricule] = erreur.messages
+                continue
+            if etat.montant > 0:
+                etat.save()
+                crees.append(etat)
+        return crees, erreurs
+
+    def recalculer(self):
+        if self.statut != StatutEtatPaie.BROUILLON:
+            raise ValueError("Seul un état de paie préparé (non validé) peut être recalculé.")
+        self.calculer()
+        self.save()
+
+    @transaction.atomic
+    def valider(self, utilisateur):
+        """
+        DAF (ou Direction) : contrôle que les pointages n'ont pas changé
+        depuis la préparation, constate la charge (D 661 / C 422) et
+        impute aux OF le coût des jours pointés sur eux.
+        """
+        if self.statut != StatutEtatPaie.BROUILLON:
+            raise ValueError(f"L'état de paie {self.numero} est déjà « {self.get_statut_display()} ».")
+        if self.date_fin > timezone.localdate():
+            raise ValueError(f"La période se termine le {self.date_fin:%d/%m/%Y} : elle ne peut pas encore être validée.")
+        montant_prepare = self.montant
+        par_of = self.calculer()
+        if self.montant != montant_prepare:
+            raise ValueError(
+                f"Les pointages ont changé depuis la préparation ({montant_prepare} -> {self.montant}) : "
+                "le RH doit recalculer l'état avant validation."
+            )
+        self.statut = StatutEtatPaie.VALIDE
+        self.valide_par = utilisateur
+        self.date_validation = timezone.now()
+        self.save()
+        from apps.comptabilite.ecritures import ecrire_etat_paie
+        from apps.couts.models import CoutMainOeuvre
+        ecrire_etat_paie(self)
+        for of_id, (jours, montant) in par_of.items():
+            heures = jours * HEURES_PAR_JOUR
+            CoutMainOeuvre.objects.create(
+                ordre_fabrication_id=of_id, heures=heures, etat_paie=self,
+                cout_horaire=(montant / heures).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
+            )
+
+    @transaction.atomic
+    def payer(self, caissier):
+        """
+        Caissier : remet les espèces à l'ouvrier. Crée le décaissement sur sa
+        session ouverte, autorisé par la personne qui a validé la paie (la
+        DAF), puis l'effectue (écriture D 422 / C 571, solde de caisse).
+        """
+        from apps.caisse.models import Decaissement, SessionCaisse, StatutSession
+        if self.statut != StatutEtatPaie.VALIDE:
+            raise ValueError(f"L'état de paie {self.numero} est « {self.get_statut_display()} » : seul un état validé se paie.")
+        session = SessionCaisse.objects.filter(caissier=caissier, statut=StatutSession.OUVERTE).first()
+        if session is None:
+            raise ValueError("Ouvrez votre session de caisse pour payer.")
+        ouvrier = self.ouvrier
+        decaissement = Decaissement.objects.create(
+            session_caisse=session, montant=self.montant, effectue_par=caissier,
+            motif=f"Paie {self.numero} du {self.date_debut:%d/%m/%Y} au {self.date_fin:%d/%m/%Y}",
+            beneficiaire=f"{ouvrier.matricule} {ouvrier.nom_complet}",
+        )
+        decaissement.autoriser(self.valide_par)
+        self.decaissement = decaissement
+        self.save(update_fields=["decaissement"])
+        decaissement.effectuer(caissier)
+        self.statut = StatutEtatPaie.PAYE
+        self.date_paiement = timezone.now()
+        self.save()
+
+    @transaction.atomic
+    def annuler(self, utilisateur, motif):
+        """DAF : annule un état validé non payé (contre-passation, coûts des OF retirés)."""
+        if self.statut != StatutEtatPaie.VALIDE:
+            raise ValueError("Seul un état de paie validé et non payé peut être annulé (un état préparé se supprime).")
+        if not (motif or "").strip():
+            raise ValueError("Le motif d'annulation est obligatoire.")
+        from apps.comptabilite.ecritures import ecrire_etat_paie
+        self.statut = StatutEtatPaie.ANNULE
+        self.motif_annulation = motif.strip()
+        self.save()
+        ecrire_etat_paie(self, annulation=True)
+        self.couts_main_oeuvre.all().delete()
+

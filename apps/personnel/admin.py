@@ -45,3 +45,14 @@ class PointageAdmin(admin.ModelAdmin):
     search_fields = ("ouvrier__matricule", "ouvrier__nom", "ouvrier__prenom", "ordre_fabrication__numero")
     date_hierarchy = "date"
     readonly_fields = ("statut", "saisi_par", "valide_par", "date_validation")
+
+
+@admin.register(models.EtatPaie)
+class EtatPaieAdmin(admin.ModelAdmin):
+    list_display = ("numero", "ouvrier", "periodicite", "date_debut", "date_fin", "jours_travailles", "montant", "statut")
+    list_filter = ("statut", "periodicite")
+    search_fields = ("numero", "ouvrier__matricule", "ouvrier__nom", "ouvrier__prenom")
+    date_hierarchy = "date_debut"
+
+    def has_change_permission(self, request, obj=None):
+        return False   # le circuit (préparer, valider, payer, annuler) passe par l'API

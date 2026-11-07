@@ -19,7 +19,7 @@ from django.core.exceptions import ValidationError
 from django.db import models
 from apps.referentiel.models import Article
 from apps.production.models import OrdreFabrication
-from apps.core.validation import ValidationAvantEnregistrement, exiger_positif
+from apps.core.validation import ValidationAvantEnregistrement, exiger_positif, valeur_en_base
 
 
 class CoutMatiere(ValidationAvantEnregistrement, models.Model):
@@ -83,6 +83,11 @@ class CoutMainOeuvre(ValidationAvantEnregistrement, models.Model):
     )
     heures = models.DecimalField("Heures travaillées", max_digits=8, decimal_places=2)
     cout_horaire = models.DecimalField("Coût horaire", max_digits=10, decimal_places=2)
+    etat_paie = models.ForeignKey(
+        "personnel.EtatPaie", verbose_name="État de paie d'origine", on_delete=models.PROTECT,
+        null=True, blank=True, related_name="couts_main_oeuvre", editable=False,
+        help_text="Renseigné quand la ligne vient de la paie des ouvriers (jours pointés sur l'OF).",
+    )
 
     class Meta:
         verbose_name = "Coût main-d'œuvre"
@@ -94,6 +99,12 @@ class CoutMainOeuvre(ValidationAvantEnregistrement, models.Model):
     def clean(self):
         exiger_positif(self.heures, "heures", "Le nombre d'heures")
         exiger_positif(self.cout_horaire, "cout_horaire", "Le coût horaire", strict=False)
+        if self.pk and valeur_en_base(self, "etat_paie"):
+            raise ValidationError("Cette ligne vient de la paie des ouvriers : elle ne se modifie pas (annulez l'état de paie).")
+
+    def verifier_suppression(self):
+        if self.etat_paie_id:
+            raise ValidationError("Cette ligne vient de la paie des ouvriers : annulez l'état de paie pour la retirer.")
 
     @property
     def cout_total(self):

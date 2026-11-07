@@ -74,3 +74,14 @@ class PointageSerializer(ValidationModeleMixin, serializers.ModelSerializer):
         fields = "__all__"
         # Validation uniquement par l'action /valider/ (ou /valider_periode/).
         read_only_fields = ["statut", "saisi_par", "valide_par", "date_validation"]
+
+
+class EtatPaieSerializer(serializers.ModelSerializer):
+    ouvrier_nom = serializers.CharField(source="ouvrier.nom_complet", read_only=True)
+    ouvrier_matricule = serializers.CharField(source="ouvrier.matricule", read_only=True)
+    decaissement_numero = serializers.CharField(source="decaissement.numero", read_only=True, default=None)
+
+    class Meta:
+        model = models.EtatPaie
+        fields = "__all__"
+        read_only_fields = [f.name for f in models.EtatPaie._meta.fields]

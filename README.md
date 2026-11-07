@@ -42,7 +42,7 @@ evam-erp/
     ├── couts/                 <- coûts réels et standards, charges, clés de répartition
     ├── comptabilite/          <- écritures automatiques, plan de comptes, anomalies, exports, clôtures
     ├── personnel/             <- ouvriers (sans accès à l'application), compétences, affectations,
-    │                             rémunération, pointages
+    │                             rémunération, pointages, paie
     └── reporting/             <- tableau de bord de la Direction
 ```
 
@@ -168,13 +168,13 @@ document ne nomme qui le pilote — point confirmé avec le client) et le
 | `RESPONSABLE_QUALITE` | Contrôles qualité, libération/blocage des lots | — |
 | `RESPONSABLE_ACHATS` | Fournisseurs, contrats, catalogue produits/prix, demandes d'achat (approbation), commandes fournisseurs | Réceptions et retours (partagés avec le Magasinier) |
 | `COMMERCIAL` | Clients, prospects, contrats, tarifs, devis, commandes, factures | Stock disponible (jamais de modification) |
-| `CAISSIER` | Sessions de caisse, encaissements, justification d'écarts | Commandes, prix (aucune modification), **ne peut jamais supprimer un écart** |
+| `CAISSIER` | Sessions de caisse, encaissements, justification d'écarts, paiement en espèces des ouvriers | Commandes, prix (aucune modification), **ne peut jamais supprimer un écart** |
 | `RESPONSABLE_DISTRIBUTION` | Tournées, lancement des préparations, confirmation des livraisons | — |
 | `CHAUFFEUR` | Confirmation de livraison | **Ne voit que ses propres tournées et bons de livraison** |
-| `COMPTABILITE_DAF` | Anomalies, exports comptables, clôtures, plan de comptes | Lecture transversale sur la plupart des modules |
+| `COMPTABILITE_DAF` | Anomalies, exports comptables, clôtures, plan de comptes, validation / annulation de la paie des ouvriers | Lecture transversale sur la plupart des modules |
 | `DIRECTION` | — | Tableaux de bord, coûts, journal des actions |
 | `ADMIN_SI` | Utilisateurs et tous les modules | — (accès total) |
-| `RH` | Fiches des ouvriers, rémunération, pointages (saisie et validation), affectations | — |
+| `RH` | Fiches des ouvriers, rémunération, pointages (saisie et validation), affectations, préparation de la paie | — |
 
 ### Où sont codées les permissions
 
@@ -242,7 +242,7 @@ l'historique des changements de statut sur `.../{id}/historique/`.
   achats en cours − besoins saisis à la main`. Il est rattaché aux OF
   concernés et le Responsable Achat est notifié à sa création.
 - **Écritures comptables** : facture, encaissement, décaissement, avoir,
-  réception et retour fournisseur, synthèse de caisse (voir
+  réception et retour fournisseur, synthèse de caisse, paie des ouvriers (voir
   `apps/comptabilite/ecritures.py`). Une écriture déséquilibrée ou sur
   une période clôturée annule toute l'opération.
 - **Notifications** : envoyées aux profils concernés à chaque étape
@@ -287,10 +287,30 @@ distinctes des utilisateurs, tenues par le **RH**.
   - validation : `POST .../pointages/{id}/valider/` ou
     `POST .../pointages/valider_periode/` ; un pointage validé ne change plus.
 
-Prévu ensuite : états de paie (retenue au prorata des absences non
-justifiées pour un salaire mensuel), validation par la DAF, écriture
-comptable, paiement en espèces par la caisse avec fiche d'émargement,
-coût de main-d'œuvre par OF.
+- **Paie** (`/api/personnel/etats-paie/`) : un état par ouvrier et par
+  période — semaine du lundi au dimanche, ou mois civil — calculé jour
+  par jour avec le taux en vigueur ce jour-là :
+  - taux journalier : taux × part de journée pointée (présent 1,
+    demi-journée 0,5), week-end compris s'il a travaillé ;
+  - salaire mensuel : chaque jour ouvrable (lundi-vendredi) sous contrat
+    vaut salaire ÷ jours ouvrables du mois, moins les absences non
+    justifiées ; un jour ouvrable non pointé est payé mais signalé ;
+  - pas d'heures supplémentaires, de primes ni de charges sociales ;
+    montant arrondi au franc ; tous les pointages doivent être validés.
+
+  Circuit (chaque rôle par une personne différente) :
+  1. **RH** — `POST .../etats-paie/preparer/ {"periodicite", "date"}`
+     prépare les états de la période (`.../recalculer/` si besoin) ;
+  2. **DAF ou Direction** — `.../valider/` : écriture D 661 / C 422
+     (compte de tiers = matricule), coût des jours pointés sur un OF
+     imputé à l'OF (`CoutMainOeuvre`, journée de 8 h). La période est
+     alors arrêtée : plus de pointage ni de nouveau taux dessus ;
+     `.../annuler/` (motif) contre-passe un état validé non payé ;
+  3. **Caissier** — `.../payer/` : décaissement en espèces sur sa session
+     ouverte, autorisé par la personne qui a validé la paie, écriture
+     D 422 / C 571 ;
+  4. fiche d'émargement à faire signer :
+     `GET .../etats-paie/emargement/?date_debut=…&date_fin=…` (PDF).
 
 ---
 

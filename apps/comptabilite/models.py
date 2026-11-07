@@ -166,6 +166,8 @@ class CleCompte(models.TextChoices):
     BANQUE = "BANQUE", "Banque (virement, chèque)"
     MOBILE_MONEY = "MOBILE_MONEY", "Mobile Money"
     CHARGES_DIVERSES = "CHARGES_DIVERSES", "Charges diverses (décaissements)"
+    CHARGES_PERSONNEL = "CHARGES_PERSONNEL", "Rémunérations du personnel (paie des ouvriers)"
+    PERSONNEL = "PERSONNEL", "Personnel, rémunérations dues"
 
 
 # Valeurs proposées par défaut (SYSCOHADA révisé) : à valider par le DAF,
@@ -183,6 +185,8 @@ COMPTES_PAR_DEFAUT = {
     CleCompte.BANQUE: "521",
     CleCompte.MOBILE_MONEY: "5215",
     CleCompte.CHARGES_DIVERSES: "658",
+    CleCompte.CHARGES_PERSONNEL: "661",
+    CleCompte.PERSONNEL: "422",
 }
 
 

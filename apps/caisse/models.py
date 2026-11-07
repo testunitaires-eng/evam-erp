@@ -274,25 +274,6 @@ class SessionCaisse(ValidationAvantEnregistrement, models.Model):
         if self.statut == StatutSession.CLOTUREE or self.encaissements.exists() or self.decaissements.exists():
             raise ValidationError("Une session clôturée ou comportant des mouvements ne peut pas être supprimée.")
 
-    # @property
-    # def ecart(self):
-    #     if self.solde_theorique_cloture is None or self.solde_compte_cloture is None:
-    #         return None
-    #     return self.solde_compte_cloture - self.solde_theorique_cloture
-
-    # def cloturer(self, solde_theorique, solde_compte):
-    #     """
-    #     Clôture la session. Si un écart existe, il doit obligatoirement
-    #     être justifié via EcartCaisse (voir vue caisse).
-    #     """
-    #     from django.utils import timezone
-    #     self.solde_theorique_cloture = solde_theorique
-    #     self.solde_compte_cloture = solde_compte
-    #     self.statut = StatutSession.CLOTUREE
-    #     self.date_cloture = timezone.now()
-    #     self.save()
-
-
 
     @property
     def ecart(self):
@@ -473,10 +454,6 @@ class EcartCaisse(ValidationAvantEnregistrement, models.Model):
         if self.valide_par_id and self.valide_par.profil not in (Profil.COMPTABILITE_DAF, Profil.ADMIN_SI) \
                 and not self.valide_par.is_superuser:
             raise ValidationError({"valide_par": "Seule la Comptabilité/DAF peut valider un écart de caisse."})
-
-
-
-
 
 
 class StatutDecaissement(models.TextChoices):

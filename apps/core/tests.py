@@ -1508,3 +1508,127 @@ class CoherenceRolesTests(BaseValidation):
         for url in ("/api/qualite/non-conformites/", "/api/qualite/controles-realises/", "/api/qualite/instruments/"):
             self.assertEqual(achats.get(url).status_code, 200, url)
         self.assertEqual(achats.post("/api/qualite/instruments/", {"designation": "pH-mètre"}, format="json").status_code, 403)
+
+
+class CorrectionsResultatsFauxTests(BaseValidation):
+    """Retour fournisseur comptabilisé, réception non conforme bloquée, pagination ordonnée, besoins d'achat des OF."""
+
+    def recevoir(self, quantite=10, prix=5, conforme=True, suivi_par_lot=True):
+        self.matiere.suivi_par_lot = suivi_par_lot
+        self.matiere.save()
+        commande = CommandeFournisseur.objects.create(
+            fournisseur=Fournisseur.objects.create(nom="Fournisseur"), cree_par=self.admin,
+        )
+        ligne = LigneCommandeFournisseur.objects.create(
+            commande=commande, article=self.matiere, quantite_commandee=quantite, prix_unitaire=prix,
+        )
+        commande.envoyer()
+        reception = ReceptionAchat.objects.create(commande=commande, receptionne_par=self.admin, conforme=conforme)
+        LigneReceptionAchat.objects.create(reception=reception, ligne_commande=ligne, quantite_recue=quantite)
+        return reception
+
+    def test_retour_fournisseur_contre_passe_la_reception(self):
+        from apps.achats.models import RetourFournisseur
+        from apps.comptabilite.ecritures import ecritures_de
+        reception = self.recevoir(quantite=10, prix=5)
+        fournisseur = reception.commande.fournisseur
+        retour = RetourFournisseur.objects.create(
+            reception=reception, article=self.matiere, quantite_retournee=4, motif="ENDOMMAGE", traite_par=self.admin,
+        )
+        lignes = [l for e in ecritures_de(retour) for l in e.lignes.all()]
+        self.assertEqual(len(lignes), 2)
+        debit_fournisseur = next(l for l in lignes if l.compte_tiers == fournisseur.code)
+        self.assertEqual((debit_fournisseur.debit, debit_fournisseur.credit), (Decimal("20.00"), Decimal("0")))
+        self.assertEqual(sum(l.credit for l in lignes), Decimal("20.00"))
+
+    def test_reception_non_conforme_sans_suivi_par_lot_reste_indisponible(self):
+        from apps.stocks.models import LotMatiere
+        self.recevoir(quantite=10, conforme=False, suivi_par_lot=False)
+        stock = StockArticle.objects.get(article=self.matiere)
+        self.assertEqual((stock.quantite_physique, stock.quantite_bloquee, stock.quantite_disponible),
+                         (Decimal("10"), Decimal("10"), Decimal("0")))
+        self.assertEqual(LotMatiere.objects.get().statut, "BLOQUE")
+
+    def test_reception_conforme_sans_suivi_par_lot_ne_cree_pas_de_lot(self):
+        from apps.stocks.models import LotMatiere
+        self.recevoir(quantite=10, conforme=True, suivi_par_lot=False)
+        self.assertEqual(StockArticle.objects.get(article=self.matiere).quantite_disponible, Decimal("10"))
+        self.assertFalse(LotMatiere.objects.exists())
+
+    def test_pagination_trie_les_listes_non_ordonnees(self):
+        from rest_framework.request import Request
+        from rest_framework.test import APIRequestFactory
+        from apps.core.pagination import PaginationOrdonnee
+        for _ in range(3):
+            OrdreFabrication.objects.create(article=self.produit, quantite_a_produire=1, responsable=self.admin)
+        requete = Request(APIRequestFactory().get("/"))
+        page = PaginationOrdonnee().paginate_queryset(OrdreFabrication.objects.order_by(), requete)
+        self.assertEqual([of.pk for of in page], sorted((of.pk for of in page), reverse=True))
+
+    def test_of_avec_matiere_manquante_cree_un_besoin_d_achat(self):
+        from apps.achats.models import BesoinApprovisionnement
+        self.entree_stock(self.matiere, 5)
+        of = OrdreFabrication.objects.create(article=self.produit, quantite_a_produire=10, responsable=self.admin)
+        besoin = BesoinApprovisionnement.objects.get(origine="AUTO_PRODUCTION")   # 20 kg nécessaires, 5 en stock
+        self.assertEqual((besoin.article, besoin.quantite_besoin, besoin.satisfait), (self.matiere, Decimal("15"), False))
+        self.assertEqual(list(besoin.ordres_fabrication.all()), [of])
+        of.quantite_a_produire = 12                                                # 24 kg : besoin mis à jour
+        of.save()
+        besoin.refresh_from_db()
+        self.assertEqual((BesoinApprovisionnement.objects.count(), besoin.quantite_besoin), (1, Decimal("19")))
+        of.annuler("Test")                                                          # OF annulé : besoin soldé
+        besoin.refresh_from_db()
+        self.assertTrue(besoin.satisfait)
+
+    def test_of_couvert_par_le_stock_ne_cree_pas_de_besoin(self):
+        from apps.achats.models import BesoinApprovisionnement
+        self.entree_stock(self.matiere, 50)
+        OrdreFabrication.objects.create(article=self.produit, quantite_a_produire=10, responsable=self.admin)
+        self.assertFalse(BesoinApprovisionnement.objects.filter(origine="AUTO_PRODUCTION").exists())
+
+    def test_un_seul_besoin_par_matiere_of_et_seuil(self):
+        from apps.achats.models import BesoinApprovisionnement
+        self.matiere.stock_alerte = 10
+        self.matiere.save()
+        self.entree_stock(self.matiere, 30)                                         # au-dessus du seuil : rien
+        self.assertFalse(BesoinApprovisionnement.objects.exists())
+        of1 = OrdreFabrication.objects.create(article=self.produit, quantite_a_produire=10, responsable=self.admin)
+        of2 = OrdreFabrication.objects.create(article=self.produit, quantite_a_produire=5, responsable=self.admin)
+        besoin = BesoinApprovisionnement.objects.get()                              # 20 + 10 + 10 (seuil) - 30
+        self.assertEqual((besoin.origine, besoin.quantite_besoin), ("AUTO_PRODUCTION", Decimal("10")))
+        self.assertEqual(set(besoin.ordres_fabrication.all()), {of1, of2})
+        of2.annuler("Test")                                                         # 20 + 10 - 30 = 0 : soldé
+        besoin.refresh_from_db()
+        self.assertTrue(besoin.satisfait)
+        self.assertEqual(BesoinApprovisionnement.objects.filter(satisfait=False).count(), 0)
+
+    def test_pas_de_nouveau_besoin_tant_que_l_achat_est_en_cours(self):
+        from apps.achats.models import BesoinApprovisionnement
+        self.matiere.stock_alerte = 100
+        self.matiere.save()
+        self.entree_stock(self.matiere, 60)
+        besoin = BesoinApprovisionnement.objects.get()
+        self.assertEqual((besoin.origine, besoin.quantite_besoin), ("SEUIL_ALERTE", Decimal("40")))
+        demande = besoin.creer_demande_achat(self.admin)
+        MouvementStock.objects.create(                                              # nouveau mouvement sous le seuil
+            article=self.matiere, depot=depot_par_defaut("Magasin principal"), type_mouvement="SORTIE",
+            quantite=10, utilisateur=self.admin,
+        )
+        ouvert = BesoinApprovisionnement.objects.get(satisfait=False)              # seulement les 10 nouveaux
+        self.assertEqual(ouvert.quantite_besoin, Decimal("10"))
+        demande.rejeter(self.admin)                                                 # rejet : un seul besoin, 50
+        ouverts = BesoinApprovisionnement.objects.filter(satisfait=False)
+        self.assertEqual([(b.pk, b.quantite_besoin) for b in ouverts], [(besoin.pk, Decimal("50"))])
+
+    def test_commande_fournisseur_couvre_le_besoin_et_son_annulation_le_rouvre(self):
+        from apps.achats.models import BesoinApprovisionnement
+        self.matiere.stock_alerte = 100
+        self.matiere.save()
+        self.entree_stock(self.matiere, 60)
+        commande = CommandeFournisseur.objects.create(fournisseur=Fournisseur.objects.create(nom="F"), cree_par=self.admin)
+        LigneCommandeFournisseur.objects.create(commande=commande, article=self.matiere, quantite_commandee=40, prix_unitaire=1)
+        self.assertFalse(BesoinApprovisionnement.objects.filter(satisfait=False).exists())
+        commande.statut = "ANNULEE"
+        commande.save()
+        self.assertEqual(BesoinApprovisionnement.objects.get(satisfait=False).quantite_besoin, Decimal("40"))
+

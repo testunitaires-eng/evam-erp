@@ -12,7 +12,6 @@ sont résolues automatiquement.
 """
 
 from datetime import timedelta
-from decimal import Decimal
 
 from django.utils import timezone
 

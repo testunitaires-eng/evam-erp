@@ -156,46 +156,165 @@ class OrigineBesoin(models.TextChoices):
     MANUEL = "MANUEL", "Saisi manuellement"
 
 
-def verifier_seuil_alerte(article):
+# Types d'articles achetés (les produits fabriqués ne génèrent pas de besoin d'achat).
+TYPES_ARTICLES_ACHETES = ("MATIERE_PREMIERE", "EMBALLAGE", "CONSOMMABLE")
+ORIGINES_AUTOMATIQUES = (OrigineBesoin.AUTO_PRODUCTION, OrigineBesoin.SEUIL_ALERTE)
+
+
+def besoins_production(article):
     """
-    Circuit 3 (achats) : dès que le stock DISPONIBLE d'une matière
-    première (tous dépôts) passe sous son seuil d'alerte, un besoin
-    d'approvisionnement est créé automatiquement, pour la quantité
-    manquante (seuil - disponible). Un seul besoin ouvert par matière :
-    s'il existe déjà, sa quantité est mise à jour. Si le stock repasse
-    au-dessus du seuil avant toute demande d'achat, le besoin est soldé.
-    Appelé après chaque mouvement de stock (apps/stocks/signals.py).
+    Quantité de l'article encore attendue par les OF non terminés, et ces OF.
+    - OF en brouillon : tout son besoin théorique (rien n'est encore réservé) ;
+    - OF lancé : seulement la part qui n'a pas pu être réservée au lancement
+      et n'a pas été sortie depuis (le reste est déjà compté dans le stock
+      réservé, donc retiré du disponible).
     """
     from decimal import Decimal
+    from django.db.models import Sum
+    from apps.production.models import BesoinMatierePrevu, ReservationMatiere, SortieMatiere, StatutOF
+    statuts_ouverts = (
+        StatutOF.BROUILLON, StatutOF.A_PREPARER, StatutOF.MATIERES_EN_PREPARATION, StatutOF.PRET, StatutOF.EN_PRODUCTION,
+    )
+    total, ofs = Decimal("0"), []
+    for besoin_of in BesoinMatierePrevu.objects.filter(
+        matiere=article, ordre_fabrication__statut__in=statuts_ouverts,
+    ).select_related("ordre_fabrication"):
+        of = besoin_of.ordre_fabrication
+        attendu = Decimal(besoin_of.quantite_theorique)
+        if of.statut != StatutOF.BROUILLON:
+            reservation = ReservationMatiere.objects.filter(ordre_fabrication=of, matiere=article).aggregate(
+                reservee=Sum("quantite_reservee"), restante=Sum("quantite_restante"),
+            )
+            reservee = reservation["reservee"] or Decimal("0")
+            consommee = reservee - (reservation["restante"] or Decimal("0"))
+            sorties = SortieMatiere.objects.filter(ordre_fabrication=of, matiere=article).aggregate(
+                total=Sum("quantite_sortie"),
+            )["total"] or Decimal("0")
+            attendu -= reservee + max(sorties - consommee, Decimal("0"))
+        if attendu > 0:
+            total += attendu
+            ofs.append(of)
+    return total, ofs
+
+
+def quantite_en_cours_achat(article):
+    """
+    Ce qui est déjà en route pour l'article, en unité de stock : demandes
+    d'achat en attente ou approuvées, et reste à recevoir des commandes
+    fournisseurs non soldées (brouillon, envoyée, partiellement reçue).
+    Une demande transformée est comptée via sa commande.
+    """
+    from decimal import Decimal
+    from django.db.models import Sum
+    demandes = DemandeAchat.objects.filter(
+        article=article, statut__in=(StatutDemandeAchat.EN_ATTENTE, StatutDemandeAchat.APPROUVEE),
+    ).aggregate(total=Sum("quantite_demandee"))["total"] or Decimal("0")
+    commandes = sum(
+        (ligne.en_unite_de_stock(ligne.reste_a_recevoir) for ligne in LigneCommandeFournisseur.objects.filter(
+            article=article, commande__statut__in=(
+                StatutCommandeFournisseur.BROUILLON, StatutCommandeFournisseur.ENVOYEE,
+                StatutCommandeFournisseur.PARTIELLEMENT_RECUE,
+            ),
+        ).select_related("article") if ligne.reste_a_recevoir > 0),
+        Decimal("0"),
+    )
+    return demandes + commandes
+
+
+def recalculer_besoin_article(article):
+    """
+    UN SEUL besoin d'achat automatique ouvert par matière (§6.2), qui
+    couvre à la fois les OF et le seuil d'alerte :
+
+        manque = besoins des OF non terminés + seuil d'alerte
+                 - stock disponible (tous dépôts)
+                 - quantités déjà en cours d'achat (demandes, commandes)
+                 - besoins saisis à la main encore ouverts
+
+    - manque > 0 : le besoin ouvert est créé (Responsable Achat notifié)
+      ou mis à jour ; origine « production » si des OF en ont besoin,
+      sinon « seuil d'alerte » ; il est rattaché aux OF concernés ;
+    - manque <= 0 : le besoin ouvert est soldé.
+    Un besoin transformé en demande d'achat n'est plus touché : sa demande
+    est alors comptée « en cours », ce qui évite de commander deux fois.
+
+    Appelé après chaque mouvement de stock (apps/stocks/signals.py), à
+    chaque changement d'un OF, d'une demande ou d'une commande.
+    """
+    from decimal import Decimal, ROUND_UP
     from django.db.models import F as Champ, Sum
     from apps.stocks.models import StockArticle
-    if article.type_article not in ("MATIERE_PREMIERE", "EMBALLAGE", "CONSOMMABLE") or not article.stock_alerte:
+    if article.type_article not in TYPES_ARTICLES_ACHETES:
         return
-    disponible = StockArticle.objects.filter(article=article).aggregate(
-        total=Sum(Champ("quantite_physique") - Champ("quantite_bloquee") - Champ("quantite_reservee")),
-    )["total"] or Decimal("0")
-    besoin = BesoinApprovisionnement.objects.filter(
-        article=article, origine=OrigineBesoin.SEUIL_ALERTE, satisfait=False,
-    ).first()
-    manque = article.stock_alerte - disponible
-    if manque > 0:
-        if besoin is None:
-            besoin = BesoinApprovisionnement.objects.create(
-                article=article, quantite_besoin=manque, origine=OrigineBesoin.SEUIL_ALERTE,
-            )
-            from apps.core.notifications import notifier
-            from apps.comptes.models import Profil
-            notifier(
-                "Stock sous le seuil d'alerte : besoin d'achat",
-                f"{article.code} - {article.designation} : manque {manque}",
-                document=besoin, profils=[Profil.RESPONSABLE_ACHATS],
-            )
-        elif besoin.quantite_besoin != manque and not besoin.demandes_achat.exists():
-            besoin.quantite_besoin = manque
+    production, ofs = besoins_production(article)
+    alerte = Decimal(article.stock_alerte or 0)
+    ouverts = list(BesoinApprovisionnement.objects.filter(
+        article=article, origine__in=ORIGINES_AUTOMATIQUES, satisfait=False,
+    ).order_by("pk"))
+    besoin = ouverts[0] if ouverts else None
+    for doublon in ouverts[1:]:                       # ne laisser qu'un besoin ouvert
+        doublon.satisfait = True
+        doublon.save()
+    if production <= 0 and alerte <= 0:
+        manque = Decimal("0")
+    else:
+        disponible = StockArticle.objects.filter(article=article).aggregate(
+            total=Sum(Champ("quantite_physique") - Champ("quantite_bloquee") - Champ("quantite_reservee")),
+        )["total"] or Decimal("0")
+        manuels = BesoinApprovisionnement.objects.filter(
+            article=article, origine=OrigineBesoin.MANUEL, satisfait=False,
+        ).aggregate(total=Sum("quantite_besoin"))["total"] or Decimal("0")
+        manque = production + alerte - disponible - quantite_en_cours_achat(article) - manuels
+        manque = manque.quantize(Decimal("0.001"), rounding=ROUND_UP)
+    if manque <= 0:
+        if besoin is not None:
+            besoin.satisfait = True
             besoin.save()
-    elif besoin is not None and not besoin.demandes_achat.exists():
-        besoin.satisfait = True
+        return
+    origine = OrigineBesoin.AUTO_PRODUCTION if production > 0 else OrigineBesoin.SEUIL_ALERTE
+    if besoin is None:
+        besoin = BesoinApprovisionnement.objects.create(article=article, quantite_besoin=manque, origine=origine)
+        besoin.ordres_fabrication.set(ofs)
+        from apps.core.notifications import notifier
+        from apps.comptes.models import Profil
+        cause = (f"pour {', '.join(of.numero for of in ofs)}" if ofs else "stock sous le seuil d'alerte")
+        notifier(
+            "Besoin d'achat à traiter",
+            f"{article.code} - {article.designation} : manque {manque} ({cause})",
+            document=besoin, profils=[Profil.RESPONSABLE_ACHATS],
+        )
+        return
+    if (besoin.quantite_besoin, besoin.origine) != (manque, origine):
+        besoin.quantite_besoin, besoin.origine = manque, origine
         besoin.save()
+    besoin.ordres_fabrication.set(ofs)
+
+
+def verifier_seuil_alerte(article):
+    """Après un mouvement de stock (apps/stocks/signals.py) : voir recalculer_besoin_article."""
+    recalculer_besoin_article(article)
+
+
+def recalculer_besoins_articles(articles):
+    """Recalcule le besoin de chaque article (sans doublon)."""
+    vus = set()
+    for article in articles:
+        if article is not None and article.pk not in vus:
+            vus.add(article.pk)
+            recalculer_besoin_article(article)
+
+
+def synchroniser_besoins_of(of):
+    """
+    Après un changement de l'OF (création, quantité, statut, annulation,
+    libération des réservations) : recalcul des matières de l'OF, et de
+    celles qu'il ne demande plus (besoins encore ouverts qui lui sont liés).
+    """
+    articles = [b.matiere for b in of.besoins_matieres.select_related("matiere")]
+    articles += [b.article for b in BesoinApprovisionnement.objects.filter(
+        ordres_fabrication=of, satisfait=False,
+    ).select_related("article")]
+    recalculer_besoins_articles(articles)
 
 
 class BesoinApprovisionnement(ValidationAvantEnregistrement, models.Model):
@@ -208,6 +327,11 @@ class BesoinApprovisionnement(ValidationAvantEnregistrement, models.Model):
     quantite_besoin = models.DecimalField("Quantité nécessaire", max_digits=14, decimal_places=3)
     origine = models.CharField("Origine du besoin", max_length=20, choices=OrigineBesoin.choices)
     satisfait = models.BooleanField("Satisfait par une commande", default=False)
+    ordres_fabrication = models.ManyToManyField(
+        "production.OrdreFabrication", verbose_name="OF à l'origine du besoin",
+        blank=True, related_name="besoins_achat",
+        help_text="OF dont les matières manquantes sont couvertes par ce besoin (besoin généré par la production).",
+    )
     date_creation = models.DateTimeField("Date de création", auto_now_add=True)
 
     class Meta:
@@ -238,6 +362,7 @@ class BesoinApprovisionnement(ValidationAvantEnregistrement, models.Model):
         )
         self.satisfait = True
         self.save()
+        recalculer_besoin_article(self.article)
         return demande
 
 
@@ -316,6 +441,21 @@ class DemandeAchat(ValidationAvantEnregistrement, models.Model):
         if self.statut != StatutDemandeAchat.EN_ATTENTE:
             raise ValidationError("Seule une demande en attente peut être supprimée.")
 
+    def save(self, *args, **kwargs):
+        creation = self._state.adding
+        super().save(*args, **kwargs)
+        # Demande saisie directement (hors besoin) : elle couvre une partie du
+        # besoin automatique ouvert. Celle créée depuis un besoin est recalculée
+        # par creer_demande_achat, une fois le besoin pris en charge.
+        if creation and not self.besoin_id:
+            recalculer_besoin_article(self.article)
+
+    def delete(self, *args, **kwargs):
+        article = self.article
+        resultat = super().delete(*args, **kwargs)
+        recalculer_besoin_article(article)
+        return resultat
+
     def _verifier_en_attente(self):
         if self.statut != StatutDemandeAchat.EN_ATTENTE:
             raise ValueError(f"Cette demande est déjà {self.get_statut_display().lower()}.")
@@ -335,10 +475,16 @@ class DemandeAchat(ValidationAvantEnregistrement, models.Model):
         self.approuve_par = utilisateur
         self.date_traitement = timezone.now()
         self.save()
-        # Demande rejetée : le besoin d'origine redevient à traiter.
+        # Demande rejetée : le besoin d'origine redevient à traiter (et sa
+        # quantité est recalculée ; un seul besoin ouvert par matière).
+        if self.besoin_id and self.besoin.satisfait and self.besoin.origine in ORIGINES_AUTOMATIQUES:
+            BesoinApprovisionnement.objects.filter(
+                article_id=self.article_id, origine__in=ORIGINES_AUTOMATIQUES, satisfait=False,
+            ).exclude(pk=self.besoin_id).update(satisfait=True)
         if self.besoin_id and self.besoin.satisfait:
             self.besoin.satisfait = False
             self.besoin.save()
+        recalculer_besoin_article(self.article)
 
 
 class StatutCommandeFournisseur(models.TextChoices):
@@ -395,6 +541,15 @@ class CommandeFournisseur(ValidationAvantEnregistrement, models.Model):
             if nouvelle and self.demande_achat_id:
                 self.demande_achat.statut = StatutDemandeAchat.TRANSFORMEE
                 self.demande_achat.save()
+            # Commande annulée : ce qu'elle devait livrer redevient à acheter.
+            if self.statut == StatutCommandeFournisseur.ANNULEE and not nouvelle:
+                recalculer_besoins_articles(l.article for l in self.lignes.select_related("article"))
+
+    def delete(self, *args, **kwargs):
+        articles = [l.article for l in self.lignes.select_related("article")]
+        resultat = super().delete(*args, **kwargs)
+        recalculer_besoins_articles(articles)
+        return resultat
 
     def clean(self):
         """
@@ -527,6 +682,23 @@ class LigneCommandeFournisseur(ValidationAvantEnregistrement, models.Model):
         if self.commande.statut != StatutCommandeFournisseur.BROUILLON:
             raise ValidationError("La commande a été envoyée : ses lignes ne peuvent plus être supprimées.")
 
+    def save(self, *args, **kwargs):
+        ancien_article = None if self._state.adding else valeur_en_base(self, "article")
+        super().save(*args, **kwargs)
+        # Quantité commandée = quantité en cours d'achat : le besoin ouvert suit.
+        # (Une réception met aussi à jour la ligne ; le mouvement de stock qui
+        # suit relance de toute façon le calcul.)
+        articles = [self.article]
+        if ancien_article and ancien_article != self.article_id:
+            articles.append(Article.objects.get(pk=ancien_article))
+        recalculer_besoins_articles(articles)
+
+    def delete(self, *args, **kwargs):
+        article = self.article
+        resultat = super().delete(*args, **kwargs)
+        recalculer_besoin_article(article)
+        return resultat
+
 
 class ReceptionAchat(ValidationAvantEnregistrement, models.Model):
     """
@@ -631,11 +803,16 @@ class LigneReceptionAchat(ValidationAvantEnregistrement, models.Model):
         son lot matière (lot fournisseur, DLC). Réception non conforme : lot
         bloqué ; contrôle de réception prévu au plan qualité : lot « à
         contrôler » jusqu'à sa libération.
+
+        Réception non conforme d'un article NON suivi par lot : un lot est
+        quand même créé, bloqué, pour que la marchandise refusée reste
+        indisponible (jusqu'à sa libération ou son retour au fournisseur)
+        au lieu d'entrer directement dans le stock utilisable.
         """
         from django.utils import timezone
         from apps.stocks.models import LotMatiere, StatutLotMatiere
         article = self.ligne_commande.article
-        if not article.suivi_par_lot:
+        if not article.suivi_par_lot and self.reception.conforme:
             return None
         from apps.qualite.models import controle_reception_requis
         statut = StatutLotMatiere.LIBERE
@@ -787,3 +964,6 @@ class RetourFournisseur(ValidationAvantEnregistrement, models.Model):
                     document_origine=self.reception.commande.numero,
                     utilisateur=self.traite_par,
                 )
+                # Contre-passation de l'écriture de réception (dette fournisseur / achat).
+                from apps.comptabilite.ecritures import ecrire_retour_fournisseur
+                ecrire_retour_fournisseur(self)

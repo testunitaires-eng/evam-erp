@@ -10,9 +10,8 @@ from rest_framework import viewsets
 from apps.core.views import HistoriqueMixin
 from rest_framework.decorators import action, api_view, permission_classes as drf_permission_classes
 from rest_framework.response import Response
-from rest_framework.permissions import IsAuthenticated
 from . import models, serializers
-from apps.comptes.permissions import role_required, acces
+from apps.comptes.permissions import acces
 from apps.comptes.models import Profil
 
 
@@ -107,16 +106,6 @@ class LigneCommandeViewSet(DerogationPrixMixin, viewsets.ModelViewSet):
     filterset_fields = ["commande", "article"]
 
 
-# class FactureViewSet(viewsets.ModelViewSet):
-#     queryset = models.Facture.objects.all()
-#     serializer_class = serializers.FactureSerializer
-#     permission_classes = [role_required(
-#         Profil.COMMERCIAL, Profil.CAISSIER, Profil.COMPTABILITE_DAF, Profil.ADMIN_SI,
-#     )]
-#     filterset_fields = ["client", "statut"]
-#     search_fields = ["numero"]
-
-
 class FactureViewSet(HistoriqueMixin, viewsets.ModelViewSet):
     queryset = models.Facture.objects.all()
     serializer_class = serializers.FactureSerializer
@@ -185,9 +174,6 @@ class LigneFactureViewSet(viewsets.ReadOnlyModelViewSet):
     filterset_fields = ["facture", "article"]
 
 
-
-
-
 class AvoirViewSet(HistoriqueMixin, viewsets.ModelViewSet):
     queryset = models.Avoir.objects.all()
     serializer_class = serializers.AvoirSerializer
@@ -250,7 +236,6 @@ def impayes(request):
             })
     resultat.sort(key=lambda f: f["jours_retard"], reverse=True)
     return Response(resultat)
-
 
 
 class DevisViewSet(HistoriqueMixin, viewsets.ModelViewSet):

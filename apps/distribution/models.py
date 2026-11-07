@@ -44,19 +44,6 @@ class Chauffeur(models.Model):
         return str(self.utilisateur)
 
 
-class Depot(models.Model):
-    """Dépôt logistique (peut correspondre à apps.stocks.Depot ; séparé
-    ici pour ne pas créer de dépendance circulaire entre modules)."""
-    nom = models.CharField("Nom", max_length=100)
-
-    class Meta:
-        verbose_name = "Dépôt (distribution)"
-        verbose_name_plural = "Dépôts (distribution)"
-
-    def __str__(self):
-        return self.nom
-
-
 class Tournee(ValidationAvantEnregistrement, models.Model):
     numero = models.CharField("Numéro", max_length=30, unique=True, editable=False)
     chauffeur = models.ForeignKey(Chauffeur, verbose_name="Chauffeur", on_delete=models.PROTECT)
@@ -378,22 +365,3 @@ class BonLivraison(ValidationAvantEnregistrement, models.Model):
     def verifier_suppression(self):
         if self.statut == StatutLivraison.LIVREE or self.reclamations.exists():
             raise ValidationError("Un bon de livraison livré ou faisant l'objet d'une réclamation ne peut pas être supprimé.")
-
-
-class TransfertDepot(ValidationAvantEnregistrement, models.Model):
-    """Transfert d'un article entre deux dépôts."""
-    depot_source = models.ForeignKey(Depot, verbose_name="Dépôt source", on_delete=models.PROTECT, related_name="transferts_sortants")
-    depot_destination = models.ForeignKey(Depot, verbose_name="Dépôt destination", on_delete=models.PROTECT, related_name="transferts_entrants")
-    date_transfert = models.DateTimeField("Date de transfert", auto_now_add=True)
-    statut = models.CharField("Statut", max_length=20, default="EN_COURS")
-
-    class Meta:
-        verbose_name = "Transfert entre dépôts"
-        verbose_name_plural = "Transferts entre dépôts"
-
-    def __str__(self):
-        return f"Transfert {self.depot_source} -> {self.depot_destination}"
-
-    def clean(self):
-        if self.depot_source_id and self.depot_source_id == self.depot_destination_id:
-            raise ValidationError({"depot_destination": "Le dépôt de destination doit être différent du dépôt source."})

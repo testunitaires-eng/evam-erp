@@ -10,7 +10,7 @@ from rest_framework import mixins, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from . import models, serializers
-from apps.comptes.permissions import role_required, lecture_seule_pour, acces
+from apps.comptes.permissions import acces
 from apps.comptes.models import Profil
 
 

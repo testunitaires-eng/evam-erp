@@ -1,37 +1,3 @@
-
-# """
-# Interface d'administration Django du module référentiel.
-# """
-
-# from django.contrib import admin
-# from . import models
-
-# @admin.register(models.Article)
-# class ArticleAdmin(admin.ModelAdmin):
-#     search_fields = ()
-
-
-# @admin.register(models.FicheTechnique)
-# class FicheTechniqueAdmin(admin.ModelAdmin):
-#     search_fields = ()
-
-
-# @admin.register(models.CompositionFicheTechnique)
-# class CompositionFicheTechniqueAdmin(admin.ModelAdmin):
-#     search_fields = ()
-
-
-# @admin.register(models.FicheConditionnement)
-# class FicheConditionnementAdmin(admin.ModelAdmin):
-#     search_fields = ()
-
-
-# @admin.register(models.ControleQualiteRequis)
-# class ControleQualiteRequisAdmin(admin.ModelAdmin):
-#     search_fields = ()
-
-
-
 """
 Interface d'administration Django du module référentiel.
 """

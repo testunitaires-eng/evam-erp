@@ -57,6 +57,7 @@ INSTALLED_APPS = [
     "apps.distribution",   # Module 9  - Préparation, tournées, livraisons
     "apps.couts",          # Module 10 - Coûts standards/réels, rentabilité
     "apps.comptabilite",   # Module 11 - Pilotage, anomalies, exports comptables
+    "apps.personnel",      # Ouvriers (sans accès à l'application), compétences, affectations
 ]
 
 MIDDLEWARE = [

@@ -32,6 +32,7 @@ MODULES = {
     "qualite": "QUALITE", "commercial": "COMMERCIAL", "reclamations": "COMMERCIAL", "caisse": "CAISSE",
     "distribution": "DISTRIBUTION", "couts": "COUTS", "comptabilite": "COMPTABILITE", "fiscalite": "COMPTABILITE",
     "reporting": "COMPTABILITE", "comptes": "ADMINISTRATION", "core": "ADMINISTRATION",
+    "personnel": "PRODUCTION",
 }
 
 

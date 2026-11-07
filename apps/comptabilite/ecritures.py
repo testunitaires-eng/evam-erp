@@ -13,6 +13,8 @@ Schémas (comptes paramétrables, voir CompteParametre) :
 - Avoir utilisé      : D 709 Rabais accordés / C 411 Client
 - Réception d'achat  : D 60x Achats (selon la nature de l'article) / C 401 Fournisseur
 - Retour fournisseur : contre-passation de la réception : D 401 Fournisseur / C 60x Achats
+- État de paie validé: D 661 Rémunérations du personnel / C 422 Personnel (tiers = matricule)
+- Paie payée        : décaissement D 422 Personnel / C 571 Caisse ; état annulé : contre-passation
 - Ventes comptoir    : particuliers au comptant -> pas d'écriture par facture ni par
                        encaissement, mais une SYNTHÈSE à la clôture de la session de
                        caisse : D 571 (ou banque / Mobile Money) / C 702x, C taxes
@@ -195,12 +197,17 @@ def ecrire_encaissement(encaissement):
 
 def ecrire_decaissement(decaissement):
     """Sortie d'argent en espèces ; un remboursement de réclamation solde le compte du client."""
+    from apps.personnel.models import EtatPaie
     from apps.reclamations.models import SolutionClient
     solution = SolutionClient.objects.filter(reference_sortie_caisse=decaissement.numero).select_related(
         "reclamation__client",
     ).first()
+    etat_paie = EtatPaie.objects.filter(decaissement=decaissement).select_related("ouvrier").first()
     if solution:
         debit = (compte(CleCompte.CLIENTS), solution.reclamation.client.code)
+    elif etat_paie:
+        # Paie d'un ouvrier : solde sa rémunération due.
+        debit = (compte(CleCompte.PERSONNEL), etat_paie.ouvrier.matricule)
     else:
         debit = (compte(CleCompte.CHARGES_DIVERSES), "")
     libelle = f"Décaissement {decaissement.numero} - {decaissement.motif}"
@@ -251,3 +258,24 @@ def ecrire_retour_fournisseur(retour):
         (compte(CleCompte.FOURNISSEURS), commande.fournisseur.code, libelle, montant, 0),
         (compte_d_achat(retour.article), "", libelle, 0, montant),
     ])
+
+
+def ecrire_etat_paie(etat, annulation=False):
+    """
+    Paie d'un ouvrier validée par la DAF : la charge de personnel est
+    constatée et la rémunération devient due à l'ouvrier (payée ensuite
+    en espèces par un décaissement). Annulation : contre-passation.
+    """
+    ouvrier = etat.ouvrier
+    libelle = (
+        f"{'Annulation paie' if annulation else 'Paie'} {etat.numero} - {ouvrier.matricule} {ouvrier.nom_complet} "
+        f"du {etat.date_debut:%d/%m/%Y} au {etat.date_fin:%d/%m/%Y}"
+    )
+    charge = (compte(CleCompte.CHARGES_PERSONNEL), "", libelle)
+    dette = (compte(CleCompte.PERSONNEL), ouvrier.matricule, libelle)
+    debit, credit = (dette, charge) if annulation else (charge, dette)
+    return passer_ecriture(etat, Journal.OPERATIONS_DIVERSES, etat.numero, libelle, [
+        (*debit, etat.montant, 0),
+        (*credit, 0, etat.montant),
+    ], date=None if annulation else etat.date_fin)
+

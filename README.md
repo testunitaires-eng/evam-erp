@@ -25,7 +25,7 @@ evam-erp/
 └── apps/                      <- une application Django par module métier
     ├── core/                  <- transverse : numérotation, historique, notifications,
     │                             PDF, exports, paramètres de l'entreprise, pagination
-    ├── comptes/               <- utilisateurs, 12 profils, permissions, journal des actions
+    ├── comptes/               <- utilisateurs, 13 profils, permissions, journal des actions
     ├── industriel/            <- socle : activités, usines, lignes, postes, équipements, circuits
     ├── referentiel/           <- articles, familles, formats, fiches techniques, conversions d'unités
     ├── fiscalite/             <- matrice fiscale par produit, préparation de la facture normalisée (SFEC)
@@ -41,6 +41,8 @@ evam-erp/
     ├── reclamations/          <- retours clients : réclamation, retour physique, contrôle, solution
     ├── couts/                 <- coûts réels et standards, charges, clés de répartition
     ├── comptabilite/          <- écritures automatiques, plan de comptes, anomalies, exports, clôtures
+    ├── personnel/             <- ouvriers (sans accès à l'application), compétences, affectations,
+    │                             rémunération, pointages, paie
     └── reporting/             <- tableau de bord de la Direction
 ```
 
@@ -91,7 +93,7 @@ python manage.py initialiser_referentiel_valeurs    # familles, formats, parfums
 python manage.py createsuperuser
 
 # 8. (optionnel) Créer un compte de démonstration par profil métier
-#    (12 comptes, identifiant = nom du profil en minuscules,
+#    (13 comptes, identifiant = nom du profil en minuscules,
 #    mot de passe "Demo1234!" pour tous)
 python manage.py creer_comptes_demo
 
@@ -150,27 +152,29 @@ change avec `?ordering=<champ>`.
 
 ---
 
-## 4. Les 12 profils et leurs droits
+## 4. Les 13 profils et leurs droits
 
 Chaque utilisateur a **un seul profil** (`Utilisateur.profil`). Le
-cahier des charges décrit 11 acteurs ; un 12e (**Responsable Achat**)
-a été ajouté car le module Achats est détaillé sans que le document ne
-nomme qui le pilote — point confirmé avec le client.
+cahier des charges décrit 11 acteurs ; deux ont été ajoutés : le
+**Responsable Achat** (le module Achats est détaillé sans que le
+document ne nomme qui le pilote — point confirmé avec le client) et le
+**RH** (module personnel).
 
 | Profil (identifiant technique) | Peut créer/modifier | Lecture seule sur / Restrictions |
 |---|---|---|
-| `RESPONSABLE_PRODUCTION` | Fiches techniques, plans de production, OF, validation des sorties complémentaires | Coûts (jamais accès aux prix) |
-| `AGENT_PRODUCTION` | Étapes de production, pertes | **Ne voit que les OF où il figure dans `agents_affectes`** |
+| `RESPONSABLE_PRODUCTION` | Fiches techniques, plans de production, OF, validation des sorties complémentaires, affectations des ouvriers | Coûts (jamais accès aux prix) ; ouvriers et pointages en lecture, jamais leur rémunération |
+| `AGENT_PRODUCTION` | Étapes de production, pertes | **Ne voit que les OF où il figure dans `agents_affectes`** ; consulte les ouvriers, affectations et pointages |
 | `MAGASINIER` | Mouvements de stock, sorties matières, préparations de livraison, réceptions, retours fournisseurs | Fiches techniques (refusé en écriture), OF |
 | `RESPONSABLE_QUALITE` | Contrôles qualité, libération/blocage des lots | — |
 | `RESPONSABLE_ACHATS` | Fournisseurs, contrats, catalogue produits/prix, demandes d'achat (approbation), commandes fournisseurs | Réceptions et retours (partagés avec le Magasinier) |
 | `COMMERCIAL` | Clients, prospects, contrats, tarifs, devis, commandes, factures | Stock disponible (jamais de modification) |
-| `CAISSIER` | Sessions de caisse, encaissements, justification d'écarts | Commandes, prix (aucune modification), **ne peut jamais supprimer un écart** |
+| `CAISSIER` | Sessions de caisse, encaissements, justification d'écarts, paiement en espèces des ouvriers | Commandes, prix (aucune modification), **ne peut jamais supprimer un écart** |
 | `RESPONSABLE_DISTRIBUTION` | Tournées, lancement des préparations, confirmation des livraisons | — |
 | `CHAUFFEUR` | Confirmation de livraison | **Ne voit que ses propres tournées et bons de livraison** |
-| `COMPTABILITE_DAF` | Anomalies, exports comptables, clôtures, plan de comptes | Lecture transversale sur la plupart des modules |
+| `COMPTABILITE_DAF` | Anomalies, exports comptables, clôtures, plan de comptes, validation / annulation de la paie des ouvriers | Lecture transversale sur la plupart des modules |
 | `DIRECTION` | — | Tableaux de bord, coûts, journal des actions |
 | `ADMIN_SI` | Utilisateurs et tous les modules | — (accès total) |
+| `RH` | Fiches des ouvriers, rémunération, pointages (saisie et validation), affectations, préparation de la paie | — |
 
 ### Où sont codées les permissions
 
@@ -238,12 +242,75 @@ l'historique des changements de statut sur `.../{id}/historique/`.
   achats en cours − besoins saisis à la main`. Il est rattaché aux OF
   concernés et le Responsable Achat est notifié à sa création.
 - **Écritures comptables** : facture, encaissement, décaissement, avoir,
-  réception et retour fournisseur, synthèse de caisse (voir
+  réception et retour fournisseur, synthèse de caisse, paie des ouvriers (voir
   `apps/comptabilite/ecritures.py`). Une écriture déséquilibrée ou sur
   une période clôturée annule toute l'opération.
 - **Notifications** : envoyées aux profils concernés à chaque étape
   clé (demande d'achat à approuver, réception attendue, commande à
   servir...) — `GET /api/notifications/`.
+
+### Ouvriers (module `personnel`)
+
+Les ouvriers travaillent aux étapes de production mais **n'ont jamais
+de compte** : ce sont de simples fiches (`/api/personnel/ouvriers/`),
+distinctes des utilisateurs, tenues par le **RH**.
+
+- **Permanent** ou **temporaire** : un temporaire a obligatoirement une
+  date de fin de contrat. Matricule automatique (`OUV-000001`).
+- **Zones de compétence** : les étapes du processus (`EtapeStandard`)
+  que l'ouvrier sait tenir. On ajoute une zone hors ligne (nettoyage,
+  magasin...) en créant l'étape correspondante dans le socle industriel.
+- **Affectations** (`/api/personnel/affectations/`) : à une étape ou un
+  poste précis pour une période, ou à l'équipe d'un OF (période reprise
+  du planning de l'OF). Contrôles : ouvrier actif, sous contrat sur
+  toute la période (un temporaire est limité à sa fin de contrat),
+  compétent pour l'étape, jamais sur deux postes en même temps ; un
+  même ouvrier peut en revanche travailler sur plusieurs OF.
+- **Ouvriers disponibles** pour une étape à une date :
+  `GET /api/personnel/ouvriers/disponibles/?etape=<id>&date=AAAA-MM-JJ`.
+- **Départ** : désactiver la fiche avec un motif ; les affectations en
+  cours s'arrêtent le jour même, celles à venir sont retirées. Une fiche
+  déjà affectée ne se supprime pas.
+
+- **Rémunération** (`/api/personnel/remunerations/`, RH ; lecture DAF et
+  Direction) : salaire mensuel fixe ou taux journalier, paie
+  hebdomadaire ou mensuelle, avec une date d'effet. Une condition déjà
+  appliquée à des pointages validés ne se modifie plus : on en crée une
+  nouvelle, les périodes passées gardent leur taux.
+- **Pointages** (`/api/personnel/pointages/`, RH) : une ligne par
+  ouvrier et par jour — présent, demi-journée ou absent (absence
+  justifiée avec motif, ou non). Le lieu de travail (étape, poste, OF)
+  est repris de l'affectation du jour ; l'OF est facultatif mais doit
+  être un OF auquel l'ouvrier est affecté.
+  - feuille du jour : `GET .../pointages/feuille/?date=AAAA-MM-JJ` ;
+  - saisie groupée d'une journée (tout ou rien) : `POST .../pointages/saisie_jour/` ;
+  - validation : `POST .../pointages/{id}/valider/` ou
+    `POST .../pointages/valider_periode/` ; un pointage validé ne change plus.
+
+- **Paie** (`/api/personnel/etats-paie/`) : un état par ouvrier et par
+  période — semaine du lundi au dimanche, ou mois civil — calculé jour
+  par jour avec le taux en vigueur ce jour-là :
+  - taux journalier : taux × part de journée pointée (présent 1,
+    demi-journée 0,5), week-end compris s'il a travaillé ;
+  - salaire mensuel : chaque jour ouvrable (lundi-vendredi) sous contrat
+    vaut salaire ÷ jours ouvrables du mois, moins les absences non
+    justifiées ; un jour ouvrable non pointé est payé mais signalé ;
+  - pas d'heures supplémentaires, de primes ni de charges sociales ;
+    montant arrondi au franc ; tous les pointages doivent être validés.
+
+  Circuit (chaque rôle par une personne différente) :
+  1. **RH** — `POST .../etats-paie/preparer/ {"periodicite", "date"}`
+     prépare les états de la période (`.../recalculer/` si besoin) ;
+  2. **DAF ou Direction** — `.../valider/` : écriture D 661 / C 422
+     (compte de tiers = matricule), coût des jours pointés sur un OF
+     imputé à l'OF (`CoutMainOeuvre`, journée de 8 h). La période est
+     alors arrêtée : plus de pointage ni de nouveau taux dessus ;
+     `.../annuler/` (motif) contre-passe un état validé non payé ;
+  3. **Caissier** — `.../payer/` : décaissement en espèces sur sa session
+     ouverte, autorisé par la personne qui a validé la paie, écriture
+     D 422 / C 571 ;
+  4. fiche d'émargement à faire signer :
+     `GET .../etats-paie/emargement/?date_debut=…&date_fin=…` (PDF).
 
 ---
 

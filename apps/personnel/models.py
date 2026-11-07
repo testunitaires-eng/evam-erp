@@ -17,9 +17,20 @@ le Responsable Production / l'Administrateur SI.
   Contrôles : ouvrier actif et sous contrat sur toute la période,
   compétent pour l'étape, pas deux postes en même temps.
 
-Phases suivantes (non couvertes ici) : conditions de rémunération,
-pointages, états de paie, écritures comptables, coût par OF.
+- ConditionRemuneration : salaire mensuel fixe ou taux journalier, et
+  périodicité de paie (hebdomadaire / mensuelle), historisés par date
+  d'effet (une augmentation ne change pas les périodes passées).
+- Pointage : une ligne par ouvrier et par jour (présent, demi-journée,
+  absent, absence justifiée ou non), rattachée à l'étape / au poste /
+  à l'OF de son affectation. Saisi puis validé par le RH ; un pointage
+  validé ne change plus.
+
+Phases suivantes : états de paie (retenue au prorata des absences non
+justifiées pour un salaire mensuel), validation par la DAF, écriture
+comptable, paiement en espèces par la caisse, coût par OF.
 """
+
+from decimal import Decimal
 
 from django.core.exceptions import ValidationError
 from django.db import models, transaction
@@ -153,8 +164,15 @@ class Ouvrier(ValidationAvantEnregistrement, models.Model):
                 f"(ex : {hors_contrat[0]}) : modifiez-les d'abord."
             )})
 
+    def condition_au(self, date):
+        """Condition de rémunération en vigueur à cette date (la plus récente déjà entrée en vigueur)."""
+        return self.conditions_remuneration.filter(date_effet__lte=date).order_by("-date_effet").first()
+
+    def affectations_du(self, date):
+        return [a for a in self.affectations.select_related("etape", "poste", "ordre_fabrication") if a.est_active(date)]
+
     def verifier_suppression(self):
-        if self.affectations.exists():
+        if self.affectations.exists() or self.pointages.exists():
             raise ValidationError("Cet ouvrier a déjà été affecté : désactivez-le (avec un motif de sortie) au lieu de le supprimer.")
 
 
@@ -264,3 +282,197 @@ class Affectation(ValidationAvantEnregistrement, models.Model):
                     raise ValidationError({"date_debut": (
                         f"{ouvrier.nom_complet} est déjà affecté sur cette période : {autre}."
                     )})
+
+
+class ModeRemuneration(models.TextChoices):
+    MENSUEL = "MENSUEL", "Salaire mensuel fixe"
+    JOURNALIER = "JOURNALIER", "Taux journalier (par jour travaillé)"
+
+
+class PeriodicitePaie(models.TextChoices):
+    HEBDOMADAIRE = "HEBDOMADAIRE", "Hebdomadaire"
+    MENSUELLE = "MENSUELLE", "Mensuelle"
+
+
+class ConditionRemuneration(ValidationAvantEnregistrement, models.Model):
+    """
+    Combien et à quel rythme l'ouvrier est payé, à partir d'une date
+    d'effet. On ne modifie pas une condition déjà appliquée à des
+    pointages validés : on en crée une nouvelle (nouvelle date d'effet),
+    pour que les périodes passées gardent le taux de l'époque.
+    """
+    ouvrier = models.ForeignKey(Ouvrier, verbose_name="Ouvrier", on_delete=models.PROTECT, related_name="conditions_remuneration")
+    mode = models.CharField("Mode de rémunération", max_length=15, choices=ModeRemuneration.choices)
+    montant = models.DecimalField(
+        "Montant (FCFA)", max_digits=12, decimal_places=2,
+        help_text="Salaire mensuel pour le mode mensuel, montant par jour travaillé pour le mode journalier.",
+    )
+    periodicite_paie = models.CharField("Paie", max_length=15, choices=PeriodicitePaie.choices, default=PeriodicitePaie.MENSUELLE)
+    date_effet = models.DateField("En vigueur à partir du")
+    saisi_par = models.ForeignKey(Utilisateur, verbose_name="Saisi par", on_delete=models.PROTECT, null=True, blank=True, related_name="+")
+    date_creation = models.DateTimeField("Créée le", auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Condition de rémunération"
+        verbose_name_plural = "Conditions de rémunération"
+        ordering = ["ouvrier", "-date_effet"]
+        unique_together = ("ouvrier", "date_effet")
+
+    def __str__(self):
+        return f"{self.ouvrier} : {self.montant} ({self.get_mode_display()}) dès le {self.date_effet:%d/%m/%Y}"
+
+    def _pointages_valides_couverts(self, date_effet=None):
+        """Pointages validés auxquels cette condition s'applique (jusqu'à la condition suivante)."""
+        date_effet = date_effet or self.date_effet
+        suivante = ConditionRemuneration.objects.filter(
+            ouvrier_id=self.ouvrier_id, date_effet__gt=date_effet,
+        ).exclude(pk=self.pk).order_by("date_effet").first()
+        pointages = Pointage.objects.filter(ouvrier_id=self.ouvrier_id, date__gte=date_effet, statut=StatutPointage.VALIDE)
+        if suivante:
+            pointages = pointages.filter(date__lt=suivante.date_effet)
+        return pointages
+
+    def clean(self):
+        if self.montant is None or self.montant <= 0:
+            raise ValidationError({"montant": "Le montant doit être strictement positif."})
+        if self.ouvrier_id and self.date_effet:
+            ouvrier = self.ouvrier
+            if self.date_effet < ouvrier.date_entree:
+                raise ValidationError({"date_effet": f"{ouvrier.nom_complet} n'entre chez EVAM que le {ouvrier.date_entree:%d/%m/%Y}."})
+            if ouvrier.date_fin_contrat and self.date_effet > ouvrier.date_fin_contrat:
+                raise ValidationError({"date_effet": f"Le contrat de {ouvrier.nom_complet} se termine le {ouvrier.date_fin_contrat:%d/%m/%Y}."})
+        if self.pk:
+            if valeur_en_base(self, "ouvrier") != self.ouvrier_id:
+                raise ValidationError({"ouvrier": "L'ouvrier d'une condition ne change pas."})
+            ancienne_date = valeur_en_base(self, "date_effet")
+            modifiee = any(valeur_en_base(self, champ) != getattr(self, champ)
+                           for champ in ("mode", "montant", "periodicite_paie", "date_effet"))
+            if modifiee and self._pointages_valides_couverts(ancienne_date).exists():
+                raise ValidationError(
+                    "Cette condition s'applique déjà à des pointages validés : créez une nouvelle condition "
+                    "avec une nouvelle date d'effet au lieu de la modifier."
+                )
+
+    def verifier_suppression(self):
+        if self._pointages_valides_couverts().exists():
+            raise ValidationError("Cette condition s'applique déjà à des pointages validés : elle ne peut pas être supprimée.")
+
+
+class Presence(models.TextChoices):
+    PRESENT = "PRESENT", "Présent"
+    DEMI_JOURNEE = "DEMI_JOURNEE", "Demi-journée"
+    ABSENT = "ABSENT", "Absent"
+
+
+class StatutPointage(models.TextChoices):
+    SAISI = "SAISI", "Saisi"
+    VALIDE = "VALIDE", "Validé"
+
+
+# Part de journée travaillée selon la présence (sert au calcul de la paie et des coûts).
+FRACTION_JOUR = {Presence.PRESENT: Decimal("1"), Presence.DEMI_JOURNEE: Decimal("0.5"), Presence.ABSENT: Decimal("0")}
+
+
+class Pointage(ValidationAvantEnregistrement, models.Model):
+    """
+    La journée d'un ouvrier, pointée par le RH. Le lieu de travail
+    (étape, poste, OF) est repris de son affectation du jour s'il n'est
+    pas saisi ; l'OF est facultatif. Une absence peut être justifiée
+    (congé, maladie...) : elle n'est alors pas retenue sur un salaire
+    mensuel. Saisi -> Validé ; un pointage validé ne change plus.
+    """
+    ouvrier = models.ForeignKey(Ouvrier, verbose_name="Ouvrier", on_delete=models.PROTECT, related_name="pointages")
+    date = models.DateField("Jour")
+    presence = models.CharField("Présence", max_length=15, choices=Presence.choices, default=Presence.PRESENT)
+    absence_justifiee = models.BooleanField(
+        "Absence justifiée", default=False,
+        help_text="Congé, maladie... : non retenue sur le salaire mensuel. Sans objet si présent.",
+    )
+    motif_absence = models.CharField("Motif de l'absence", max_length=255, blank=True)
+    etape = models.ForeignKey(
+        "industriel.EtapeStandard", verbose_name="Étape", on_delete=models.PROTECT, null=True, blank=True, related_name="pointages",
+    )
+    poste = models.ForeignKey("industriel.Poste", verbose_name="Poste", on_delete=models.PROTECT, null=True, blank=True, related_name="pointages")
+    ordre_fabrication = models.ForeignKey(
+        "production.OrdreFabrication", verbose_name="OF", on_delete=models.PROTECT, null=True, blank=True, related_name="pointages",
+    )
+    observations = models.CharField("Observations", max_length=255, blank=True)
+    statut = models.CharField("Statut", max_length=10, choices=StatutPointage.choices, default=StatutPointage.SAISI)
+    saisi_par = models.ForeignKey(Utilisateur, verbose_name="Saisi par", on_delete=models.PROTECT, null=True, blank=True, related_name="+")
+    valide_par = models.ForeignKey(Utilisateur, verbose_name="Validé par", on_delete=models.PROTECT, null=True, blank=True, related_name="+")
+    date_validation = models.DateTimeField("Validé le", null=True, blank=True)
+
+    class Meta:
+        verbose_name = "Pointage"
+        verbose_name_plural = "Pointages"
+        ordering = ["-date", "ouvrier__nom"]
+        unique_together = ("ouvrier", "date")
+
+    def __str__(self):
+        return f"{self.ouvrier} le {self.date:%d/%m/%Y} : {self.get_presence_display()}"
+
+    @property
+    def fraction_jour(self):
+        return FRACTION_JOUR[self.presence]
+
+    def _completer_depuis_affectation(self):
+        """Lieu de travail non saisi : celui de l'affectation du jour (un OF unique en priorité, sinon le poste)."""
+        if self.etape_id or self.poste_id or self.ordre_fabrication_id or self.presence == Presence.ABSENT:
+            return
+        affectations = self.ouvrier.affectations_du(self.date)
+        sur_of = [a for a in affectations if a.ordre_fabrication_id]
+        choix = sur_of[0] if len(sur_of) == 1 else next((a for a in affectations if not a.ordre_fabrication_id), None)
+        if choix is not None:
+            self.etape_id, self.poste_id, self.ordre_fabrication_id = choix.etape_id, choix.poste_id, choix.ordre_fabrication_id
+
+    def clean(self):
+        ancien_statut = valeur_en_base(self, "statut")
+        if ancien_statut == StatutPointage.VALIDE:
+            raise ValidationError("Ce pointage est validé : il ne peut plus être modifié.")
+        if self.statut == StatutPointage.VALIDE and ancien_statut is None:
+            raise ValidationError({"statut": "Un pointage se saisit d'abord, puis se valide (action Valider)."})
+        if self.pk and valeur_en_base(self, "ouvrier") != self.ouvrier_id:
+            raise ValidationError({"ouvrier": "L'ouvrier d'un pointage ne change pas."})
+        if not self.ouvrier_id or not self.date:
+            return
+        ouvrier = self.ouvrier
+        if self.date > timezone.localdate():
+            raise ValidationError({"date": "On ne pointe pas un jour à venir."})
+        if self.date < ouvrier.date_entree or (ouvrier.date_fin_contrat and self.date > ouvrier.date_fin_contrat):
+            raise ValidationError({"date": f"{ouvrier.nom_complet} n'est pas sous contrat le {self.date:%d/%m/%Y}."})
+        if not ouvrier.actif and self._state.adding:
+            raise ValidationError({"ouvrier": f"{ouvrier.nom_complet} n'est plus actif : pointez ses jours avant de désactiver sa fiche."})
+        if self.presence == Presence.PRESENT:
+            self.absence_justifiee, self.motif_absence = False, ""
+        elif self.absence_justifiee and not (self.motif_absence or "").strip():
+            raise ValidationError({"motif_absence": "Indiquez le motif de l'absence justifiée."})
+        if self.presence == Presence.ABSENT:
+            self.etape_id = self.poste_id = self.ordre_fabrication_id = None
+            return
+        self._completer_depuis_affectation()
+        if self.poste_id:
+            if self.etape_id and self.etape_id != self.poste.etape_id:
+                raise ValidationError({"poste": f"Le poste {self.poste.code} correspond à l'étape « {self.poste.etape.libelle} »."})
+            self.etape_id = self.poste.etape_id
+        if self.ordre_fabrication_id:
+            of = self.ordre_fabrication
+            if of.statut == "ANNULE":
+                raise ValidationError({"ordre_fabrication": f"L'OF {of.numero} est annulé."})
+            if not any(a.ordre_fabrication_id == of.pk for a in ouvrier.affectations_du(self.date)):
+                raise ValidationError({"ordre_fabrication": (
+                    f"{ouvrier.nom_complet} n'est pas affecté à l'OF {of.numero} le {self.date:%d/%m/%Y}."
+                )})
+
+    def verifier_suppression(self):
+        if self.statut == StatutPointage.VALIDE:
+            raise ValidationError("Un pointage validé ne peut pas être supprimé.")
+
+    def valider(self, utilisateur):
+        if self.statut == StatutPointage.VALIDE:
+            raise ValueError(f"Le pointage de {self.ouvrier.nom_complet} du {self.date:%d/%m/%Y} est déjà validé.")
+        self.statut = StatutPointage.VALIDE
+        self.valide_par = utilisateur
+        self.date_validation = timezone.now()
+        # Mise à jour ciblée : pas de nouveau contrôle de saisie ; l'historique
+        # du changement de statut est enregistré par ValidationAvantEnregistrement.
+        self.save(update_fields=["statut", "valide_par", "date_validation"])

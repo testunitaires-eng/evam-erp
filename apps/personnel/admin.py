@@ -28,3 +28,20 @@ class AffectationAdmin(admin.ModelAdmin):
     list_filter = ("etape", "ouvrier__type_contrat")
     search_fields = ("ouvrier__matricule", "ouvrier__nom", "ouvrier__prenom", "ordre_fabrication__numero")
     readonly_fields = ("affecte_par", "date_creation")
+
+
+@admin.register(models.ConditionRemuneration)
+class ConditionRemunerationAdmin(admin.ModelAdmin):
+    list_display = ("ouvrier", "mode", "montant", "periodicite_paie", "date_effet")
+    list_filter = ("mode", "periodicite_paie")
+    search_fields = ("ouvrier__matricule", "ouvrier__nom", "ouvrier__prenom")
+    readonly_fields = ("saisi_par", "date_creation")
+
+
+@admin.register(models.Pointage)
+class PointageAdmin(admin.ModelAdmin):
+    list_display = ("date", "ouvrier", "presence", "absence_justifiee", "etape", "ordre_fabrication", "statut")
+    list_filter = ("statut", "presence", "absence_justifiee", "date")
+    search_fields = ("ouvrier__matricule", "ouvrier__nom", "ouvrier__prenom", "ordre_fabrication__numero")
+    date_hierarchy = "date"
+    readonly_fields = ("statut", "saisi_par", "valide_par", "date_validation")

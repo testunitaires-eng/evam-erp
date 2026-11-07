@@ -16,9 +16,9 @@ from django.db import models
 
 class Profil(models.TextChoices):
     """
-    Les 12 acteurs de l'application (11 issus du cahier des charges +
-    Responsable Achat, ajouté car le document décrit un module Achats
-    complet - §6 - sans jamais nommer explicitement qui le pilote).
+    Les 13 acteurs de l'application : 11 issus du cahier des charges,
+    + Responsable Achat (le document décrit un module Achats complet -
+    §6 - sans jamais nommer qui le pilote), + RH (module personnel).
     Un utilisateur a un seul profil principal.
     """
     RESPONSABLE_PRODUCTION = "RESPONSABLE_PRODUCTION", "Responsable Production"
@@ -33,6 +33,9 @@ class Profil(models.TextChoices):
     COMPTABILITE_DAF = "COMPTABILITE_DAF", "Comptabilité / DAF"
     DIRECTION = "DIRECTION", "PDG / Direction"
     ADMIN_SI = "ADMIN_SI", "Administrateur SI"
+    # Ajouté avec le module personnel : tient les fiches des ouvriers,
+    # leur rémunération et leurs pointages, prépare les états de paie.
+    RH = "RH", "Ressources humaines"
 
 
 class Utilisateur(AbstractUser):

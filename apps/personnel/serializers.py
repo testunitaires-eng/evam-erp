@@ -50,3 +50,27 @@ class AffectationSerializer(ValidationModeleMixin, serializers.ModelSerializer):
         model = models.Affectation
         fields = "__all__"
         read_only_fields = ["affecte_par"]
+
+
+class ConditionRemunerationSerializer(ValidationModeleMixin, serializers.ModelSerializer):
+    ouvrier_nom = serializers.CharField(source="ouvrier.nom_complet", read_only=True)
+
+    class Meta:
+        model = models.ConditionRemuneration
+        fields = "__all__"
+        read_only_fields = ["saisi_par"]
+
+
+class PointageSerializer(ValidationModeleMixin, serializers.ModelSerializer):
+    ouvrier_nom = serializers.CharField(source="ouvrier.nom_complet", read_only=True)
+    ouvrier_matricule = serializers.CharField(source="ouvrier.matricule", read_only=True)
+    etape_libelle = serializers.CharField(source="etape.libelle", read_only=True, default=None)
+    poste_code = serializers.CharField(source="poste.code", read_only=True, default=None)
+    of_numero = serializers.CharField(source="ordre_fabrication.numero", read_only=True, default=None)
+    fraction_jour = serializers.DecimalField(max_digits=3, decimal_places=1, read_only=True)
+
+    class Meta:
+        model = models.Pointage
+        fields = "__all__"
+        # Validation uniquement par l'action /valider/ (ou /valider_periode/).
+        read_only_fields = ["statut", "saisi_par", "valide_par", "date_validation"]

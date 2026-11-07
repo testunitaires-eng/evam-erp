@@ -25,7 +25,7 @@ evam-erp/
 └── apps/                      <- une application Django par module métier
     ├── core/                  <- transverse : numérotation, historique, notifications,
     │                             PDF, exports, paramètres de l'entreprise, pagination
-    ├── comptes/               <- utilisateurs, 12 profils, permissions, journal des actions
+    ├── comptes/               <- utilisateurs, 13 profils, permissions, journal des actions
     ├── industriel/            <- socle : activités, usines, lignes, postes, équipements, circuits
     ├── referentiel/           <- articles, familles, formats, fiches techniques, conversions d'unités
     ├── fiscalite/             <- matrice fiscale par produit, préparation de la facture normalisée (SFEC)
@@ -41,7 +41,8 @@ evam-erp/
     ├── reclamations/          <- retours clients : réclamation, retour physique, contrôle, solution
     ├── couts/                 <- coûts réels et standards, charges, clés de répartition
     ├── comptabilite/          <- écritures automatiques, plan de comptes, anomalies, exports, clôtures
-    ├── personnel/             <- ouvriers (sans accès à l'application), compétences, affectations
+    ├── personnel/             <- ouvriers (sans accès à l'application), compétences, affectations,
+    │                             rémunération, pointages
     └── reporting/             <- tableau de bord de la Direction
 ```
 
@@ -92,7 +93,7 @@ python manage.py initialiser_referentiel_valeurs    # familles, formats, parfums
 python manage.py createsuperuser
 
 # 8. (optionnel) Créer un compte de démonstration par profil métier
-#    (12 comptes, identifiant = nom du profil en minuscules,
+#    (13 comptes, identifiant = nom du profil en minuscules,
 #    mot de passe "Demo1234!" pour tous)
 python manage.py creer_comptes_demo
 
@@ -151,17 +152,18 @@ change avec `?ordering=<champ>`.
 
 ---
 
-## 4. Les 12 profils et leurs droits
+## 4. Les 13 profils et leurs droits
 
 Chaque utilisateur a **un seul profil** (`Utilisateur.profil`). Le
-cahier des charges décrit 11 acteurs ; un 12e (**Responsable Achat**)
-a été ajouté car le module Achats est détaillé sans que le document ne
-nomme qui le pilote — point confirmé avec le client.
+cahier des charges décrit 11 acteurs ; deux ont été ajoutés : le
+**Responsable Achat** (le module Achats est détaillé sans que le
+document ne nomme qui le pilote — point confirmé avec le client) et le
+**RH** (module personnel).
 
 | Profil (identifiant technique) | Peut créer/modifier | Lecture seule sur / Restrictions |
 |---|---|---|
-| `RESPONSABLE_PRODUCTION` | Fiches techniques, plans de production, OF, validation des sorties complémentaires, ouvriers et leurs affectations | Coûts (jamais accès aux prix) |
-| `AGENT_PRODUCTION` | Étapes de production, pertes | **Ne voit que les OF où il figure dans `agents_affectes`** ; consulte les ouvriers et affectations |
+| `RESPONSABLE_PRODUCTION` | Fiches techniques, plans de production, OF, validation des sorties complémentaires, affectations des ouvriers | Coûts (jamais accès aux prix) ; ouvriers et pointages en lecture, jamais leur rémunération |
+| `AGENT_PRODUCTION` | Étapes de production, pertes | **Ne voit que les OF où il figure dans `agents_affectes`** ; consulte les ouvriers, affectations et pointages |
 | `MAGASINIER` | Mouvements de stock, sorties matières, préparations de livraison, réceptions, retours fournisseurs | Fiches techniques (refusé en écriture), OF |
 | `RESPONSABLE_QUALITE` | Contrôles qualité, libération/blocage des lots | — |
 | `RESPONSABLE_ACHATS` | Fournisseurs, contrats, catalogue produits/prix, demandes d'achat (approbation), commandes fournisseurs | Réceptions et retours (partagés avec le Magasinier) |
@@ -172,6 +174,7 @@ nomme qui le pilote — point confirmé avec le client.
 | `COMPTABILITE_DAF` | Anomalies, exports comptables, clôtures, plan de comptes | Lecture transversale sur la plupart des modules |
 | `DIRECTION` | — | Tableaux de bord, coûts, journal des actions |
 | `ADMIN_SI` | Utilisateurs et tous les modules | — (accès total) |
+| `RH` | Fiches des ouvriers, rémunération, pointages (saisie et validation), affectations | — |
 
 ### Où sont codées les permissions
 
@@ -250,7 +253,7 @@ l'historique des changements de statut sur `.../{id}/historique/`.
 
 Les ouvriers travaillent aux étapes de production mais **n'ont jamais
 de compte** : ce sont de simples fiches (`/api/personnel/ouvriers/`),
-distinctes des utilisateurs.
+distinctes des utilisateurs, tenues par le **RH**.
 
 - **Permanent** ou **temporaire** : un temporaire a obligatoirement une
   date de fin de contrat. Matricule automatique (`OUV-000001`).
@@ -269,9 +272,25 @@ distinctes des utilisateurs.
   cours s'arrêtent le jour même, celles à venir sont retirées. Une fiche
   déjà affectée ne se supprime pas.
 
-Prévu ensuite : rémunération (mensuelle, hebdomadaire, journalière...),
-pointages, états de paie, écritures comptables et coût de main-d'œuvre
-par OF.
+- **Rémunération** (`/api/personnel/remunerations/`, RH ; lecture DAF et
+  Direction) : salaire mensuel fixe ou taux journalier, paie
+  hebdomadaire ou mensuelle, avec une date d'effet. Une condition déjà
+  appliquée à des pointages validés ne se modifie plus : on en crée une
+  nouvelle, les périodes passées gardent leur taux.
+- **Pointages** (`/api/personnel/pointages/`, RH) : une ligne par
+  ouvrier et par jour — présent, demi-journée ou absent (absence
+  justifiée avec motif, ou non). Le lieu de travail (étape, poste, OF)
+  est repris de l'affectation du jour ; l'OF est facultatif mais doit
+  être un OF auquel l'ouvrier est affecté.
+  - feuille du jour : `GET .../pointages/feuille/?date=AAAA-MM-JJ` ;
+  - saisie groupée d'une journée (tout ou rien) : `POST .../pointages/saisie_jour/` ;
+  - validation : `POST .../pointages/{id}/valider/` ou
+    `POST .../pointages/valider_periode/` ; un pointage validé ne change plus.
+
+Prévu ensuite : états de paie (retenue au prorata des absences non
+justifiées pour un salaire mensuel), validation par la DAF, écriture
+comptable, paiement en espèces par la caisse avec fiche d'émargement,
+coût de main-d'œuvre par OF.
 
 ---
 

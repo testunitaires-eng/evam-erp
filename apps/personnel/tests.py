@@ -1,4 +1,5 @@
 from datetime import date, timedelta
+from decimal import Decimal
 
 from django.core.exceptions import ValidationError
 from django.utils import timezone
@@ -8,12 +9,14 @@ from apps.comptes.models import Profil, Utilisateur
 from apps.core.tests import BaseValidation
 from apps.industriel.models import Activite, EtapeStandard, Ligne, Poste, Usine
 from apps.production.models import OrdreFabrication
-from apps.personnel.models import Affectation, Ouvrier
+from apps.personnel.models import Affectation, ConditionRemuneration, Ouvrier, Pointage
 
 AUJOURDHUI = timezone.localdate()
 
 
-class PersonnelTests(BaseValidation):
+class BasePersonnel(BaseValidation):
+    """Étapes, ligne, poste et utilitaires communs (aucun test ici)."""
+
     def setUp(self):
         super().setUp()
         self.remplissage = EtapeStandard.objects.get_or_create(code="REMPLISSAGE", defaults={"libelle": "Remplissage"})[0]
@@ -34,6 +37,11 @@ class PersonnelTests(BaseValidation):
         champs.setdefault("etape", self.remplissage)
         champs.setdefault("date_debut", AUJOURDHUI)
         return Affectation.objects.create(ouvrier=ouvrier, **champs)
+
+
+
+class PersonnelTests(BasePersonnel):
+    """Phase 1 : registre des ouvriers et affectations."""
 
     # -- registre -------------------------------------------------------------
     def test_creation_api_matricule_automatique_et_temporaire_sans_fin_refuse(self):
@@ -146,9 +154,111 @@ class PersonnelTests(BaseValidation):
             api.force_authenticate(Utilisateur.objects.create_user(profil.lower(), password="x", profil=profil))
             return api
         donnees = {"nom": "A", "prenom": "B", "type_contrat": "PERMANENT", "date_entree": str(AUJOURDHUI)}
-        self.assertEqual(client(Profil.RESPONSABLE_PRODUCTION).post("/api/personnel/ouvriers/", donnees, format="json").status_code, 201)
+        self.assertEqual(client(Profil.RH).post("/api/personnel/ouvriers/", donnees, format="json").status_code, 201)
+        production = client(Profil.RESPONSABLE_PRODUCTION)                           # consulte, affecte
+        self.assertEqual(production.get("/api/personnel/ouvriers/").status_code, 200)
+        self.assertEqual(production.post("/api/personnel/ouvriers/", donnees, format="json").status_code, 403)
+        ouvrier = self.ouvrier()
+        r = production.post("/api/personnel/affectations/", {"ouvrier": ouvrier.id, "etape": self.remplissage.id, "date_debut": str(AUJOURDHUI)}, format="json")
+        self.assertEqual(r.status_code, 201, r.content)
+        self.assertEqual(production.get("/api/personnel/remunerations/").status_code, 403)  # jamais les montants
+        self.assertEqual(production.get("/api/personnel/pointages/").status_code, 200)
+        self.assertEqual(production.post("/api/personnel/pointages/", {"ouvrier": ouvrier.id, "date": str(AUJOURDHUI)}, format="json").status_code, 403)
+        daf = client(Profil.COMPTABILITE_DAF)
+        self.assertEqual(daf.get("/api/personnel/remunerations/").status_code, 200)
+        self.assertEqual(daf.post("/api/personnel/remunerations/", {}, format="json").status_code, 403)
         agent = client(Profil.AGENT_PRODUCTION)
         self.assertEqual(agent.get("/api/personnel/ouvriers/").status_code, 200)
         self.assertEqual(agent.post("/api/personnel/ouvriers/", donnees, format="json").status_code, 403)
         self.assertEqual(client(Profil.MAGASINIER).get("/api/personnel/ouvriers/").status_code, 403)
         self.assertEqual(client(Profil.CAISSIER).get("/api/personnel/affectations/").status_code, 403)
+
+
+class RemunerationEtPointageTests(BasePersonnel):
+    """Phase 2 : conditions de rémunération historisées, pointages journaliers."""
+
+    def test_condition_historisee_et_figee_une_fois_appliquee(self):
+        ouvrier = self.ouvrier()
+        debut = ouvrier.date_entree
+        ancienne = ConditionRemuneration.objects.create(ouvrier=ouvrier, mode="MENSUEL", montant=90000, date_effet=debut)
+        nouvelle = ConditionRemuneration.objects.create(ouvrier=ouvrier, mode="MENSUEL", montant=100000, date_effet=AUJOURDHUI)
+        self.assertEqual(ouvrier.condition_au(AUJOURDHUI - timedelta(days=1)), ancienne)
+        self.assertEqual(ouvrier.condition_au(AUJOURDHUI), nouvelle)
+        pointage = Pointage.objects.create(ouvrier=ouvrier, date=debut + timedelta(days=1))
+        pointage.valider(self.admin)
+        ancienne.montant = 95000
+        with self.assertRaisesMessage(ValidationError, "créez une nouvelle condition"):
+            ancienne.save()
+        with self.assertRaisesMessage(ValidationError, "pointages validés"):
+            ancienne.delete()
+        nouvelle.montant = 110000                                                    # aucun pointage validé couvert
+        nouvelle.save()
+        with self.assertRaisesMessage(ValidationError, "strictement positif"):
+            ConditionRemuneration.objects.create(ouvrier=ouvrier, mode="JOURNALIER", montant=0, date_effet=AUJOURDHUI - timedelta(days=2))
+
+    def test_pointage_reprend_l_affectation_du_jour(self):
+        ouvrier = self.ouvrier()
+        self.affecter(ouvrier, poste=self.poste, etape=None, date_debut=AUJOURDHUI - timedelta(days=5))
+        pointage = Pointage.objects.create(ouvrier=ouvrier, date=AUJOURDHUI)
+        self.assertEqual((pointage.poste, pointage.etape, pointage.ordre_fabrication), (self.poste, self.remplissage, None))
+        of = OrdreFabrication.objects.create(article=self.produit, quantite_a_produire=1, responsable=self.admin, date_prevue=AUJOURDHUI - timedelta(days=1))
+        Affectation.objects.create(ouvrier=ouvrier, etape=self.remplissage, ordre_fabrication=of)
+        hier = Pointage.objects.create(ouvrier=ouvrier, date=AUJOURDHUI - timedelta(days=1))  # l'OF du jour prime
+        self.assertEqual(hier.ordre_fabrication, of)
+        absent = Pointage.objects.create(ouvrier=ouvrier, date=AUJOURDHUI - timedelta(days=2), presence="ABSENT")
+        self.assertEqual((absent.etape, absent.fraction_jour), (None, 0))
+
+    def test_regles_du_pointage(self):
+        ouvrier = self.ouvrier()
+        with self.assertRaisesMessage(ValidationError, "jour à venir"):
+            Pointage.objects.create(ouvrier=ouvrier, date=AUJOURDHUI + timedelta(days=1))
+        with self.assertRaisesMessage(ValidationError, "pas sous contrat"):
+            Pointage.objects.create(ouvrier=ouvrier, date=ouvrier.date_entree - timedelta(days=1))
+        with self.assertRaisesMessage(ValidationError, "motif de l'absence"):
+            Pointage.objects.create(ouvrier=ouvrier, date=AUJOURDHUI, presence="ABSENT", absence_justifiee=True)
+        of = OrdreFabrication.objects.create(article=self.produit, quantite_a_produire=1, responsable=self.admin)
+        with self.assertRaisesMessage(ValidationError, "n'est pas affecté à l'OF"):
+            Pointage.objects.create(ouvrier=ouvrier, date=AUJOURDHUI, ordre_fabrication=of)
+        pointage = Pointage.objects.create(ouvrier=ouvrier, date=AUJOURDHUI, presence="DEMI_JOURNEE")
+        self.assertEqual(pointage.fraction_jour, Decimal("0.5"))
+        pointage.valider(self.admin)
+        pointage.presence = "PRESENT"
+        with self.assertRaisesMessage(ValidationError, "validé"):
+            pointage.save()
+        with self.assertRaisesMessage(ValidationError, "validé"):
+            pointage.delete()
+        with self.assertRaises(ValueError):
+            pointage.valider(self.admin)
+
+    def test_feuille_saisie_du_jour_et_validation_de_periode(self):
+        a, b = self.ouvrier(), self.ouvrier()
+        self.affecter(a, poste=self.poste, etape=None)
+        feuille = self.api.get(f"/api/personnel/pointages/feuille/?date={AUJOURDHUI}").data
+        self.assertEqual({l["ouvrier"] for l in feuille["lignes"]}, {a.id, b.id})
+        ligne_a = next(l for l in feuille["lignes"] if l["ouvrier"] == a.id)
+        self.assertEqual((ligne_a["affectations"][0]["poste_code"], ligne_a["pointage"]), (self.poste.code, None))
+        # Une ligne refusée : rien n'est enregistré.
+        r = self.api.post("/api/personnel/pointages/saisie_jour/", {"date": str(AUJOURDHUI), "lignes": [
+            {"ouvrier": a.id, "presence": "PRESENT"},
+            {"ouvrier": b.id, "presence": "ABSENT", "absence_justifiee": True},
+        ]}, format="json")
+        self.assertEqual(r.status_code, 400, r.content)
+        self.assertIn(str(b.id), r.data["erreurs"])
+        self.assertFalse(Pointage.objects.exists())
+        r = self.api.post("/api/personnel/pointages/saisie_jour/", {"date": str(AUJOURDHUI), "lignes": [
+            {"ouvrier": a.id, "presence": "PRESENT"},
+            {"ouvrier": b.id, "presence": "ABSENT", "absence_justifiee": True, "motif_absence": "Maladie"},
+        ]}, format="json")
+        self.assertEqual(r.status_code, 201, r.content)
+        self.assertEqual(Pointage.objects.get(ouvrier=a).poste, self.poste)
+        r = self.api.post("/api/personnel/pointages/saisie_jour/", {"date": str(AUJOURDHUI), "lignes": [
+            {"ouvrier": b.id, "presence": "PRESENT"}]}, format="json")            # correction avant validation
+        self.assertEqual((r.status_code, Pointage.objects.get(ouvrier=b).presence), (201, "PRESENT"))
+        r = self.api.post("/api/personnel/pointages/valider_periode/", {"du": str(AUJOURDHUI), "au": str(AUJOURDHUI)}, format="json")
+        self.assertEqual(r.data["valides"], 2)
+        r = self.api.post("/api/personnel/pointages/saisie_jour/", {"date": str(AUJOURDHUI), "lignes": [
+            {"ouvrier": b.id, "presence": "ABSENT"}]}, format="json")             # validé : refusé
+        self.assertEqual(r.status_code, 400, r.content)
+        historique = self.api.get(f"/api/personnel/pointages/{Pointage.objects.get(ouvrier=a).id}/").data
+        self.assertEqual((historique["statut"], historique["valide_par"]), ("VALIDE", self.admin.id))
+

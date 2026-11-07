@@ -41,6 +41,7 @@ evam-erp/
     ├── reclamations/          <- retours clients : réclamation, retour physique, contrôle, solution
     ├── couts/                 <- coûts réels et standards, charges, clés de répartition
     ├── comptabilite/          <- écritures automatiques, plan de comptes, anomalies, exports, clôtures
+    ├── personnel/             <- ouvriers (sans accès à l'application), compétences, affectations
     └── reporting/             <- tableau de bord de la Direction
 ```
 
@@ -159,8 +160,8 @@ nomme qui le pilote — point confirmé avec le client.
 
 | Profil (identifiant technique) | Peut créer/modifier | Lecture seule sur / Restrictions |
 |---|---|---|
-| `RESPONSABLE_PRODUCTION` | Fiches techniques, plans de production, OF, validation des sorties complémentaires | Coûts (jamais accès aux prix) |
-| `AGENT_PRODUCTION` | Étapes de production, pertes | **Ne voit que les OF où il figure dans `agents_affectes`** |
+| `RESPONSABLE_PRODUCTION` | Fiches techniques, plans de production, OF, validation des sorties complémentaires, ouvriers et leurs affectations | Coûts (jamais accès aux prix) |
+| `AGENT_PRODUCTION` | Étapes de production, pertes | **Ne voit que les OF où il figure dans `agents_affectes`** ; consulte les ouvriers et affectations |
 | `MAGASINIER` | Mouvements de stock, sorties matières, préparations de livraison, réceptions, retours fournisseurs | Fiches techniques (refusé en écriture), OF |
 | `RESPONSABLE_QUALITE` | Contrôles qualité, libération/blocage des lots | — |
 | `RESPONSABLE_ACHATS` | Fournisseurs, contrats, catalogue produits/prix, demandes d'achat (approbation), commandes fournisseurs | Réceptions et retours (partagés avec le Magasinier) |
@@ -244,6 +245,33 @@ l'historique des changements de statut sur `.../{id}/historique/`.
 - **Notifications** : envoyées aux profils concernés à chaque étape
   clé (demande d'achat à approuver, réception attendue, commande à
   servir...) — `GET /api/notifications/`.
+
+### Ouvriers (module `personnel`)
+
+Les ouvriers travaillent aux étapes de production mais **n'ont jamais
+de compte** : ce sont de simples fiches (`/api/personnel/ouvriers/`),
+distinctes des utilisateurs.
+
+- **Permanent** ou **temporaire** : un temporaire a obligatoirement une
+  date de fin de contrat. Matricule automatique (`OUV-000001`).
+- **Zones de compétence** : les étapes du processus (`EtapeStandard`)
+  que l'ouvrier sait tenir. On ajoute une zone hors ligne (nettoyage,
+  magasin...) en créant l'étape correspondante dans le socle industriel.
+- **Affectations** (`/api/personnel/affectations/`) : à une étape ou un
+  poste précis pour une période, ou à l'équipe d'un OF (période reprise
+  du planning de l'OF). Contrôles : ouvrier actif, sous contrat sur
+  toute la période (un temporaire est limité à sa fin de contrat),
+  compétent pour l'étape, jamais sur deux postes en même temps ; un
+  même ouvrier peut en revanche travailler sur plusieurs OF.
+- **Ouvriers disponibles** pour une étape à une date :
+  `GET /api/personnel/ouvriers/disponibles/?etape=<id>&date=AAAA-MM-JJ`.
+- **Départ** : désactiver la fiche avec un motif ; les affectations en
+  cours s'arrêtent le jour même, celles à venir sont retirées. Une fiche
+  déjà affectée ne se supprime pas.
+
+Prévu ensuite : rémunération (mensuelle, hebdomadaire, journalière...),
+pointages, états de paie, écritures comptables et coût de main-d'œuvre
+par OF.
 
 ---
 

@@ -220,6 +220,75 @@ class UniteAchatTests(BaseValidation):
         self.assertIn("conversion", str(r.data))
 
 
+class ReceptionControleeTests(BaseValidation):
+    """Réception d'une matière suivie par lot soumise à un contrôle « À la réception »."""
+
+    def setUp(self):
+        super().setUp()
+        self.matiere.suivi_par_lot = True
+        self.matiere.save()
+        self.point = PointControle.objects.create(
+            designation="Aspect sucre", parametre=ParametreQualite.objects.get(libelle="Aspect / couleur"),
+            article=self.matiere, declencheur="RECEPTION", statut="ACTIF",
+        )
+        self.commande_f = CommandeFournisseur.objects.create(fournisseur=Fournisseur.objects.create(code="F1", nom="Sucrerie"), cree_par=self.admin)
+        self.ligne = LigneCommandeFournisseur.objects.create(commande=self.commande_f, article=self.matiere, quantite_commandee=10, prix_unitaire=500)
+        self.commande_f.envoyer()
+        self.depot = depot_par_defaut("Magasin principal")
+
+    def receptionner(self, conforme=True):
+        reception = ReceptionAchat.objects.create(commande=self.commande_f, receptionne_par=self.admin, conforme=conforme)
+        r = self.api.post("/api/achats/lignes-reception/", {
+            "reception": reception.id, "ligne_commande": self.ligne.id, "quantite_recue": 10, "lot_fournisseur": "SB-1",
+        }, format="json")
+        self.assertEqual(r.status_code, 201, r.content)
+        return LotMatiere.objects.get(lot_fournisseur="SB-1")
+
+    def test_lot_a_controler_puis_libere_au_controle_conforme(self):
+        lot = self.receptionner()
+        self.assertEqual(lot.statut, "A_CONTROLER")
+        stock = StockArticle.objects.get(article=self.matiere, depot=self.depot)
+        self.assertEqual(stock.quantite_bloquee, Decimal(10))
+        self.assertEqual(stock.quantite_disponible, 0)
+        controle = ResultatControle.objects.get(point=self.point, lot_matiere=lot)
+        controle.enregistrer(self.admin, resultat_qualitatif="CONFORME")
+        lot.refresh_from_db()
+        stock.refresh_from_db()
+        self.assertEqual(lot.statut, "LIBERE")
+        self.assertEqual(stock.quantite_bloquee, 0)
+        self.assertEqual(stock.quantite_disponible, Decimal(10))
+
+    def test_reception_non_conforme_bloque_le_lot(self):
+        lot = self.receptionner(conforme=False)
+        self.assertEqual(lot.statut, "BLOQUE")
+        self.assertFalse(ResultatControle.objects.filter(lot_matiere=lot).exists())
+        stock = StockArticle.objects.get(article=self.matiere, depot=self.depot)
+        self.assertEqual(stock.quantite_bloquee, Decimal(10))
+        self.assertEqual(stock.quantite_disponible, 0)
+
+
+class DroitsRHTests(BaseValidation):
+    def test_le_rh_lit_le_parametrage_industriel_et_les_of(self):
+        rh = Utilisateur.objects.create_user("rh", password="x", profil=Profil.RH)
+        api = APIClient()
+        api.force_authenticate(rh)
+        for url in ("/api/industriel/usines/", "/api/industriel/etapes/", "/api/industriel/postes/", "/api/production/ordres-fabrication/"):
+            self.assertEqual(api.get(url).status_code, 200, url)
+        self.assertEqual(api.post("/api/industriel/usines/", {"code": "X", "nom": "X"}, format="json").status_code, 403)
+
+
+class NumerosOFBesoinTests(BaseValidation):
+    def test_besoin_renvoie_les_numeros_d_of(self):
+        from apps.achats.models import BesoinApprovisionnement
+        of1 = OrdreFabrication.objects.create(article=self.produit, quantite_a_produire=10, responsable=self.admin)
+        of2 = OrdreFabrication.objects.create(article=self.produit, quantite_a_produire=5, responsable=self.admin)
+        besoin = BesoinApprovisionnement.objects.create(article=self.matiere, quantite_besoin=30, origine="AUTO_PRODUCTION")
+        besoin.ordres_fabrication.set([of1, of2])
+        r = self.api.get(f"/api/achats/besoins/{besoin.id}/")
+        self.assertEqual(r.status_code, 200, r.content)
+        self.assertEqual(sorted(r.data["ordres_fabrication_numeros"]), sorted([of1.numero, of2.numero]))
+
+
 class CoutChangementSerieTests(BaseValidation):
     def test_nettoyage_impute_directement_a_l_of(self):
         periode = timezone.localdate().strftime("%Y-%m")

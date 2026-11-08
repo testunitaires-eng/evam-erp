@@ -824,11 +824,12 @@ class LigneReceptionAchat(ValidationAvantEnregistrement, models.Model):
             article=article, depot=depot, lot_fournisseur=self.lot_fournisseur,
             fournisseur=commande.fournisseur, ligne_reception=self,
             date_reception=timezone.localdate(), date_peremption=self.date_peremption,
-            quantite_initiale=self.quantite_recue * self.ligne_commande.facteur_stock, statut=StatutLotMatiere.LIBERE,
+            quantite_initiale=self.quantite_recue * self.ligne_commande.facteur_stock,
+            # Créé directement avec son statut final : LIBERE -> A_CONTROLER
+            # n'est pas une transition autorisée.
+            statut=statut,
         )
         lot.save()
-        if statut != StatutLotMatiere.LIBERE:
-            lot.changer_statut(statut)
         if statut == StatutLotMatiere.A_CONTROLER:
             from apps.qualite.models import generer_controles_reception
             generer_controles_reception(lot)

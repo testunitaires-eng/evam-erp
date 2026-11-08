@@ -113,8 +113,9 @@ class OrdreFabricationViewSet(HistoriqueMixin, viewsets.ModelViewSet):
     # L'Agent Production consulte ses OF (lecture seule, filtrés ci-dessous) ;
     # seuls le Responsable Production et l'Admin SI les gèrent.
     # La DAF lit les OF pour leur rattacher une charge directe (coûts en cascade).
+    # Le RH lit les OF pour y affecter des ouvriers.
     permission_classes = [acces(
-        lecture=(Profil.AGENT_PRODUCTION, Profil.DIRECTION, Profil.RESPONSABLE_QUALITE, Profil.COMPTABILITE_DAF,),
+        lecture=(Profil.AGENT_PRODUCTION, Profil.DIRECTION, Profil.RESPONSABLE_QUALITE, Profil.COMPTABILITE_DAF, Profil.RH,),
         ecriture=(Profil.RESPONSABLE_PRODUCTION, Profil.ADMIN_SI,),
     )]
     filterset_fields = ["article", "statut", "ligne", "circuit"]

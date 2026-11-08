@@ -61,7 +61,7 @@ class ArticleFournisseurViewSet(viewsets.ModelViewSet):
 
 
 class BesoinApprovisionnementViewSet(viewsets.ModelViewSet):
-    queryset = models.BesoinApprovisionnement.objects.all()
+    queryset = models.BesoinApprovisionnement.objects.prefetch_related("ordres_fabrication")
     serializer_class = serializers.BesoinApprovisionnementSerializer
     permission_classes = [acces(
         lecture=(Profil.DIRECTION, Profil.MAGASINIER, Profil.COMPTABILITE_DAF,),

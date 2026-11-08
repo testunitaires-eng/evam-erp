@@ -15,6 +15,7 @@ from . import models, serializers
 LECTEURS = (
     Profil.RESPONSABLE_PRODUCTION, Profil.AGENT_PRODUCTION, Profil.MAGASINIER, Profil.RESPONSABLE_QUALITE,
     Profil.RESPONSABLE_ACHATS, Profil.COMPTABILITE_DAF, Profil.RESPONSABLE_DISTRIBUTION, Profil.COMMERCIAL,
+    Profil.RH,
 )
 PARAMETRAGE = acces(lecture=LECTEURS, ecriture=(Profil.ADMIN_SI, Profil.DIRECTION))
 

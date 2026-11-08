@@ -27,6 +27,11 @@ class ArticleFournisseurSerializer(ValidationModeleMixin, serializers.ModelSeria
 
 
 class BesoinApprovisionnementSerializer(ValidationModeleMixin, serializers.ModelSerializer):
+    # Le Responsable Achats n'a pas accès aux OF : on lui donne leurs numéros ici.
+    ordres_fabrication_numeros = serializers.SlugRelatedField(
+        source="ordres_fabrication", many=True, read_only=True, slug_field="numero",
+    )
+
     class Meta:
         model = models.BesoinApprovisionnement
         fields = "__all__"

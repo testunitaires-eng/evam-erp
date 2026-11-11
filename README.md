@@ -352,10 +352,36 @@ Phase 1 (paramétrage) :
   l'eau. La liste définitive est à valider avec le technicien (le
   schéma du procédé et le classeur ne décrivent pas la même chaîne).
 
-À venir : charges prévues et calcul du coût standard, saisies du
-traitement (compteurs, heures, pressions, pertes), maintenance, coût
-réel et clôture, révision du standard, puis valorisation PEPS / FIFO
-(en attente de l'avis de l'expert-comptable).
+Phase 2 (prévisionnel et coût standard, onglet « Calcul coût eau ») :
+- `/api/eau/previsions-volumes/` : bouteilles prévues par mois et par
+  format (Production ou contrôle de gestion) ; volume = bouteilles ×
+  contenance ÷ 1 000.
+- `/api/eau/previsions-captage/` : m³ captés prévus vers le site eau et
+  vers les autres sites ; donne la part du site eau dans le forage.
+- `/api/eau/elements-cout/` : une ligne de charge (étape → bloc,
+  équipement facultatif, famille, catégorie). La famille ne change plus
+  après création. `/api/eau/versions-elements-cout/` : ses valeurs à
+  partir d'un mois (quantité, prix HT, fréquence + période, ou durée de
+  vie), ou « retiré ». Une charge « au besoin » n'a jamais de valeur
+  prévue.
+- `GET /api/eau/couts-standards/calcul/?usine=<id>&mois=AAAA-MM` : le
+  calcul détaillé comme dans le classeur (volume, partage du forage,
+  coût mensuel et au m³ de chaque ligne, synthèse forage / traitement,
+  contrôle « OK »), avec les alertes (ligne non chiffrée, comptée 0) et
+  les points bloquants (pas de volume, pas de partage du forage). Les
+  montants restent exacts pendant le calcul et ne sont arrondis qu'à
+  l'affichage. Données du classeur → 823 000 FCFA/mois, 4 115 FCFA/m³.
+- `POST /api/eau/couts-standards/proposer/ {"usine", "mois_application"}`
+  enregistre le calcul comme standard **proposé** (détail conservé) ;
+  `.../{id}/valider/` ou `.../{id}/rejeter/` (motif obligatoire) par le
+  contrôle de gestion. Un standard validé s'applique à partir du mois
+  suivant (seul le premier du site peut porter sur un mois commencé),
+  puis ne se modifie ni ne se supprime ; `.../en_vigueur/?usine=&mois=`
+  donne celui qui s'applique, `.../{id}/historique/` qui a fait quoi.
+
+À venir : saisies du traitement (compteurs, heures, pressions, pertes),
+maintenance, coût réel et clôture, révision du standard, puis
+valorisation PEPS / FIFO (en attente de l'avis de l'expert-comptable).
 
 ---
 

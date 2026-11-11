@@ -5,11 +5,14 @@ from django.test import TestCase
 from rest_framework.test import APIClient
 
 from apps.comptes.models import Profil, Utilisateur
+from apps.eau.calculs import CalculImpossible, calcul_previsionnel, proposer_standard
 from apps.eau.models import (
-    Bloc, CaracteristiquesEquipement, ParametresEau, Periode, bloc_de_l_equipement, coefficient_mensuel,
-    montant_mensuel_etale, montant_mensuel_frequence, mois_courant, mois_suivant,
+    Bloc, CaracteristiquesEquipement, CoutStandardEau, ElementCout, ParametresEau, Periode, PrevisionCaptage,
+    PrevisionVolume, VersionElementCout, bloc_de_l_equipement, coefficient_mensuel, montant_mensuel_etale,
+    montant_mensuel_frequence, mois_courant, mois_suivant,
 )
 from apps.industriel.models import Activite, Equipement, EtapeStandard, Ligne, Poste, Usine
+from apps.referentiel.models import Article, FamilleArticle, FormatArticle, UniteVenteArticle
 
 CENTIME = Decimal("0.01")
 
@@ -174,3 +177,185 @@ class ApiTests(BaseEau):
             f"/api/industriel/equipements/{self.pompe_uf.pk}/", {"designation": "Pompe de l'ultrafiltration"}, format="json",
         )
         self.assertEqual(reponse.status_code, 200, reponse.content)
+
+
+# =====================================================================
+# Phase 2 - le calcul du classeur (onglet « Calcul coût eau »)
+# =====================================================================
+
+# étape, libellé, famille, catégorie, unité, quantité, prix, fréquence, période, durée, coût mensuel attendu
+CHARGES_DU_CLASSEUR = [
+    ("CAPTAGE", "Électricité pompe du forage", "COURANTE", "ELECTRICITE", "kW", 5, 100, 720, "MOIS", None, "144000.00"),
+    ("CAPTAGE", "Carburant groupe électrogène (à confirmer)", "COURANTE", "CARBURANT", "L", None, None, None, None, None, "0.00"),
+    ("CAPTAGE", "Amortissement installation du forage", "ETALEE", "AMORTISSEMENT", "lot", 1, 12000000, None, None, 120, "40000.00"),
+    ("CAPTAGE", "Entretien préventif pompe du forage", "PREVENTIVE", "MAINTENANCE_PREVENTIVE", "entretien", 1, 120000, 3, "AN", None, "12000.00"),
+    ("PREFILTRATION", "Électricité pompe d'alimentation des filtres", "COURANTE", "ELECTRICITE", "kW", 2, 100, 200, "MOIS", None, "40000.00"),
+    ("PREFILTRATION", "Sable du filtre à sable", "ETALEE", "DUREE_DE_VIE", "kg", 500, 400, None, None, 24, "8333.33"),
+    ("PREFILTRATION", "Charbon actif", "ETALEE", "DUREE_DE_VIE", "kg", 200, 3000, None, None, 12, "50000.00"),
+    ("PREFILTRATION", "Résine de l'adoucisseur", "ETALEE", "DUREE_DE_VIE", "L", 100, 5000, None, None, 60, "8333.33"),
+    ("PREFILTRATION", "Sel de régénération", "COURANTE", "CONSOMMABLE", "kg", 50, 300, 4, "MOIS", None, "60000.00"),
+    ("PREFILTRATION", "Produit de lavage des filtres", "PREVENTIVE", "MAINTENANCE_PREVENTIVE", "L", 5, 2000, 2, "MOIS", None, "20000.00"),
+    ("PREFILTRATION", "Amortissement des corps de filtres", "ETALEE", "AMORTISSEMENT", "unité", 3, 1500000, None, None, 120, "37500.00"),
+    ("ULTRAFILTRATION", "Électricité pompe de l'ultrafiltration", "COURANTE", "ELECTRICITE", "kW", 3, 100, 200, "MOIS", None, "60000.00"),
+    ("ULTRAFILTRATION", "Membrane DP1 (0,01 µ)", "ETALEE", "DUREE_DE_VIE", "unité", 1, 1000000, None, None, 48, "20833.33"),
+    ("ULTRAFILTRATION", "Membrane DP2 (0,02 µ)", "ETALEE", "DUREE_DE_VIE", "unité", 1, 1000000, None, None, 48, "20833.33"),
+    ("ULTRAFILTRATION", "Membrane DP3 (0,1 µ)", "ETALEE", "DUREE_DE_VIE", "unité", 1, 1000000, None, None, 48, "20833.33"),
+    ("ULTRAFILTRATION", "Amortissement module d'ultrafiltration", "ETALEE", "AMORTISSEMENT", "lot", 1, 6000000, None, None, 120, "50000.00"),
+    ("CUVES_EAU", "Nettoyage de la cuve eau traitée", "PREVENTIVE", "MAINTENANCE_PREVENTIVE", "L", 10, 3000, 4, "AN", None, "10000.00"),
+    ("CUVES_EAU", "Amortissement cuves eau brute et eau traitée", "ETALEE", "AMORTISSEMENT", "unité", 2, 2400000, None, None, 120, "40000.00"),
+    ("UV", "Électricité lampe(s) UV", "COURANTE", "ELECTRICITE", "kW", Decimal("0.1"), 100, 200, "MOIS", None, "2000.00"),
+    ("UV", "Lampe(s) UV", "ETALEE", "DUREE_DE_VIE", "unité", 2, 120000, None, None, 12, "20000.00"),
+    ("UV", "Gaine quartz", "ETALEE", "DUREE_DE_VIE", "unité", 2, 60000, None, None, 24, "5000.00"),
+    ("UV", "Amortissement réacteur UV", "ETALEE", "AMORTISSEMENT", "unité", 1, 1200000, None, None, 120, "10000.00"),
+    ("CONTROLE_QUALITE_EAU", "Analyses par laboratoire externe", "COURANTE", "ANALYSE", "analyse", 1, 50000, 2, "MOIS", None, "100000.00"),
+    ("CONTROLE_QUALITE_EAU", "Kits de contrôle interne", "COURANTE", "ANALYSE", "kit", 1, 10000, 1, "SEMAINE", None, "43333.33"),
+    # Une charge au besoin existe pour le réel mais n'entre jamais dans le prévisionnel.
+    ("ULTRAFILTRATION", "Réparation pompe de l'ultrafiltration", "AU_BESOIN", "MAINTENANCE_AU_BESOIN", "", None, None, None, None, None, "0.00"),
+]
+
+
+class BaseClasseur(BaseEau):
+    """Toutes les données de test de l'onglet « Calcul coût eau », applicables depuis le mois dernier."""
+
+    def setUp(self):
+        super().setUp()
+        self.formats = {}
+        for nom, contenance, bouteilles in (("150 cl", "1.5", 100000), ("50 cl", "0.5", 60000), ("500 cl", "5", 4000)):
+            article = Article.objects.create(
+                type_article="PRODUIT_FINI", unite_mesure="UNITE", famille=FamilleArticle.objects.get_or_create(nom="Eau")[0],
+                format=FormatArticle.objects.get_or_create(valeur=nom)[0],
+                unite_vente=UniteVenteArticle.objects.get_or_create(nom="Pack de 6")[0],
+                contenance=Decimal(contenance), unite_contenance="L",
+            )
+            self.formats[nom] = article
+            PrevisionVolume.objects.create(usine=self.usine, article=article, mois_application=self.passe, bouteilles_par_mois=bouteilles)
+        PrevisionCaptage.objects.create(usine=self.usine, mois_application=self.passe, volume_site_eau_m3=220, volume_autres_sites_m3=330)
+        self.elements = {}
+        for ordre, (etape, libelle, famille, categorie, unite, quantite, prix, frequence, periode, duree, _) in enumerate(CHARGES_DU_CLASSEUR):
+            element = ElementCout.objects.create(
+                usine=self.usine, libelle=libelle, etape=EtapeStandard.objects.get(code=etape), famille=famille,
+                categorie=categorie, unite=unite, ordre=ordre,
+            )
+            self.elements[libelle] = element
+            if quantite is not None:
+                VersionElementCout.objects.create(
+                    element=element, mois_application=self.passe, quantite=quantite, prix_unitaire=prix,
+                    frequence=frequence, periode=periode or "", duree_vie_mois=duree,
+                )
+
+
+class CalculClasseurTests(BaseClasseur):
+
+    def test_le_calcul_retrouve_exactement_le_classeur(self):
+        calcul = calcul_previsionnel(self.usine, self.courant)
+        self.assertEqual(calcul["volume"]["total_m3"], "200")
+        self.assertEqual(calcul["partage_forage"]["part_site_eau"], "0.4")
+        attendus = {ligne[1]: ligne[-1] for ligne in CHARGES_DU_CLASSEUR}
+        self.assertEqual({ligne["libelle"]: ligne["cout_mensuel"] for ligne in calcul["charges"]}, attendus)
+        self.assertEqual(calcul["synthese"], {
+            "cout_forage": "196000.00", "cout_forage_m3": "980.00",
+            "cout_traitement": "627000.00", "cout_traitement_m3": "3135.00",
+            "cout_mensuel": "823000.00", "cout_m3": "4115.00", "cout_litre": "4.115", "controle": "OK",
+        })
+        self.assertEqual(calcul["bloquants"], [])
+        self.assertEqual(calcul["alertes"], ["« Carburant groupe électrogène (à confirmer) » n'est pas chiffré pour ce mois : compté 0."])
+        ligne = next(l for l in calcul["charges"] if l["libelle"] == "Électricité pompe du forage")
+        self.assertEqual((ligne["bloc"], ligne["part_site"], ligne["cout_m3"]), ("FORAGE", "0.4", "720.00"))
+
+    def test_une_modification_ne_change_que_les_mois_suivants(self):
+        kits = self.elements["Kits de contrôle interne"]
+        VersionElementCout.objects.create(element=kits, mois_application=self.suivant, quantite=1, prix_unitaire=12000, frequence=1, periode="SEMAINE")
+        gaine = self.elements["Gaine quartz"]
+        VersionElementCout.objects.create(element=gaine, mois_application=self.suivant, retire=True)
+        self.assertEqual(calcul_previsionnel(self.usine, self.courant)["synthese"]["cout_mensuel"], "823000.00")
+        suivant = calcul_previsionnel(self.usine, self.suivant)
+        # kits : 12 000 x 52 / 12 = 52 000 (au lieu de 43 333,33) ; gaine retirée (- 5 000).
+        self.assertEqual(suivant["synthese"]["cout_mensuel"], "826666.67")
+        self.assertNotIn("Gaine quartz", [l["libelle"] for l in suivant["charges"]])
+        # Le partage du forage change aussi au mois suivant seulement.
+        PrevisionCaptage.objects.create(usine=self.usine, mois_application=self.suivant, volume_site_eau_m3=250, volume_autres_sites_m3=250)
+        self.assertEqual(calcul_previsionnel(self.usine, self.courant)["synthese"]["cout_forage"], "196000.00")
+        self.assertEqual(calcul_previsionnel(self.usine, self.suivant)["synthese"]["cout_forage"], "245000.00")
+
+    def test_calcul_impossible_sans_volume_ou_sans_partage_du_forage(self):
+        autre = Usine.objects.create(nom="Site sans prévision")
+        self.assertTrue(calcul_previsionnel(autre, self.courant)["bloquants"])
+        PrevisionCaptage.objects.all().delete()
+        calcul = calcul_previsionnel(self.usine, self.courant)
+        self.assertEqual(len(calcul["bloquants"]), 1)
+        with self.assertRaises(CalculImpossible):
+            proposer_standard(self.usine, self.courant)
+
+    def test_valeurs_attendues_selon_la_famille(self):
+        cas = [
+            ("Charbon actif", {"quantite": 200, "prix_unitaire": 3000}),                                       # étalée sans durée
+            ("Charbon actif", {"quantite": 200, "prix_unitaire": 3000, "duree_vie_mois": 12, "periode": "MOIS"}),
+            ("Sel de régénération", {"quantite": 50, "prix_unitaire": 300, "frequence": 4}),                    # sans période
+            ("Sel de régénération", {"quantite": 50, "prix_unitaire": 300, "frequence": 4, "periode": "MOIS", "duree_vie_mois": 3}),
+            ("Réparation pompe de l'ultrafiltration", {"quantite": 1, "prix_unitaire": 300000}),                 # au besoin : jamais prévu
+        ]
+        for libelle, champs in cas:
+            with self.assertRaises(ValidationError, msg=libelle):
+                VersionElementCout.objects.create(element=self.elements[libelle], mois_application=self.suivant, **champs)
+
+    def test_element_hors_coût_de_l_eau_et_famille_figee(self):
+        with self.assertRaises(ValidationError):
+            ElementCout.objects.create(usine=self.usine, libelle="Électricité soutireuse", etape=self.poste_remplissage.etape,
+                                       famille="COURANTE", categorie="ELECTRICITE")
+        with self.assertRaises(ValidationError):   # pompe du forage rattachée à une étape du traitement
+            ElementCout.objects.create(usine=self.usine, libelle="X", etape=EtapeStandard.objects.get(code="UV"),
+                                       equipement=self.pompe_forage, famille="COURANTE", categorie="ELECTRICITE")
+        sel = self.elements["Sel de régénération"]
+        sel.famille = "ETALEE"
+        with self.assertRaises(ValidationError):
+            sel.save()
+
+    def test_prevision_de_volume_sur_un_vrai_format(self):
+        matiere = Article.objects.create(code="SEL", type_article="MATIERE_PREMIERE", unite_mesure="KG")
+        with self.assertRaises(ValidationError):
+            PrevisionVolume.objects.create(usine=self.usine, article=matiere, mois_application=self.passe, bouteilles_par_mois=10)
+
+
+class CoutStandardTests(BaseClasseur):
+    """Le logiciel propose, le contrôle de gestion valide ; chaque version est historisée."""
+
+    def test_proposer_valider_et_standard_en_vigueur(self):
+        controle = self.client_pour(Profil.CONTROLE_GESTION)
+        reponse = controle.post("/api/eau/couts-standards/proposer/", {"usine": self.usine.pk, "mois_application": self.passe}, format="json")
+        self.assertEqual(reponse.status_code, 201, reponse.content)
+        self.assertEqual((reponse.data["cout_m3"], reponse.data["statut"], reponse.data["cout_litre"]), ("4115.0000", "PROPOSE", "4.1150000"))
+        self.assertEqual(reponse.data["detail"]["synthese"]["cout_mensuel"], "823000.00")
+        premier = reponse.data["id"]
+        # Rien ne s'applique tant que ce n'est pas validé.
+        self.assertIsNone(controle.get(f"/api/eau/couts-standards/en_vigueur/?usine={self.usine.pk}").data)
+        self.assertEqual(controle.post(f"/api/eau/couts-standards/{premier}/valider/").status_code, 200)
+        en_vigueur = controle.get(f"/api/eau/couts-standards/en_vigueur/?usine={self.usine.pk}&mois={self.courant}").data
+        self.assertEqual((en_vigueur["id"], en_vigueur["valide_par_nom"]), (premier, "controle_gestion"))
+        historique = controle.get(f"/api/eau/couts-standards/{premier}/historique/").data
+        self.assertEqual(len(historique), 2)
+        # Un standard validé ne bouge plus.
+        standard = CoutStandardEau.objects.get(pk=premier)
+        with self.assertRaises(ValidationError):
+            standard.delete()
+        # Le suivant s'applique au plus tôt le mois prochain (règle 14).
+        refuse = controle.post("/api/eau/couts-standards/proposer/", {"usine": self.usine.pk, "mois_application": self.courant}, format="json").data
+        self.assertEqual(controle.post(f"/api/eau/couts-standards/{refuse['id']}/valider/").status_code, 400)
+        self.assertEqual(controle.post(f"/api/eau/couts-standards/{refuse['id']}/rejeter/").status_code, 400)   # motif obligatoire
+        self.assertEqual(controle.post(f"/api/eau/couts-standards/{refuse['id']}/rejeter/", {"motif": "Mois en cours"}, format="json").status_code, 200)
+        suivant = controle.post("/api/eau/couts-standards/proposer/", {"usine": self.usine.pk, "mois_application": self.suivant}, format="json").data
+        self.assertEqual(controle.post(f"/api/eau/couts-standards/{suivant['id']}/valider/").status_code, 200)
+        self.assertEqual(controle.get(f"/api/eau/couts-standards/en_vigueur/?usine={self.usine.pk}&mois={self.courant}").data["id"], premier)
+        self.assertEqual(controle.get(f"/api/eau/couts-standards/en_vigueur/?usine={self.usine.pk}&mois={self.suivant}").data["id"], suivant["id"])
+
+    def test_droits_sur_le_calcul(self):
+        url = f"/api/eau/couts-standards/calcul/?usine={self.usine.pk}&mois={self.courant}"
+        self.assertEqual(self.client_pour(Profil.TECHNICIEN_EAU).get(url).status_code, 403)
+        lecture = self.client_pour(Profil.COMPTABILITE_DAF)
+        self.assertEqual(lecture.get(url).data["synthese"]["cout_m3"], "4115.00")
+        self.assertEqual(lecture.post("/api/eau/couts-standards/proposer/", {"usine": self.usine.pk, "mois_application": self.passe}, format="json").status_code, 403)
+        production = self.client_pour(Profil.RESPONSABLE_PRODUCTION)
+        reponse = production.post("/api/eau/previsions-volumes/", {
+            "usine": self.usine.pk, "article": self.formats["50 cl"].pk, "mois_application": self.suivant, "bouteilles_par_mois": 70000,
+        }, format="json")
+        self.assertEqual(reponse.status_code, 201, reponse.content)
+        self.assertEqual(reponse.data["volume_m3"], "35.000")

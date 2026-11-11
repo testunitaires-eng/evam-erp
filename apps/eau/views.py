@@ -12,7 +12,8 @@ from rest_framework.response import Response
 
 from apps.comptes.models import Profil
 from apps.comptes.permissions import acces
-from . import models, serializers
+from apps.core.views import HistoriqueMixin
+from . import calculs, models, serializers
 
 CONSULTATION = (Profil.DIRECTION, Profil.COMPTABILITE_DAF, Profil.ADMIN_SI)
 PARAMETRES = acces(lecture=CONSULTATION, ecriture=(Profil.CONTROLE_GESTION,))
@@ -98,3 +99,99 @@ def listes(request):
             for periode, (numerateur, denominateur) in models.COEFFICIENTS_PERIODES.items()
         ],
     })
+
+
+# =====================================================================
+# Phase 2 - prévisionnel et coût standard
+# =====================================================================
+
+class PrevisionVolumeViewSet(VersionneeViewSet):
+    """Bouteilles prévues par format (saisies par la Production ou le contrôle de gestion)."""
+    queryset = models.PrevisionVolume.objects.select_related("article", "usine", "saisi_par")
+    serializer_class = serializers.PrevisionVolumeSerializer
+    permission_classes = [acces(lecture=CONSULTATION, ecriture=(Profil.CONTROLE_GESTION, Profil.RESPONSABLE_PRODUCTION))]
+    filterset_fields = ["usine", "article", "mois_application"]
+
+
+class PrevisionCaptageViewSet(VersionneeViewSet):
+    queryset = models.PrevisionCaptage.objects.select_related("usine", "saisi_par")
+    serializer_class = serializers.PrevisionCaptageSerializer
+    permission_classes = [PARAMETRES]
+    filterset_fields = ["usine", "mois_application"]
+
+
+class ElementCoutViewSet(viewsets.ModelViewSet):
+    queryset = models.ElementCout.objects.select_related("etape__sous_etape_de", "equipement", "usine")
+    serializer_class = serializers.ElementCoutSerializer
+    permission_classes = [PARAMETRES]
+    filterset_fields = ["usine", "etape", "equipement", "famille", "categorie"]
+    search_fields = ["libelle"]
+
+
+class VersionElementCoutViewSet(VersionneeViewSet):
+    queryset = models.VersionElementCout.objects.select_related("element", "saisi_par")
+    serializer_class = serializers.VersionElementCoutSerializer
+    permission_classes = [PARAMETRES]
+    filterset_fields = ["element", "element__usine", "mois_application"]
+
+
+class CoutStandardEauViewSet(HistoriqueMixin, viewsets.ReadOnlyModelViewSet):
+    """
+    Versions du coût standard de l'eau. Le logiciel calcule et propose,
+    le contrôle de gestion valide ou rejette ; rien ne change seul.
+    """
+    queryset = models.CoutStandardEau.objects.select_related("usine", "propose_par", "valide_par")
+    serializer_class = serializers.CoutStandardEauSerializer
+    permission_classes = [PARAMETRES]
+    filterset_fields = ["usine", "statut", "origine", "mois_application"]
+
+    def _usine(self, valeur):
+        from apps.industriel.models import Usine
+        return Usine.objects.filter(pk=valeur).first() if str(valeur or "").isdigit() else None
+
+    @action(detail=False, methods=["get"])
+    def calcul(self, request):
+        """GET .../couts-standards/calcul/?usine=<id>&mois=AAAA-MM : le calcul prévisionnel détaillé (rien n'est enregistré)."""
+        usine, mois = self._usine(request.query_params.get("usine")), _mois_demande(request)
+        if usine is None or mois is None:
+            return Response({"erreur": "Paramètres attendus : usine=<id> et mois=AAAA-MM."}, status=400)
+        return Response(calculs.sans_valeurs_exactes(calculs.calcul_previsionnel(usine, mois)))
+
+    @action(detail=False, methods=["post"])
+    def proposer(self, request):
+        """POST .../couts-standards/proposer/ {"usine", "mois_application"} : enregistre le prévisionnel comme standard proposé."""
+        usine, mois = self._usine(request.data.get("usine")), request.data.get("mois_application") or ""
+        if usine is None or not models.FORMAT_MOIS.fullmatch(mois):
+            return Response({"erreur": "Paramètres attendus : usine=<id> et mois_application=AAAA-MM."}, status=400)
+        try:
+            standard = calculs.proposer_standard(usine, mois, request.user)
+        except ValueError as erreur:
+            return Response({"erreur": str(erreur)}, status=400)
+        return Response(self.get_serializer(standard).data, status=201)
+
+    @action(detail=True, methods=["post"])
+    def valider(self, request, pk=None):
+        standard = self.get_object()
+        try:
+            standard.valider(request.user, request.data.get("motif", ""))
+        except ValueError as erreur:
+            return Response({"erreur": str(erreur)}, status=400)
+        return Response(self.get_serializer(standard).data)
+
+    @action(detail=True, methods=["post"])
+    def rejeter(self, request, pk=None):
+        standard = self.get_object()
+        try:
+            standard.rejeter(request.user, request.data.get("motif", ""))
+        except ValueError as erreur:
+            return Response({"erreur": str(erreur)}, status=400)
+        return Response(self.get_serializer(standard).data)
+
+    @action(detail=False, methods=["get"])
+    def en_vigueur(self, request):
+        """GET .../couts-standards/en_vigueur/?usine=<id>&mois=AAAA-MM : le standard validé qui s'applique ce mois."""
+        mois = _mois_demande(request)
+        if mois is None:
+            return Response({"erreur": "Le mois doit être au format AAAA-MM."}, status=400)
+        standard = models.CoutStandardEau.en_vigueur(mois, usine_id=request.query_params.get("usine"))
+        return Response(self.get_serializer(standard).data if standard else None)

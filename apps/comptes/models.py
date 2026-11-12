@@ -16,9 +16,10 @@ from django.db import models
 
 class Profil(models.TextChoices):
     """
-    Les 13 acteurs de l'application : 11 issus du cahier des charges,
+    Les 15 acteurs de l'application : 11 issus du cahier des charges,
     + Responsable Achat (le document décrit un module Achats complet -
-    §6 - sans jamais nommer qui le pilote), + RH (module personnel).
+    §6 - sans jamais nommer qui le pilote), + RH (module personnel),
+    + Contrôle de gestion et Technicien eau (coût de l'eau traitée).
     Un utilisateur a un seul profil principal.
     """
     RESPONSABLE_PRODUCTION = "RESPONSABLE_PRODUCTION", "Responsable Production"
@@ -36,6 +37,12 @@ class Profil(models.TextChoices):
     # Ajouté avec le module personnel : tient les fiches des ouvriers,
     # leur rémunération et leurs pointages, prépare les états de paie.
     RH = "RH", "Ressources humaines"
+    # Ajoutés avec le module « coût de l'eau » (classeur EVAM, onglet
+    # « Rôles et droits ») : le contrôle de gestion paramètre, impute et
+    # valide le coût standard ; les techniciens saisissent les données
+    # techniques du traitement de l'eau sans jamais voir les coûts.
+    CONTROLE_GESTION = "CONTROLE_GESTION", "Contrôle de gestion"
+    TECHNICIEN_EAU = "TECHNICIEN_EAU", "Technicien traitement de l'eau"
 
 
 class Utilisateur(AbstractUser):
@@ -106,6 +113,7 @@ class Module(models.TextChoices):
     DISTRIBUTION = "DISTRIBUTION", "Distribution / Logistique"
     COUTS = "COUTS", "Coûts & Rentabilité"
     COMPTABILITE = "COMPTABILITE", "Pilotage / Comptabilité"
+    EAU = "EAU", "Coût de l'eau traitée"
     ADMINISTRATION = "ADMINISTRATION", "Administration / Droits"
 
 

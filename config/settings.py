@@ -58,6 +58,7 @@ INSTALLED_APPS = [
     "apps.couts",          # Module 10 - Coûts standards/réels, rentabilité
     "apps.comptabilite",   # Module 11 - Pilotage, anomalies, exports comptables
     "apps.personnel",      # Ouvriers (sans accès à l'application), compétences, affectations
+    "apps.eau",            # Coût de l'eau traitée (site eau) : paramétrage, coût standard
 ]
 
 MIDDLEWARE = [

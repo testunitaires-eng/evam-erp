@@ -25,7 +25,7 @@ evam-erp/
 └── apps/                      <- une application Django par module métier
     ├── core/                  <- transverse : numérotation, historique, notifications,
     │                             PDF, exports, paramètres de l'entreprise, pagination
-    ├── comptes/               <- utilisateurs, 13 profils, permissions, journal des actions
+    ├── comptes/               <- utilisateurs, 15 profils, permissions, journal des actions
     ├── industriel/            <- socle : activités, usines, lignes, postes, équipements, circuits
     ├── referentiel/           <- articles, familles, formats, fiches techniques, conversions d'unités
     ├── fiscalite/             <- matrice fiscale par produit, préparation de la facture normalisée (SFEC)
@@ -43,6 +43,8 @@ evam-erp/
     ├── comptabilite/          <- écritures automatiques, plan de comptes, anomalies, exports, clôtures
     ├── personnel/             <- ouvriers (sans accès à l'application), compétences, affectations,
     │                             rémunération, pointages, paie
+    ├── eau/                   <- coût de l'eau traitée du site eau (paramétrage versionné,
+    │                             puis coût standard, réel et révision - en cours)
     └── reporting/             <- tableau de bord de la Direction
 ```
 
@@ -93,7 +95,7 @@ python manage.py initialiser_referentiel_valeurs    # familles, formats, parfums
 python manage.py createsuperuser
 
 # 8. (optionnel) Créer un compte de démonstration par profil métier
-#    (13 comptes, identifiant = nom du profil en minuscules,
+#    (15 comptes, identifiant = nom du profil en minuscules,
 #    mot de passe "Demo1234!" pour tous)
 python manage.py creer_comptes_demo
 
@@ -152,13 +154,15 @@ change avec `?ordering=<champ>`.
 
 ---
 
-## 4. Les 13 profils et leurs droits
+## 4. Les 15 profils et leurs droits
 
 Chaque utilisateur a **un seul profil** (`Utilisateur.profil`). Le
-cahier des charges décrit 11 acteurs ; deux ont été ajoutés : le
+cahier des charges décrit 11 acteurs ; quatre ont été ajoutés : le
 **Responsable Achat** (le module Achats est détaillé sans que le
-document ne nomme qui le pilote — point confirmé avec le client) et le
-**RH** (module personnel).
+document ne nomme qui le pilote — point confirmé avec le client), le
+**RH** (module personnel), le **Contrôle de gestion** et le
+**Technicien eau** (coût de l'eau, onglet « Rôles et droits » du
+classeur EVAM).
 
 | Profil (identifiant technique) | Peut créer/modifier | Lecture seule sur / Restrictions |
 |---|---|---|
@@ -175,6 +179,8 @@ document ne nomme qui le pilote — point confirmé avec le client) et le
 | `DIRECTION` | — | Tableaux de bord, coûts, journal des actions |
 | `ADMIN_SI` | Utilisateurs et tous les modules | — (accès total) |
 | `RH` | Fiches des ouvriers, rémunération, pointages (saisie et validation), affectations, préparation de la paie | — |
+| `CONTROLE_GESTION` | Seul profil qui crée et modifie les paramètres du coût de l'eau ; paramétrage industriel (étapes, équipements) | — |
+| `TECHNICIEN_EAU` | (saisies techniques du traitement de l'eau : phases suivantes) | Socle industriel, puissance et heures des équipements ; **jamais les coûts ni les seuils** |
 
 ### Où sont codées les permissions
 
@@ -311,6 +317,100 @@ distinctes des utilisateurs, tenues par le **RH**.
      D 422 / C 571 ;
   4. fiche d'émargement à faire signer :
      `GET .../etats-paie/emargement/?date_debut=…&date_fin=…` (PDF).
+
+### Coût de l'eau traitée (module `eau`)
+
+Référence : le classeur `EVAM_cout_standard_eau_TEST.xlsx` (valeurs de
+test que le logiciel doit retrouver exactement). Ne concerne que le
+produit Eau : Jus et Yaourt gardent la cascade de `apps/couts`.
+Principes retenus : les charges du forage (part du site eau) et du
+traitement forment le coût de l'eau du mois, et les OF sont valorisés
+au volume d'eau × coût standard au m³ ; **aucun effet rétroactif**.
+
+Phase 1 (paramétrage) :
+- **Paramètres versionnés** : chaque modification est une nouvelle
+  version avec un mois d'application (`AAAA-MM`). La première version
+  peut porter sur un mois passé (paramétrage initial) et reste
+  corrigeable tant qu'elle est seule ; toute nouvelle version
+  s'applique au plus tôt le mois suivant ; une version dont le mois a
+  commencé est alors figée. `.../en_vigueur/?mois=AAAA-MM` donne la
+  version qui s'applique.
+- `/api/eau/parametres/` : seuil d'écart du standard (5 %), seuil de
+  volume minimal (50 %), taux de rejet toléré, seuil de « grosse
+  réparation », jour de clôture du mois — par site.
+- `/api/eau/caracteristiques-equipements/` : puissance (kW) et heures
+  de marche standard par jour de chaque équipement du site (y compris
+  la ligne de production, pour répartir la facture d'électricité). Le
+  bloc **Forage** ou **Traitement** se déduit de l'étape du poste de
+  l'équipement (captage → forage ; autres étapes amont → traitement).
+- `/api/eau/listes/` : blocs, familles (Courante, Étalée, Préventive,
+  Au besoin, avec leur formule), catégories et périodes avec leur
+  coefficient mensuel gardé en fraction (jour 365/12, semaine 52/12,
+  mois 1, an 1/12) pour retrouver les montants du classeur au centime.
+- Étapes ajoutées sous « Traitement de l'eau » : Préfiltration,
+  Ultrafiltration, Cuves d'eau brute et traitée, Contrôle qualité de
+  l'eau. La liste définitive est à valider avec le technicien (le
+  schéma du procédé et le classeur ne décrivent pas la même chaîne).
+
+Phase 2 (prévisionnel et coût standard, onglet « Calcul coût eau ») :
+- `/api/eau/previsions-volumes/` : bouteilles prévues par mois et par
+  format (Production ou contrôle de gestion) ; volume = bouteilles ×
+  contenance ÷ 1 000.
+- `/api/eau/previsions-captage/` : m³ captés prévus vers le site eau et
+  vers les autres sites ; donne la part du site eau dans le forage.
+- `/api/eau/elements-cout/` : une ligne de charge (étape → bloc,
+  équipement facultatif, famille, catégorie). La famille ne change plus
+  après création. `/api/eau/versions-elements-cout/` : ses valeurs à
+  partir d'un mois (quantité, prix HT, fréquence + période, ou durée de
+  vie), ou « retiré ». Une charge « au besoin » n'a jamais de valeur
+  prévue.
+- `GET /api/eau/couts-standards/calcul/?usine=<id>&mois=AAAA-MM` : le
+  calcul détaillé comme dans le classeur (volume, partage du forage,
+  coût mensuel et au m³ de chaque ligne, synthèse forage / traitement,
+  contrôle « OK »), avec les alertes (ligne non chiffrée, comptée 0) et
+  les points bloquants (pas de volume, pas de partage du forage). Les
+  montants restent exacts pendant le calcul et ne sont arrondis qu'à
+  l'affichage. Données du classeur → 823 000 FCFA/mois, 4 115 FCFA/m³.
+- `POST /api/eau/couts-standards/proposer/ {"usine", "mois_application"}`
+  enregistre le calcul comme standard **proposé** (détail conservé) ;
+  `.../{id}/valider/` ou `.../{id}/rejeter/` (motif obligatoire) par le
+  contrôle de gestion. Un standard validé s'applique à partir du mois
+  suivant (seul le premier du site peut porter sur un mois commencé),
+  puis ne se modifie ni ne se supprime ; `.../en_vigueur/?usine=&mois=`
+  donne celui qui s'applique, `.../{id}/historique/` qui a fait quoi.
+
+Phase 3 (module « Traitement de l'eau » : saisies des techniciens, sans
+aucun coût) :
+- `/api/eau/compteurs/` : le compteur du forage (eau captée au total)
+  et un débitmètre par site desservi. `/api/eau/releves-compteurs/` :
+  un index par compteur et par jour ; un index ne baisse jamais.
+- `/api/eau/exceptions-heures/` : heures en moins un jour donné (arrêt,
+  panne, ligne à l'arrêt...) pour un équipement ou une **ligne entière**.
+  Les heures standard (caractéristiques de l'équipement : heures par
+  jour + jours de marche — tous les jours, lundi-samedi ou
+  lundi-vendredi) sont reportées automatiquement chaque jour. La
+  Production saisit aussi les exceptions de ses machines.
+- `/api/eau/releves-pression/` : pression d'une membrane ; au-delà de la
+  pression maximale de l'équipement, les techniciens reçoivent une
+  notification immédiate.
+- `/api/eau/pertes/` : volume estimé ou bouteilles d'un format ; le type
+  (normale / anormale) découle de la cause (rinçage, lavages, CIP,
+  rejets UF = normales ; fuite, débordement, lot rejeté, casse =
+  anormales ; « Autre » : à choisir, avec un commentaire). Saisie par
+  les techniciens et la Production.
+- `GET /api/eau/traitement/synthese/?usine=<id>&mois=AAAA-MM` : volume
+  de chaque compteur (dernier index du mois − dernier index du mois
+  précédent), part réelle du site eau dans le forage, écart entre le
+  compteur du forage et les débitmètres, heures machine par équipement
+  (standard − exceptions, jusqu'à aujourd'hui pour le mois en cours)
+  avec kW × heures, pertes normales et anormales du mois.
+
+Les contrôles qualité restent dans le module `qualite` et les
+consommations dans `stocks` : leur rattachement au coût de l'eau se fera
+avec le coût réel.
+
+À venir : maintenance, coût réel et clôture, révision du standard, puis
+valorisation PEPS / FIFO (en attente de l'avis de l'expert-comptable).
 
 ---
 

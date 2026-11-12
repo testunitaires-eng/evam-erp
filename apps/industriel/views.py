@@ -15,9 +15,11 @@ from . import models, serializers
 LECTEURS = (
     Profil.RESPONSABLE_PRODUCTION, Profil.AGENT_PRODUCTION, Profil.MAGASINIER, Profil.RESPONSABLE_QUALITE,
     Profil.RESPONSABLE_ACHATS, Profil.COMPTABILITE_DAF, Profil.RESPONSABLE_DISTRIBUTION, Profil.COMMERCIAL,
-    Profil.RH,
+    Profil.RH, Profil.TECHNICIEN_EAU,
 )
-PARAMETRAGE = acces(lecture=LECTEURS, ecriture=(Profil.ADMIN_SI, Profil.DIRECTION))
+# Le contrôle de gestion crée et modifie les paramètres (dont les
+# équipements et les étapes du traitement de l'eau).
+PARAMETRAGE = acces(lecture=LECTEURS, ecriture=(Profil.ADMIN_SI, Profil.DIRECTION, Profil.CONTROLE_GESTION))
 
 
 class ActiviteViewSet(viewsets.ModelViewSet):

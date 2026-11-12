@@ -170,3 +170,35 @@ class InstallationSerializer(SaisieSerializer):
     def get_montant_etale_mensuel(self, lot):
         """Étalement du lot à son mois d'installation (prix x quantité ÷ durée de vie)."""
         return str(models.montant_mensuel_etale(lot.quantite, lot.prix_unitaire, lot.duree_vie_mois).quantize(Decimal("0.01")))
+
+
+# Phase 5 - coût réel et clôture
+
+class ValidationSansImputationSerializer(ValidationModeleMixin, serializers.ModelSerializer):
+    element_libelle = serializers.CharField(source="element.libelle", read_only=True)
+    valide_par_nom = serializers.CharField(source="valide_par.username", read_only=True, default=None)
+
+    class Meta:
+        model = models.ValidationSansImputation
+        fields = "__all__"
+        read_only_fields = ["valide_par", "date_validation"]
+
+
+class ClotureMoisEauSerializer(serializers.ModelSerializer):
+    usine_code = serializers.CharField(source="usine.code", read_only=True)
+    cloture_par_nom = serializers.CharField(source="cloture_par.username", read_only=True, default=None)
+
+    class Meta:
+        model = models.ClotureMoisEau
+        fields = "__all__"
+        read_only_fields = [champ.name for champ in models.ClotureMoisEau._meta.fields]
+
+
+class ValorisationEauOFSerializer(serializers.ModelSerializer):
+    of_numero = serializers.CharField(source="ordre_fabrication.numero", read_only=True)
+    mois = serializers.CharField(source="cloture.mois", read_only=True)
+    montant_total = serializers.DecimalField(max_digits=16, decimal_places=2, read_only=True)
+
+    class Meta:
+        model = models.ValorisationEauOF
+        fields = "__all__"

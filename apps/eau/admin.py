@@ -111,3 +111,27 @@ class InstallationAdmin(admin.ModelAdmin):
 class AlerteEnvoyeeAdmin(admin.ModelAdmin):
     list_display = ("cle", "date")
     search_fields = ("cle",)
+
+
+@admin.register(models.ValidationSansImputation)
+class ValidationSansImputationAdmin(admin.ModelAdmin):
+    list_display = ("element", "mois", "motif", "valide_par")
+    list_filter = ("element__usine", "mois")
+    readonly_fields = ("valide_par", "date_validation")
+
+
+@admin.register(models.ClotureMoisEau)
+class ClotureMoisEauAdmin(admin.ModelAdmin):
+    list_display = ("usine", "mois", "volume_m3", "cout_reel_total", "cout_m3", "cout_standard_m3", "ecart", "decision", "cloture_par")
+    list_filter = ("usine",)
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+
+@admin.register(models.ValorisationEauOF)
+class ValorisationEauOFAdmin(admin.ModelAdmin):
+    list_display = ("ordre_fabrication", "cloture", "volume_m3", "cout_standard_m3", "montant_eau", "electricite_production")
+
+    def has_change_permission(self, request, obj=None):
+        return False

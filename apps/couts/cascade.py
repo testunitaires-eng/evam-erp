@@ -836,7 +836,10 @@ def cout_revient(periode):
         unites = article.en_unites(quantite)
         packs = article.en_packs(quantite)
         par_etape, changement_serie = {}, Decimal(0)
-        for ligne in RepartitionCout.objects.filter(ordre_fabrication=of, niveau=NiveauRepartition.PRODUIT).select_related("etape", "charge__nature"):
+        from .models import repartitions_de_l_of
+        if cout.cout_eau:
+            par_etape["Eau traitée (coût standard)"] = cout.cout_eau
+        for ligne in repartitions_de_l_of(of, production_seulement=False).select_related("etape", "charge__nature"):
             libelle = ligne.etape.libelle if ligne.etape_id else "Sans étape"
             par_etape[libelle] = par_etape.get(libelle, Decimal(0)) + ligne.montant
             if ligne.charge.source.startswith(SOURCE_CHANGEMENT_SERIE) or ligne.charge.nature.inducteur == Inducteur.TEMPS_CHANGEMENT_SERIE:

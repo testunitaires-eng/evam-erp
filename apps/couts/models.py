@@ -152,6 +152,22 @@ class CoutStandard(ValidationAvantEnregistrement, models.Model):
         exiger_positif(self.cout_standard_unitaire, "cout_standard_unitaire", "Le coût standard unitaire", strict=False)
 
 
+def repartitions_de_l_of(of, production_seulement=True):
+    """
+    Charges de production de la cascade réparties jusqu'à l'OF (niveau
+    produit). OF du site eau valorisé au coût standard de l'eau : sans
+    les charges amont (forage, traitement) ni celles rattachées au coût
+    de l'eau, déjà comprises dans le standard (pas de double compte).
+    """
+    lignes = RepartitionCout.objects.filter(ordre_fabrication=of, niveau=NiveauRepartition.PRODUIT)
+    if production_seulement:
+        lignes = lignes.filter(charge__nature__categorie=CategorieCout.PRODUCTION)
+    from apps.eau.models import ValorisationEauOF
+    if of.pk and ValorisationEauOF.objects.filter(ordre_fabrication=of).exists():
+        lignes = lignes.exclude(charge__element_eau__isnull=False).exclude(charge__nature__etape__phase="AMONT")
+    return lignes
+
+
 class CoutReel(models.Model):
     """
     Coût réel constaté d'un OF, agrégé à partir des matières, de la
@@ -175,6 +191,11 @@ class CoutReel(models.Model):
         "Charges imputées (cascade)", max_digits=16, decimal_places=2, default=0,
         help_text="Charges de production rattachées à une étape puis réparties par inducteur jusqu'à cet OF.",
     )
+    cout_eau = models.DecimalField(
+        "Eau au coût standard (site eau)", max_digits=16, decimal_places=2, default=0,
+        help_text="OF du site eau dont le mois est clôturé : volume d'eau x coût standard (+ électricité des machines de "
+                  "production). Remplace alors les charges amont (forage, traitement) de la cascade.",
+    )
     date_calcul = models.DateTimeField("Date de calcul", auto_now=True)
 
     class Meta:
@@ -188,7 +209,7 @@ class CoutReel(models.Model):
     def cout_total(self):
         return (
             self.cout_matiere_total + self.cout_main_oeuvre_total
-            + self.cout_energie_total + self.cout_amortissement_total + self.cout_charges_reparties
+            + self.cout_energie_total + self.cout_amortissement_total + self.cout_charges_reparties + self.cout_eau
         )
 
     @property
@@ -261,9 +282,7 @@ class CoutReel(models.Model):
             return [ligne(article, self.cout_total)]
         couts = {article: Decimal(0) for article in formats}
         par_pk = {article.pk: article for article in formats}
-        for repartition in RepartitionCout.objects.filter(
-            ordre_fabrication=of, niveau=NiveauRepartition.PRODUIT, charge__nature__categorie=CategorieCout.PRODUCTION,
-        ):
+        for repartition in repartitions_de_l_of(of):
             if repartition.article_id in par_pk:
                 couts[par_pk[repartition.article_id]] += repartition.montant
         poids_matieres = []
@@ -276,7 +295,7 @@ class CoutReel(models.Model):
         if self.cout_matiere_total:
             for article, _, montant in ventiler(self.cout_matiere_total, poids_matieres)[1]:
                 couts[article] += montant
-        autres = self.cout_main_oeuvre_total + self.cout_energie_total + self.cout_amortissement_total
+        autres = self.cout_main_oeuvre_total + self.cout_energie_total + self.cout_amortissement_total + self.cout_eau
         if autres:
             for article, _, montant in ventiler(autres, cle_entre_formats(formats, None)[0])[1]:
                 couts[article] += montant
@@ -348,10 +367,8 @@ class CoutReel(models.Model):
         cout_energie = 0
         cout_amortissement = 0
         # Charges de la cascade (par étape et inducteur) déjà réparties sur l'OF.
-        cout_charges = RepartitionCout.objects.filter(
-            ordre_fabrication=of, niveau=NiveauRepartition.PRODUIT,
-            charge__nature__categorie=CategorieCout.PRODUCTION,
-        ).aggregate(total=Sum("montant"))["total"] or 0
+        cout_charges = repartitions_de_l_of(of).aggregate(total=Sum("montant"))["total"] or 0
+        valorisation = getattr(of, "valorisation_eau", None) if of.pk else None
         # Ancienne répartition au prorata des quantités (clé arbitraire) : seulement
         # tant qu'aucune charge n'est saisie dans la cascade pour la période.
         periodes = {periode} | ({of.date_fin.strftime("%Y-%m")} if of.date_fin else set())
@@ -384,6 +401,7 @@ class CoutReel(models.Model):
         self.cout_energie_total = cout_energie
         self.cout_amortissement_total = cout_amortissement
         self.cout_charges_reparties = cout_charges
+        self.cout_eau = valorisation.montant_total if valorisation is not None else 0
         self.save()
         return self
 
@@ -606,6 +624,15 @@ class Charge(ValidationAvantEnregistrement, models.Model):
         OrdreFabrication, verbose_name="OF (charge directe)", on_delete=models.PROTECT, null=True, blank=True, related_name="charges_directes",
     )
     tournee = models.ForeignKey("distribution.Tournee", verbose_name="Tournée", on_delete=models.PROTECT, null=True, blank=True, related_name="charges")
+    element_eau = models.ForeignKey(
+        "eau.ElementCout", verbose_name="Élément du coût de l'eau", on_delete=models.PROTECT, null=True, blank=True,
+        related_name="charges_reelles",
+        help_text="Charge du forage ou du traitement de l'eau : l'élément de coût auquel elle s'impute (coût réel de l'eau).",
+    )
+    duree_etalement_eau_mois = models.PositiveIntegerField(
+        "Grosse réparation étalée sur (mois)", null=True, blank=True,
+        help_text="Réparation au-delà du seuil qui prolonge la vie de l'équipement : étalée à partir de ce mois. Vide = imputée au mois.",
+    )
     statut_donnee = models.CharField("Donnée", max_length=10, choices=StatutDonnee.choices, default=StatutDonnee.REEL)
     source = models.CharField("Source", max_length=200, blank=True, help_text="Ex : facture SBEE n° 1234, relevé compteur, bulletin de paie.")
     observations = models.TextField("Observations", blank=True)
@@ -632,10 +659,17 @@ class Charge(ValidationAvantEnregistrement, models.Model):
             self.numero = generer_numero("CHG")
         super().save(*args, **kwargs)
 
+    def verifier_suppression(self):
+        if self.element_eau_id:
+            from apps.eau.models import verifier_mois_ouvert
+            verifier_mois_ouvert(self.element_eau.usine_id, self.periode)
+
     def clean(self):
         exiger_positif(self.montant, "montant", "Le montant")
         if not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", self.periode or ""):
             raise ValidationError({"periode": "La période doit être au format AAAA-MM (ex : 2026-09)."})
+        from apps.eau.models import verifier_charge_eau
+        verifier_charge_eau(self)
         if self.nature_id and not self.nature.actif:
             raise ValidationError({"nature": f"L'élément de coût « {self.nature.libelle} » est inactif."})
         if self.equipement_id and self.equipement.activite_id:

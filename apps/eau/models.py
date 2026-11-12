@@ -24,7 +24,7 @@ Contenu de la phase 1 :
 import re
 from decimal import Decimal
 
-from django.core.exceptions import ValidationError
+from django.core.exceptions import ObjectDoesNotExist, ValidationError
 from django.db import models
 from django.utils import timezone
 
@@ -260,6 +260,11 @@ class Versionnee(ValidationAvantEnregistrement, models.Model):
 # Paramètres du site eau
 # =====================================================================
 
+class ValorisationStock(models.TextChoices):
+    PEPS = "PEPS", "PEPS / FIFO (premier entré, premier sorti)"
+    CMUP = "CMUP", "CMUP (coût moyen pondéré du stock)"
+
+
 class ParametresEau(Versionnee):
     """
     Seuils et règles du calcul du coût de l'eau pour un site (onglet
@@ -290,6 +295,12 @@ class ParametresEau(Versionnee):
     jour_cloture = models.PositiveSmallIntegerField(
         "Jour de clôture du mois", default=10,
         help_text="Jour du mois suivant jusqu'auquel on impute les charges du mois (ex : le 10).",
+    )
+    valorisation_sorties_stock = models.CharField(
+        "Valorisation des sorties de stock du traitement", max_length=5, choices=ValorisationStock.choices,
+        default=ValorisationStock.PEPS,
+        help_text="Pour le coût de l'eau seulement (la valeur comptable du stock reste au CMUP). PEPS retenu, "
+                  "à confirmer avec l'expert-comptable.",
     )
 
     class Meta:
@@ -484,6 +495,10 @@ class ElementCout(ValidationAvantEnregistrement, models.Model):
         help_text="Ex : puissance (kW) ; prix du kWh ; heures de marche par période.",
     )
     ordre = models.PositiveIntegerField("Ordre d'affichage", default=0)
+    attendue_chaque_mois = models.BooleanField(
+        "Charge attendue chaque mois", default=False,
+        help_text="À imputer (ou à valider « sans imputation », avec un motif) avant la clôture de chaque mois.",
+    )
     date_creation = models.DateTimeField("Créé le", auto_now_add=True)
 
     class Meta:
@@ -512,6 +527,10 @@ class ElementCout(ValidationAvantEnregistrement, models.Model):
         ancienne = valeur_en_base(self, "famille")
         if ancienne and ancienne != self.famille:
             raise ValidationError({"famille": "La famille ne change pas (elle change le calcul des mois passés) : créez un nouvel élément."})
+        if self.attendue_chaque_mois and self.famille in (Famille.ETALEE, Famille.AU_BESOIN):
+            raise ValidationError({"attendue_chaque_mois": (
+                "Une charge étalée se calcule seule et une charge au besoin n'est pas prévisible : elles ne sont pas « attendues »."
+            )})
 
     def verifier_suppression(self):
         if self.versions.exists():
@@ -655,10 +674,17 @@ class CoutStandardEau(ValidationAvantEnregistrement, models.Model):
         """
         Règle 14 : un standard validé s'applique à partir du 1er jour du
         mois suivant. Seul le tout premier standard du site (démarrage)
-        peut porter sur le mois en cours ou un mois passé.
+        peut porter sur le mois en cours ou un mois passé, ainsi qu'un
+        standard issu de la révision d'un mois clôturé (pour le mois qui
+        suit ce mois, tant qu'il n'est pas clôturé).
         """
         deja = CoutStandardEau.objects.filter(usine_id=self.usine_id, statut=StatutStandard.VALIDE).exclude(pk=self.pk)
-        if deja.exists() and self.mois_application <= mois_courant():
+        if ClotureMoisEau.objects.filter(usine_id=self.usine_id, mois=self.mois_application).exists():
+            raise ValueError(f"Le mois {self.mois_application} est clôturé : son standard ne change plus.")
+        # Révision (règle 17) : décidée à la clôture d'un mois, pour le mois suivant, même s'il est commencé
+        # (l'eau des OF n'est valorisée qu'à la clôture de leur mois : rien n'est recalculé).
+        revision_du_mois = self.origine == OrigineStandard.REVISION
+        if deja.exists() and self.mois_application <= mois_courant() and not revision_du_mois:
             raise ValueError(
                 "Un standard validé s'applique à partir du mois suivant : "
                 f"proposez-le pour {mois_suivant(mois_courant())} ou plus tard."
@@ -676,6 +702,40 @@ class CoutStandardEau(ValidationAvantEnregistrement, models.Model):
 # =====================================================================
 # Phase 3 - Saisies du module « Traitement de l'eau » (techniciens)
 # =====================================================================
+
+class VerrouCloture:
+    """
+    Les saisies d'un mois clôturé (coût de l'eau) ne se créent, ne se
+    modifient et ne se suppriment plus : le coût réel du mois est figé.
+    usine_et_mois() : (id du site, AAAA-MM) de la saisie, ou None.
+    """
+
+    def usine_et_mois(self):
+        raise NotImplementedError
+
+    def verifier_mois_ouvert(self, avec_ancien=True):
+        cibles = set()
+        try:
+            actuel = self.usine_et_mois()
+        except ObjectDoesNotExist:
+            actuel = None
+        if actuel:
+            cibles.add(actuel)
+        if avec_ancien and self.pk:
+            ancien = type(self)._default_manager.filter(pk=self.pk).first()
+            if ancien is not None and ancien.usine_et_mois():
+                cibles.add(ancien.usine_et_mois())
+        for usine_id, mois in cibles:
+            verifier_mois_ouvert(usine_id, mois)
+
+    def verifier_suppression(self):
+        self.verifier_mois_ouvert()
+
+
+def verifier_mois_ouvert(usine_id, mois):
+    if usine_id and mois and ClotureMoisEau.objects.filter(usine_id=usine_id, mois=mois).exists():
+        raise ValidationError(f"Le mois {mois} est clôturé (coût de l'eau) : ses saisies ne se modifient plus.")
+
 
 def _pas_dans_le_futur(jour, champ="date"):
     if jour and jour > timezone.localdate():
@@ -721,7 +781,7 @@ class Compteur(ValidationAvantEnregistrement, models.Model):
             raise ValidationError({"site_desservi": "Le compteur du forage mesure l'eau captée au total : pas de site desservi."})
 
 
-class ReleveCompteur(ValidationAvantEnregistrement, models.Model):
+class ReleveCompteur(VerrouCloture, ValidationAvantEnregistrement, models.Model):
     """Index d'un compteur un jour donné. Les index ne baissent jamais d'un relevé à l'autre."""
     compteur = models.ForeignKey(Compteur, verbose_name="Compteur", on_delete=models.PROTECT, related_name="releves")
     date = models.DateField("Date du relevé")
@@ -739,7 +799,11 @@ class ReleveCompteur(ValidationAvantEnregistrement, models.Model):
     def __str__(self):
         return f"{self.compteur.code} {self.date} : {self.index}"
 
+    def usine_et_mois(self):
+        return (self.compteur.usine_id, mois_de(self.date)) if self.compteur_id and self.date else None
+
     def clean(self):
+        self.verifier_mois_ouvert()
         _pas_dans_le_futur(self.date)
         exiger_positif(self.index, "index", "L'index", strict=False)
         if not self.compteur_id or not self.date:
@@ -766,7 +830,7 @@ class MotifArret(models.TextChoices):
     AUTRE = "AUTRE", "Autre"
 
 
-class ExceptionHeures(ValidationAvantEnregistrement, models.Model):
+class ExceptionHeures(VerrouCloture, ValidationAvantEnregistrement, models.Model):
     """
     Heures de marche en moins un jour donné, pour un équipement ou pour
     une ligne entière (tous les équipements dont le poste est sur la
@@ -795,7 +859,15 @@ class ExceptionHeures(ValidationAvantEnregistrement, models.Model):
         cible = self.equipement.code if self.equipement_id else f"ligne {self.ligne.code}"
         return f"{cible} {self.date} : -{self.heures_en_moins} h"
 
+    def usine_et_mois(self):
+        if not self.date:
+            return None
+        if self.equipement_id:
+            return self.equipement.usine_id, mois_de(self.date)
+        return (self.ligne.usine_id, mois_de(self.date)) if self.ligne_id else None
+
     def clean(self):
+        self.verifier_mois_ouvert()
         _pas_dans_le_futur(self.date)
         if bool(self.equipement_id) == bool(self.ligne_id):
             raise ValidationError("Indiquez soit un équipement, soit une ligne entière.")
@@ -806,7 +878,7 @@ class ExceptionHeures(ValidationAvantEnregistrement, models.Model):
             raise ValidationError({"commentaire": "Précisez le motif."})
 
 
-class RelevePression(ValidationAvantEnregistrement, models.Model):
+class RelevePression(VerrouCloture, ValidationAvantEnregistrement, models.Model):
     """
     Relevé de pression (« DP ») d'une membrane. Au-delà de la pression
     maximale paramétrée pour l'équipement, les techniciens sont alertés
@@ -839,7 +911,11 @@ class RelevePression(ValidationAvantEnregistrement, models.Model):
         seuil = self.pression_max
         return seuil is not None and self.pression_bar > seuil
 
+    def usine_et_mois(self):
+        return (self.equipement.usine_id, mois_de(self.date)) if self.equipement_id and self.date else None
+
     def clean(self):
+        self.verifier_mois_ouvert()
         _pas_dans_le_futur(self.date)
         exiger_positif(self.pression_bar, "pression_bar", "La pression", strict=False)
 
@@ -882,7 +958,7 @@ TYPE_DE_LA_CAUSE = {
 }
 
 
-class PerteEau(ValidationAvantEnregistrement, models.Model):
+class PerteEau(VerrouCloture, ValidationAvantEnregistrement, models.Model):
     """
     Perte d'eau déclarée par les techniciens ou la production (règle 5) :
     un volume estimé, ou un nombre de bouteilles d'un format. Le type
@@ -918,7 +994,11 @@ class PerteEau(ValidationAvantEnregistrement, models.Model):
             return Decimal(self.nombre_bouteilles) * self.article.contenance / 1000
         return None
 
+    def usine_et_mois(self):
+        return (self.usine_id, mois_de(self.date)) if self.usine_id and self.date else None
+
     def clean(self):
+        self.verifier_mois_ouvert()
         _pas_dans_le_futur(self.date)
         if self.cause in TYPE_DE_LA_CAUSE:
             attendu = TYPE_DE_LA_CAUSE[self.cause]
@@ -968,7 +1048,7 @@ class TypeIntervention(models.TextChoices):
     REMPLACEMENT = "REMPLACEMENT", "Remplacement d'une pièce"
 
 
-class Intervention(ValidationAvantEnregistrement, models.Model):
+class Intervention(VerrouCloture, ValidationAvantEnregistrement, models.Model):
     """
     Intervention de maintenance sur un équipement du forage ou du
     traitement, saisie par les techniciens (sans montant).
@@ -1016,7 +1096,11 @@ class Intervention(ValidationAvantEnregistrement, models.Model):
         if element.equipement_id and element.equipement_id != self.equipement_id:
             raise ValidationError({champ: f"« {element.libelle} » concerne l'équipement {element.equipement.code}."})
 
+    def usine_et_mois(self):
+        return (self.equipement.usine_id, mois_de(self.date)) if self.equipement_id and self.date else None
+
     def clean(self):
+        self.verifier_mois_ouvert()
         _pas_dans_le_futur(self.date)
         if not (self.description or "").strip():
             raise ValidationError({"description": "Décrivez l'intervention."})
@@ -1043,6 +1127,7 @@ class Intervention(ValidationAvantEnregistrement, models.Model):
             raise ValidationError({"element_remplace": "La pièce remplacée ne s'indique que pour un remplacement."})
 
     def verifier_suppression(self):
+        self.verifier_mois_ouvert()
         if self.installations.exists():
             raise ValidationError("La nouvelle pièce de ce remplacement est déjà enregistrée : supprimez-la d'abord.")
 
@@ -1062,7 +1147,7 @@ class Intervention(ValidationAvantEnregistrement, models.Model):
             notifier(titre, message, document=self, profils=[Profil.CONTROLE_GESTION, Profil.COMPTABILITE_DAF])
 
 
-class Installation(ValidationAvantEnregistrement, models.Model):
+class Installation(VerrouCloture, ValidationAvantEnregistrement, models.Model):
     """
     Un lot de pièces étalées réellement en place (élément de coût
     « Étalée ») : étalé sur sa durée de vie à partir de son mois
@@ -1136,7 +1221,11 @@ class Installation(ValidationAvantEnregistrement, models.Model):
         reste = ancien.duree_vie_mois - self.mois_deja_etales
         return Decimal(ancien.prix_unitaire) * Decimal(self.quantite) * reste / ancien.duree_vie_mois
 
+    def usine_et_mois(self):
+        return (self.element.usine_id, self.mois_installation) if self.element_id and self.mois_installation else None
+
     def clean(self):
+        self.verifier_mois_ouvert()
         verifier_format_mois(self.mois_installation, "mois_installation")
         exiger_positif(self.quantite, "quantite", "La quantité")
         exiger_positif(self.prix_unitaire, "prix_unitaire", "Le prix unitaire", strict=False)
@@ -1169,6 +1258,7 @@ class Installation(ValidationAvantEnregistrement, models.Model):
                     raise ValidationError("Ce lot a déjà été (en partie) remplacé : ses valeurs ne changent plus.")
 
     def verifier_suppression(self):
+        self.verifier_mois_ouvert()
         if self.remplacements.exists():
             raise ValidationError("Ce lot a déjà été (en partie) remplacé : il ne peut pas être supprimé.")
 
@@ -1184,3 +1274,204 @@ class AlerteEnvoyee(models.Model):
 
     def __str__(self):
         return self.cle
+
+
+# =====================================================================
+# Phase 5 - Coût réel et clôture du mois
+# =====================================================================
+#
+# - Les charges réelles sont les charges du module Coûts (factures HT,
+#   au mois de consommation) rattachées à un élément de coût de l'eau
+#   (Charge.element_eau) : une seule saisie, par la comptabilité. Les
+#   charges étalées et les valeurs résiduelles se calculent seules
+#   (versions, pièces installées) ; les charges « Électricité » forment
+#   la facture du site, répartie aux kW x heures.
+# - Avant la clôture, chaque charge attendue est imputée ou validée
+#   « sans imputation » avec un motif.
+# - La clôture fige le mois (plus aucune saisie du mois ne bouge) et
+#   valorise l'eau des OF du mois au coût standard en vigueur.
+
+def verifier_charge_eau(charge):
+    """Règles d'une charge du module Coûts rattachée au coût de l'eau (appelée par Charge.clean)."""
+    anciens = []
+    if charge.pk:
+        anciens = list(type(charge)._default_manager.filter(pk=charge.pk).values_list("element_eau__usine_id", "periode"))
+    for usine_id, periode in anciens:
+        verifier_mois_ouvert(usine_id, periode)
+    if not charge.element_eau_id:
+        if charge.duree_etalement_eau_mois:
+            raise ValidationError({"duree_etalement_eau_mois": "L'étalement ne concerne qu'une réparation rattachée au coût de l'eau."})
+        return
+    element = charge.element_eau
+    verifier_mois_ouvert(element.usine_id, charge.periode)
+    if element.famille == Famille.ETALEE:
+        raise ValidationError({"element_eau": (
+            f"« {element.libelle} » est une charge étalée : elle se calcule seule (versions et pièces installées), "
+            "on ne l'impute pas."
+        )})
+    if element.famille == Famille.AU_BESOIN and not charge.equipement_id:
+        raise ValidationError({"equipement": "Une réparation se rattache à l'équipement réparé (obligatoire)."})
+    if charge.equipement_id and element.equipement_id and charge.equipement_id != element.equipement_id:
+        raise ValidationError({"equipement": f"« {element.libelle} » concerne l'équipement {element.equipement.code}."})
+    if element.bloc == Bloc.TRAITEMENT and charge.usine_id and charge.usine_id != element.usine_id:
+        raise ValidationError({"usine": f"« {element.libelle} » est une charge du traitement du site {element.usine.code}."})
+    if charge.duree_etalement_eau_mois:
+        if element.famille != Famille.AU_BESOIN:
+            raise ValidationError({"duree_etalement_eau_mois": "Seule une grosse réparation (charge au besoin) s'étale."})
+        parametres = ParametresEau.en_vigueur(charge.periode, usine_id=element.usine_id)
+        seuil = parametres.seuil_grosse_reparation if parametres else None
+        if seuil is None:
+            raise ValidationError({"duree_etalement_eau_mois": "Le seuil de « grosse réparation » n'est pas paramétré : la réparation s'impute au mois."})
+        if charge.montant is not None and charge.montant < seuil:
+            raise ValidationError({"duree_etalement_eau_mois": f"En dessous du seuil de grosse réparation ({seuil} FCFA) : imputée en totalité au mois."})
+
+
+class ValidationSansImputation(VerrouCloture, ValidationAvantEnregistrement, models.Model):
+    """Une charge attendue absente ce mois-là, validée « sans imputation » avec un motif (ex : aucun entretien ce mois)."""
+    element = models.ForeignKey(ElementCout, verbose_name="Charge attendue", on_delete=models.PROTECT, related_name="validations_sans_imputation")
+    mois = models.CharField("Mois", max_length=7, help_text="AAAA-MM")
+    motif = models.TextField("Motif")
+    valide_par = models.ForeignKey("comptes.Utilisateur", verbose_name="Validé par", on_delete=models.PROTECT, null=True, blank=True, related_name="+")
+    date_validation = models.DateTimeField("Validé le", auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Charge validée sans imputation"
+        verbose_name_plural = "Charges validées sans imputation"
+        ordering = ["-mois", "element"]
+        constraints = [models.UniqueConstraint(fields=["element", "mois"], name="validation_sans_imputation_unique")]
+
+    def __str__(self):
+        return f"{self.element} {self.mois} : sans imputation"
+
+    def usine_et_mois(self):
+        return (self.element.usine_id, self.mois) if self.element_id and self.mois else None
+
+    def clean(self):
+        verifier_format_mois(self.mois, "mois")
+        self.verifier_mois_ouvert()
+        if not (self.motif or "").strip():
+            raise ValidationError({"motif": "Le motif est obligatoire (ex : aucun entretien ce mois)."})
+        if self.mois > mois_courant():
+            raise ValidationError({"mois": "On ne valide pas à l'avance un mois qui n'a pas commencé."})
+        if self.element_id:
+            if not self.element.attendue_chaque_mois:
+                raise ValidationError({"element": f"« {self.element.libelle} » n'est pas une charge attendue chaque mois."})
+            if est_imputee(self.element, self.mois):
+                raise ValidationError({"element": f"« {self.element.libelle} » est déjà imputée en {self.mois}."})
+
+
+def est_imputee(element, mois):
+    """
+    L'élément a-t-il une charge réelle ce mois-là : une charge du module
+    Coûts (électricité : sur n'importe quel élément Électricité du site)
+    ou une sortie de stock vers cet élément ?
+    """
+    from apps.couts.models import Charge
+    from apps.stocks.models import MouvementStock
+    if element.categorie == Categorie.ELECTRICITE:
+        return Charge.objects.filter(
+            element_eau__usine_id=element.usine_id, element_eau__categorie=Categorie.ELECTRICITE, periode=mois,
+        ).exists()
+    annee, numero = (int(x) for x in mois.split("-"))
+    return Charge.objects.filter(element_eau=element, periode=mois).exists() or MouvementStock.objects.filter(
+        element_eau=element, type_mouvement="SORTIE", date_mouvement__year=annee, date_mouvement__month=numero,
+    ).exists()
+
+
+def verifier_sortie_stock_eau(mouvement):
+    """Règles d'une sortie de stock destinée au coût de l'eau (appelée par MouvementStock.clean)."""
+    if not mouvement.element_eau_id:
+        return
+    element = mouvement.element_eau
+    if mouvement.type_mouvement not in ("SORTIE", "RETOUR"):
+        raise ValidationError({"element_eau": "Seule une sortie (ou un retour) de stock se rattache au coût de l'eau."})
+    if element.famille == Famille.ETALEE:
+        raise ValidationError({"element_eau": (
+            f"« {element.libelle} » est une pièce étalée : enregistrez son installation (contrôle de gestion), "
+            "son coût s'étale sur sa durée de vie."
+        )})
+    if element.categorie == Categorie.ELECTRICITE:
+        raise ValidationError({"element_eau": "L'électricité ne sort pas du stock."})
+
+
+class DecisionRevision(models.TextChoices):
+    MAINTENU = "MAINTENU", "Standard maintenu"
+    MAINTENU_VOLUME_FAIBLE = "MAINTENU_VOLUME_FAIBLE", "Standard maintenu (volume trop faible)"
+    NOUVEAU_PROPOSE = "NOUVEAU_PROPOSE", "Nouveau standard proposé (à valider)"
+
+
+class ClotureMoisEau(ValidationAvantEnregistrement, models.Model):
+    """
+    Clôture d'un mois pour le coût de l'eau d'un site : le coût réel
+    calculé ce jour-là est conservé tel quel (résultat), les saisies du
+    mois ne bougent plus, l'eau des OF du mois est valorisée au standard.
+    Une clôture ne s'annule pas.
+    """
+    usine = models.ForeignKey("industriel.Usine", verbose_name="Site eau", on_delete=models.PROTECT, related_name="clotures_eau")
+    mois = models.CharField("Mois", max_length=7, help_text="AAAA-MM")
+    volume_m3 = models.DecimalField("Volume d'eau en bouteilles (m³)", max_digits=14, decimal_places=3)
+    cout_reel_courant = models.DecimalField("Coût réel courant (hors au besoin et exceptionnel)", max_digits=16, decimal_places=2)
+    cout_reel_total = models.DecimalField("Coût réel total", max_digits=16, decimal_places=2)
+    cout_m3 = models.DecimalField("Coût réel total au m³", max_digits=14, decimal_places=4)
+    cout_m3_courant = models.DecimalField("Coût réel au m³ hors au besoin et exceptionnel", max_digits=14, decimal_places=4)
+    cout_standard_m3 = models.DecimalField("Coût standard en vigueur (m³)", max_digits=14, decimal_places=4)
+    valorisation_of = models.DecimalField("Eau valorisée dans les OF", max_digits=16, decimal_places=2)
+    ecart = models.DecimalField("Écart du mois (réel total - eau valorisée)", max_digits=16, decimal_places=2)
+    resultat = models.JSONField("Calcul du coût réel au jour de la clôture", default=dict)
+    ecart_courant_pct = models.DecimalField(
+        "Écart hors charges au besoin et exceptionnelles (%)", max_digits=10, decimal_places=4, null=True, blank=True,
+    )
+    volume_prevu_m3 = models.DecimalField("Volume prévu du mois (m³)", max_digits=14, decimal_places=3, null=True, blank=True)
+    decision = models.CharField("Révision du standard", max_length=25, choices=DecisionRevision.choices, blank=True)
+    standard_propose = models.OneToOneField(
+        CoutStandardEau, verbose_name="Nouveau standard proposé", on_delete=models.PROTECT, null=True, blank=True,
+        related_name="cloture_d_origine",
+    )
+    cloture_par = models.ForeignKey("comptes.Utilisateur", verbose_name="Clôturé par", on_delete=models.PROTECT, null=True, blank=True, related_name="+")
+    date_cloture = models.DateTimeField("Clôturé le", auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Clôture du mois (coût de l'eau)"
+        verbose_name_plural = "Clôtures des mois (coût de l'eau)"
+        ordering = ["usine", "-mois"]
+        constraints = [models.UniqueConstraint(fields=["usine", "mois"], name="cloture_eau_unique_par_mois")]
+
+    def __str__(self):
+        return f"Clôture {self.usine.code} {self.mois}"
+
+    def clean(self):
+        verifier_format_mois(self.mois, "mois")
+        if self.pk:
+            raise ValidationError("Une clôture ne se modifie pas.")
+
+    def verifier_suppression(self):
+        raise ValidationError("Une clôture ne s'annule pas : le mois reste figé.")
+
+
+class ValorisationEauOF(models.Model):
+    """
+    Eau d'un OF clôturé du mois valorisée au coût standard (volume x
+    standard au m³), et sa part de l'électricité des machines de
+    production (au prorata du volume). Remplace, dans le coût réel de
+    l'OF, les charges amont (forage, traitement) de la cascade.
+    """
+    cloture = models.ForeignKey(ClotureMoisEau, verbose_name="Clôture", on_delete=models.PROTECT, related_name="valorisations")
+    ordre_fabrication = models.OneToOneField(
+        "production.OrdreFabrication", verbose_name="OF", on_delete=models.PROTECT, related_name="valorisation_eau",
+    )
+    volume_m3 = models.DecimalField("Volume d'eau (m³)", max_digits=14, decimal_places=3)
+    cout_standard_m3 = models.DecimalField("Coût standard (m³)", max_digits=14, decimal_places=4)
+    montant_eau = models.DecimalField("Eau au coût standard", max_digits=16, decimal_places=2)
+    electricite_production = models.DecimalField("Électricité des machines de production", max_digits=16, decimal_places=2, default=0)
+
+    class Meta:
+        verbose_name = "Valorisation de l'eau d'un OF"
+        verbose_name_plural = "Valorisations de l'eau des OF"
+        ordering = ["cloture", "ordre_fabrication"]
+
+    def __str__(self):
+        return f"{self.ordre_fabrication.numero} : {self.montant_eau}"
+
+    @property
+    def montant_total(self):
+        return self.montant_eau + self.electricite_production

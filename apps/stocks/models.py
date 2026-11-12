@@ -242,6 +242,12 @@ class MouvementStock(models.Model):
         "Document d'origine", max_length=100, blank=True,
         help_text="Ex : numéro d'OF, de commande, de bon de livraison à l'origine du mouvement.",
     )
+    element_eau = models.ForeignKey(
+        "eau.ElementCout", verbose_name="Destination : coût de l'eau", on_delete=models.PROTECT, null=True, blank=True,
+        related_name="sorties_stock",
+        help_text="Sortie vers le forage ou le traitement de l'eau (sel, produits, kits, pièces, carburant) : "
+                  "l'élément de coût auquel elle s'impute.",
+    )
     utilisateur = models.ForeignKey(
         Utilisateur, verbose_name="Effectué par", on_delete=models.PROTECT,
     )
@@ -270,6 +276,8 @@ class MouvementStock(models.Model):
         """
         if not self._state.adding:
             return
+        from apps.eau.models import verifier_sortie_stock_eau
+        verifier_sortie_stock_eau(self)
         if self.type_mouvement == TypeMouvement.TRANSFERT:
             raise ValidationError({"type_mouvement": (
                 "Un transfert se saisit en deux mouvements : une SORTIE du dépôt "

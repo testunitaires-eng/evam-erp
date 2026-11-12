@@ -145,4 +145,9 @@ def synthese_mois(usine, mois):
             "declarations": pertes.count(),
         },
         "alertes": alertes,
+        "_exact": {"part_site_eau": part, "volume_site_eau": site_eau},
     }
+
+
+def sans_valeurs_exactes(synthese):
+    return {cle: valeur for cle, valeur in synthese.items() if cle != "_exact"}

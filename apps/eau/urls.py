@@ -18,9 +18,15 @@ router.register("releves-pression", views.RelevePressionViewSet, basename="relev
 router.register("pertes", views.PerteEauViewSet, basename="perteeau")
 router.register("interventions", views.InterventionViewSet, basename="intervention")
 router.register("installations", views.InstallationViewSet, basename="installation")
+router.register("validations-sans-imputation", views.ValidationSansImputationViewSet, basename="validationsansimputation")
+router.register("clotures", views.ClotureMoisEauViewSet, basename="cloturemoiseau")
+router.register("valorisations-of", views.ValorisationEauOFViewSet, basename="valorisationeauof")
 
 urlpatterns = [
     path("listes/", views.listes, name="eau-listes"),
     path("traitement/synthese/", views.synthese_traitement, name="eau-synthese-traitement"),
     path("maintenance/echeances/", views.echeances_maintenance, name="eau-echeances-maintenance"),
+    path("reel/calcul/", views.cout_reel, name="eau-cout-reel"),
+    path("reel/charges-attendues/", views.charges_attendues, name="eau-charges-attendues"),
+    path("reel/evolution/", views.evolution_cout, name="eau-evolution-cout"),
 ] + router.urls

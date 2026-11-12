@@ -13,7 +13,7 @@ from rest_framework.response import Response
 from apps.comptes.models import Profil
 from apps.comptes.permissions import acces
 from apps.core.views import HistoriqueMixin
-from . import calculs, models, serializers, traitement
+from . import calculs, maintenance, models, serializers, traitement
 
 CONSULTATION = (Profil.DIRECTION, Profil.COMPTABILITE_DAF, Profil.ADMIN_SI)
 PARAMETRES = acces(lecture=CONSULTATION, ecriture=(Profil.CONTROLE_GESTION,))
@@ -262,3 +262,38 @@ def synthese_traitement(request):
     if usine is None or mois is None:
         return Response({"erreur": "Paramètres attendus : usine=<id> et mois=AAAA-MM."}, status=400)
     return Response(traitement.synthese_mois(usine, mois))
+
+
+# =====================================================================
+# Phase 4 - maintenance
+# =====================================================================
+
+class InterventionViewSet(SaisieViewSet):
+    """Interventions de maintenance (techniciens, sans montant)."""
+    queryset = models.Intervention.objects.select_related("equipement", "operation", "element_remplace", "saisi_par")
+    serializer_class = serializers.InterventionSerializer
+    permission_classes = [SAISIE_TECHNICIENS]
+    filterset_fields = {
+        "equipement": ["exact"], "equipement__usine": ["exact"], "type_intervention": ["exact"],
+        "operation": ["exact"], "element_remplace": ["exact"], "date": ["exact", "gte", "lte"],
+    }
+
+
+class InstallationViewSet(SaisieViewSet):
+    """Pièces étalées en place, lot par lot, avec leur prix (contrôle de gestion)."""
+    queryset = models.Installation.objects.select_related("element", "remplace", "intervention", "saisi_par")
+    serializer_class = serializers.InstallationSerializer
+    permission_classes = [PARAMETRES]
+    filterset_fields = ["element", "element__usine", "mois_installation", "remplace", "intervention"]
+
+
+@api_view(["GET"])
+@permission_classes([acces(lecture=LECTEURS_TRAITEMENT)])
+def echeances_maintenance(request):
+    """GET /api/eau/maintenance/echeances/?usine=<id> : opérations préventives à faire et fins de vie (sans coûts)."""
+    from apps.industriel.models import Usine
+    valeur = request.query_params.get("usine", "")
+    usine = Usine.objects.filter(pk=valeur).first() if valeur.isdigit() else None
+    if usine is None:
+        return Response({"erreur": "Paramètre attendu : usine=<id>."}, status=400)
+    return Response(maintenance.echeances(usine))

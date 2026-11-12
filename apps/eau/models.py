@@ -52,6 +52,19 @@ def mois_suivant(mois):
     return f"{annee + numero // 12:04d}-{numero % 12 + 1:02d}"
 
 
+def ajouter_mois(mois, nombre):
+    annee, numero = (int(x) for x in mois.split("-"))
+    total = annee * 12 + numero - 1 + nombre
+    return f"{total // 12:04d}-{total % 12 + 1:02d}"
+
+
+def ecart_en_mois(debut, fin):
+    """Nombre de mois de debut (inclus) à fin (exclu) : 2025-01 -> 2025-04 = 3."""
+    a1, m1 = (int(x) for x in debut.split("-"))
+    a2, m2 = (int(x) for x in fin.split("-"))
+    return (a2 - a1) * 12 + m2 - m1
+
+
 def verifier_format_mois(valeur, champ):
     if not FORMAT_MOIS.fullmatch(valeur or ""):
         raise ValidationError({champ: "Le mois doit être au format AAAA-MM (ex : 2026-12)."})
@@ -928,3 +941,246 @@ class PerteEau(ValidationAvantEnregistrement, models.Model):
                 raise ValidationError({"nombre_bouteilles": "Indiquez le format et le nombre de bouteilles."})
             if not self.article.contenance or self.article.unite_contenance != "L":
                 raise ValidationError({"article": f"La contenance en litres du format {self.article.code} n'est pas renseignée."})
+
+
+# =====================================================================
+# Phase 4 - Maintenance : interventions, pièces installées, alertes
+# =====================================================================
+#
+# - Le plan de maintenance préventive, ce sont les éléments de coût de la
+#   famille « Préventive » : l'opération, l'équipement et la fréquence
+#   (nombre + période) y sont déjà, versionnés. On ne les saisit pas deux
+#   fois ; l'échéance se calcule depuis la dernière intervention.
+# - Les techniciens saisissent les interventions, sans montant : les
+#   factures sont rattachées par la comptabilité (coût réel, phase 5).
+# - Les pièces étalées réellement en place (membranes, lampes, sable,
+#   équipements amortis) sont suivies lot par lot (Installation) : mois
+#   d'installation, prix, durée de vie. Un remplacement avant la fin de
+#   la durée de vie dégage la valeur résiduelle de l'ancien lot (règle 11).
+
+def _quantite(valeur):
+    return format(Decimal(valeur).normalize(), "f")
+
+
+class TypeIntervention(models.TextChoices):
+    PREVENTIVE = "PREVENTIVE", "Préventive (plan de maintenance)"
+    AU_BESOIN = "AU_BESOIN", "Au besoin (panne, réparation)"
+    REMPLACEMENT = "REMPLACEMENT", "Remplacement d'une pièce"
+
+
+class Intervention(ValidationAvantEnregistrement, models.Model):
+    """
+    Intervention de maintenance sur un équipement du forage ou du
+    traitement, saisie par les techniciens (sans montant).
+    - Préventive : rattachée à une opération du plan (élément de coût
+      « Préventive ») ; elle remet à zéro son échéance.
+    - Au besoin : l'équipement réparé est obligatoire (règle 10).
+    - Remplacement : la pièce remplacée (élément de coût « Étalée ») et la
+      quantité ; le contrôle de gestion enregistre ensuite la nouvelle
+      pièce (Installation) avec son prix.
+    """
+    equipement = models.ForeignKey("industriel.Equipement", verbose_name="Équipement", on_delete=models.PROTECT, related_name="+")
+    type_intervention = models.CharField("Type", max_length=12, choices=TypeIntervention.choices)
+    date = models.DateField("Date de l'intervention")
+    description = models.TextField("Description")
+    pieces_utilisees = models.TextField("Pièces et produits utilisés", blank=True)
+    operation = models.ForeignKey(
+        ElementCout, verbose_name="Opération du plan préventif", on_delete=models.PROTECT, null=True, blank=True,
+        related_name="interventions", help_text="Intervention préventive : l'opération du plan réalisée.",
+    )
+    element_remplace = models.ForeignKey(
+        ElementCout, verbose_name="Pièce remplacée", on_delete=models.PROTECT, null=True, blank=True,
+        related_name="remplacements", help_text="Remplacement : l'élément étalé remplacé (membrane, lampe...).",
+    )
+    quantite_remplacee = models.DecimalField("Quantité remplacée", max_digits=14, decimal_places=4, null=True, blank=True)
+    saisi_par = models.ForeignKey("comptes.Utilisateur", verbose_name="Saisi par", on_delete=models.PROTECT, null=True, blank=True, related_name="+")
+    date_saisie = models.DateTimeField("Saisi le", auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Intervention de maintenance"
+        verbose_name_plural = "Interventions de maintenance"
+        ordering = ["-date", "-pk"]
+
+    def __str__(self):
+        return f"{self.get_type_intervention_display()} - {self.equipement.code} le {self.date:%d/%m/%Y}"
+
+    @property
+    def usine(self):
+        return self.equipement.usine if self.equipement_id else None
+
+    def _verifier_element(self, element, champ, famille):
+        if element.famille != famille:
+            raise ValidationError({champ: f"« {element.libelle} » n'est pas un élément de la famille {Famille(famille).label}."})
+        if element.usine_id != self.equipement.usine_id:
+            raise ValidationError({champ: f"« {element.libelle} » n'est pas un élément du site de l'équipement."})
+        if element.equipement_id and element.equipement_id != self.equipement_id:
+            raise ValidationError({champ: f"« {element.libelle} » concerne l'équipement {element.equipement.code}."})
+
+    def clean(self):
+        _pas_dans_le_futur(self.date)
+        if not (self.description or "").strip():
+            raise ValidationError({"description": "Décrivez l'intervention."})
+        if self.equipement_id and bloc_de_l_equipement(self.equipement) is None:
+            raise ValidationError({"equipement": (
+                f"{self.equipement.code} n'est pas un équipement du forage ou du traitement de l'eau "
+                "(rattachez-le à un poste de ces étapes)."
+            )})
+        type_ = self.type_intervention
+        if type_ == TypeIntervention.PREVENTIVE:
+            if not self.operation_id:
+                raise ValidationError({"operation": "Indiquez l'opération du plan de maintenance réalisée."})
+            self._verifier_element(self.operation, "operation", Famille.PREVENTIVE)
+        elif self.operation_id:
+            raise ValidationError({"operation": "Seule une intervention préventive se rattache au plan."})
+        if type_ == TypeIntervention.REMPLACEMENT:
+            if not self.element_remplace_id:
+                raise ValidationError({"element_remplace": "Indiquez la pièce remplacée."})
+            self._verifier_element(self.element_remplace, "element_remplace", Famille.ETALEE)
+            if self.quantite_remplacee is None:
+                self.quantite_remplacee = Decimal(1)
+            exiger_positif(self.quantite_remplacee, "quantite_remplacee", "La quantité remplacée")
+        elif self.element_remplace_id or self.quantite_remplacee is not None:
+            raise ValidationError({"element_remplace": "La pièce remplacée ne s'indique que pour un remplacement."})
+
+    def verifier_suppression(self):
+        if self.installations.exists():
+            raise ValidationError("La nouvelle pièce de ce remplacement est déjà enregistrée : supprimez-la d'abord.")
+
+    def save(self, *args, **kwargs):
+        creation = self._state.adding
+        super().save(*args, **kwargs)
+        if creation and self.type_intervention in (TypeIntervention.AU_BESOIN, TypeIntervention.REMPLACEMENT):
+            from apps.comptes.models import Profil
+            from apps.core.notifications import notifier
+            if self.type_intervention == TypeIntervention.AU_BESOIN:
+                titre = f"Réparation : {self.equipement.designation}"
+                message = f"Le {self.date:%d/%m/%Y} : {self.description} - facture à rattacher à l'équipement {self.equipement.code}."
+            else:
+                titre = f"Remplacement : {self.element_remplace.libelle}"
+                message = (f"Le {self.date:%d/%m/%Y} sur {self.equipement.code} (quantité {_quantite(self.quantite_remplacee)}) : "
+                           "enregistrer la nouvelle pièce et son prix ; valeur résiduelle de l'ancienne.")
+            notifier(titre, message, document=self, profils=[Profil.CONTROLE_GESTION, Profil.COMPTABILITE_DAF])
+
+
+class Installation(ValidationAvantEnregistrement, models.Model):
+    """
+    Un lot de pièces étalées réellement en place (élément de coût
+    « Étalée ») : étalé sur sa durée de vie à partir de son mois
+    d'installation. Un lot qui en remplace un autre (remplace = l'ancien
+    lot) retire la quantité correspondante de l'ancien lot à partir de son
+    mois ; la part de l'ancien prix pas encore étalée (valeur résiduelle)
+    est imputée en totalité ce mois-là, comme charge exceptionnelle
+    (règle 11). Ex : membrane de 1 000 000 sur 48 mois remplacée après
+    12 mois : 1 000 000 x 36 ÷ 48 = 750 000.
+    """
+    element = models.ForeignKey(ElementCout, verbose_name="Élément étalé", on_delete=models.PROTECT, related_name="installations")
+    quantite = models.DecimalField("Quantité", max_digits=14, decimal_places=4)
+    prix_unitaire = models.DecimalField("Prix unitaire HT (FCFA)", max_digits=16, decimal_places=4)
+    duree_vie_mois = models.PositiveIntegerField("Durée de vie (mois)")
+    mois_installation = models.CharField("Mois d'installation", max_length=7, help_text="AAAA-MM : premier mois étalé.")
+    remplace = models.ForeignKey(
+        "self", verbose_name="Lot remplacé", on_delete=models.PROTECT, null=True, blank=True, related_name="remplacements",
+    )
+    intervention = models.ForeignKey(
+        Intervention, verbose_name="Intervention de remplacement", on_delete=models.PROTECT, null=True, blank=True,
+        related_name="installations",
+    )
+    observations = models.CharField("Observations", max_length=200, blank=True)
+    saisi_par = models.ForeignKey("comptes.Utilisateur", verbose_name="Saisi par", on_delete=models.PROTECT, null=True, blank=True, related_name="+")
+    date_saisie = models.DateTimeField("Saisi le", auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Pièce installée (lot étalé)"
+        verbose_name_plural = "Pièces installées (lots étalés)"
+        ordering = ["element", "-mois_installation", "-pk"]
+
+    def __str__(self):
+        return f"{self.element} x {_quantite(self.quantite)} installé(e) en {self.mois_installation}"
+
+    @property
+    def dernier_mois(self):
+        """Dernier mois étalé (fin de vie)."""
+        return ajouter_mois(self.mois_installation, self.duree_vie_mois - 1)
+
+    def quantite_remplacee(self, mois, sauf=None):
+        """Quantité de ce lot remplacée par des lots installés au plus tard ce mois-là."""
+        lots = self.remplacements.filter(mois_installation__lte=mois)
+        if sauf is not None and sauf.pk:
+            lots = lots.exclude(pk=sauf.pk)
+        return sum((lot.quantite for lot in lots), Decimal(0))
+
+    def quantite_en_place(self, mois):
+        if mois < self.mois_installation:
+            return Decimal(0)
+        return self.quantite - self.quantite_remplacee(mois)
+
+    def montant_etale(self, mois):
+        """Étalement du mois (exact) : prix x quantité en place ÷ durée de vie, pendant la durée de vie."""
+        if not (self.mois_installation <= mois <= self.dernier_mois):
+            return Decimal(0)
+        return montant_mensuel_etale(self.quantite_en_place(mois), self.prix_unitaire, self.duree_vie_mois)
+
+    @property
+    def mois_deja_etales(self):
+        """Pour un lot de remplacement : mois de l'ancien lot étalés avant le remplacement."""
+        if not self.remplace_id:
+            return None
+        return min(ecart_en_mois(self.remplace.mois_installation, self.mois_installation), self.remplace.duree_vie_mois)
+
+    @property
+    def valeur_residuelle(self):
+        """Charge exceptionnelle du mois d'installation (exacte) : part de l'ancien prix pas encore étalée."""
+        if not self.remplace_id:
+            return None
+        ancien = self.remplace
+        reste = ancien.duree_vie_mois - self.mois_deja_etales
+        return Decimal(ancien.prix_unitaire) * Decimal(self.quantite) * reste / ancien.duree_vie_mois
+
+    def clean(self):
+        verifier_format_mois(self.mois_installation, "mois_installation")
+        exiger_positif(self.quantite, "quantite", "La quantité")
+        exiger_positif(self.prix_unitaire, "prix_unitaire", "Le prix unitaire", strict=False)
+        if not self.duree_vie_mois:
+            raise ValidationError({"duree_vie_mois": "La durée de vie (en mois) est obligatoire."})
+        if self.element_id and self.element.famille != Famille.ETALEE:
+            raise ValidationError({"element": "Seul un élément de la famille « Étalée » s'installe par lots."})
+        if self.remplace_id:
+            ancien = self.remplace
+            if ancien.pk == self.pk:
+                raise ValidationError({"remplace": "Un lot ne se remplace pas lui-même."})
+            if ancien.element_id != self.element_id:
+                raise ValidationError({"remplace": "Le lot remplacé n'est pas le même élément."})
+            if self.mois_installation <= ancien.mois_installation:
+                raise ValidationError({"mois_installation": f"Le lot remplacé a été installé en {ancien.mois_installation} : le remplacement vient après."})
+            disponible = ancien.quantite - ancien.quantite_remplacee(self.mois_installation, sauf=self)
+            if self.quantite > disponible:
+                raise ValidationError({"quantite": f"Il ne reste que {_quantite(disponible)} en place dans le lot remplacé."})
+        if self.intervention_id:
+            intervention = self.intervention
+            if intervention.type_intervention != TypeIntervention.REMPLACEMENT or intervention.element_remplace_id != self.element_id:
+                raise ValidationError({"intervention": "Choisissez l'intervention de remplacement de cette pièce."})
+            if mois_de(intervention.date) != self.mois_installation:
+                raise ValidationError({"mois_installation": f"Le remplacement a eu lieu en {mois_de(intervention.date)}."})
+            if not self.remplace_id:
+                raise ValidationError({"remplace": "Indiquez le lot remplacé (pour sa valeur résiduelle)."})
+        if self.pk and self.remplacements.exists():
+            for champ in ("element_id", "quantite", "prix_unitaire", "duree_vie_mois", "mois_installation"):
+                if getattr(self, champ) != valeur_en_base(self, champ):
+                    raise ValidationError("Ce lot a déjà été (en partie) remplacé : ses valeurs ne changent plus.")
+
+    def verifier_suppression(self):
+        if self.remplacements.exists():
+            raise ValidationError("Ce lot a déjà été (en partie) remplacé : il ne peut pas être supprimé.")
+
+
+class AlerteEnvoyee(models.Model):
+    """Trace des alertes datées déjà envoyées (préventive à faire, fin de vie) : chacune n'est envoyée qu'une fois."""
+    cle = models.CharField("Clé", max_length=120, unique=True)
+    date = models.DateTimeField("Envoyée le", auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Alerte de maintenance envoyée"
+        verbose_name_plural = "Alertes de maintenance envoyées"
+
+    def __str__(self):
+        return self.cle

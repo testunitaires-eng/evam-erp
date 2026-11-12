@@ -16,8 +16,11 @@ router.register("releves-compteurs", views.ReleveCompteurViewSet, basename="rele
 router.register("exceptions-heures", views.ExceptionHeuresViewSet, basename="exceptionheures")
 router.register("releves-pression", views.RelevePressionViewSet, basename="relevepression")
 router.register("pertes", views.PerteEauViewSet, basename="perteeau")
+router.register("interventions", views.InterventionViewSet, basename="intervention")
+router.register("installations", views.InstallationViewSet, basename="installation")
 
 urlpatterns = [
     path("listes/", views.listes, name="eau-listes"),
     path("traitement/synthese/", views.synthese_traitement, name="eau-synthese-traitement"),
+    path("maintenance/echeances/", views.echeances_maintenance, name="eau-echeances-maintenance"),
 ] + router.urls

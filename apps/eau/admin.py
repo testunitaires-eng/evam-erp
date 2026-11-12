@@ -90,3 +90,24 @@ class PerteEauAdmin(admin.ModelAdmin):
     list_filter = ("usine", "type_perte", "cause")
     date_hierarchy = "date"
     readonly_fields = ("saisi_par", "date_saisie")
+
+
+@admin.register(models.Intervention)
+class InterventionAdmin(admin.ModelAdmin):
+    list_display = ("date", "type_intervention", "equipement", "operation", "element_remplace", "quantite_remplacee", "saisi_par")
+    list_filter = ("type_intervention", "equipement__usine")
+    search_fields = ("equipement__code", "description")
+    readonly_fields = ("saisi_par", "date_saisie")
+
+
+@admin.register(models.Installation)
+class InstallationAdmin(admin.ModelAdmin):
+    list_display = ("element", "quantite", "prix_unitaire", "duree_vie_mois", "mois_installation", "remplace", "saisi_par")
+    list_filter = ("element__usine",)
+    readonly_fields = ("saisi_par", "date_saisie")
+
+
+@admin.register(models.AlerteEnvoyee)
+class AlerteEnvoyeeAdmin(admin.ModelAdmin):
+    list_display = ("cle", "date")
+    search_fields = ("cle",)

@@ -979,3 +979,164 @@ class CoutReelOFTests(BaseScenario):
         cout.refresh_from_db()
         self.assertEqual((cout.cout_charges_reparties, cout.cout_eau), (Decimal("400.00"), Decimal("730543.05")))
         self.assertEqual(cout.cout_total, Decimal("730943.05"))
+
+
+# =====================================================================
+# Phase 6 - révision du standard (décision après la clôture)
+# =====================================================================
+
+from apps.eau.revision import evolution  # noqa: E402
+
+
+class RevisionTests(BaseScenario):
+
+    def mois_3(self):
+        self.capter(225, 300)
+        self.produire(100000, 60000, 4000, 1000)
+        self.charges_courantes(500000, 62000)
+        dp1 = self.elements["Membrane DP1 (0,01 µ)"]
+        ancien = Installation.objects.create(element=dp1, mois_installation="2024-11", quantite=1, prix_unitaire=1000000, duree_vie_mois=48)
+        remplacement = Intervention.objects.create(equipement=self.pompe_uf, type_intervention="REMPLACEMENT", date=date(2025, 11, 15),
+                                                   description="Membrane DP1 abîmée", element_remplace=dp1)
+        Installation.objects.create(element=dp1, mois_installation=MOIS, quantite=1, prix_unitaire=1100000, duree_vie_mois=48,
+                                    remplace=ancien, intervention=remplacement)
+
+    def test_mois_1_standard_maintenu(self):
+        self.mois_1()
+        cloture = cloturer(self.usine, MOIS)
+        self.assertEqual((cloture.decision, cloture.ecart_courant_pct, cloture.standard_propose), ("MAINTENU", Decimal("-4.1960"), None))
+        self.assertEqual(cloture.volume_prevu_m3, Decimal("200.000"))
+
+    def test_mois_2_une_panne_ne_change_pas_le_standard(self):
+        """Écart total +44 % (panne), mais hors charges au besoin +0,67 % : standard maintenu."""
+        self.capter(180, 360)
+        self.produire(85000, 50000, 3000, 3000)
+        ExceptionHeures.objects.create(ligne=self.ligne, date=date(2025, 11, 12), heures_en_moins=20, motif="PANNE")
+        self.charges_courantes(450000, 55000)
+        self.imputer("Réparation pompe de l'ultrafiltration", 300000, equipement=self.pompe_uf)
+        Utilisateur.objects.create_user("cg", password="x", profil=Profil.CONTROLE_GESTION)
+        cloture = cloturer(self.usine, MOIS)
+        self.assertEqual(cloture.decision, "MAINTENU")
+        self.assertFalse(CoutStandardEau.objects.filter(origine="REVISION").exists())
+        # Les rejets au-delà du taux toléré sont signalés au contrôle de gestion.
+        self.assertTrue(Notification.objects.filter(titre__startswith="Pertes anormales").exists())
+
+    def test_mois_3_nouveau_standard_propose_puis_valide(self):
+        self.mois_3()
+        Utilisateur.objects.create_user("cg", password="x", profil=Profil.CONTROLE_GESTION)
+        cloture = cloturer(self.usine, MOIS)
+        self.assertEqual((cloture.decision, cloture.ecart_courant_pct), ("NOUVEAU_PROPOSE", Decimal("-8.2410")))
+        propose = cloture.standard_propose
+        self.assertEqual((propose.mois_application, propose.origine, propose.statut, propose.cout_m3),
+                         ("2025-12", "REVISION", "PROPOSE", Decimal("3775.8821")))
+        self.assertTrue(Notification.objects.filter(titre__startswith="Écart de coût de l'eau").exists())
+        # Le mois suivant n'est pas clôturé : le contrôle de gestion peut valider le standard révisé.
+        controle = self.client_pour(Profil.CONTROLE_GESTION)
+        reponse = controle.post(f"/api/eau/couts-standards/{propose.pk}/valider/", {}, format="json")
+        self.assertEqual(reponse.status_code, 200, reponse.data)
+        self.assertEqual(CoutStandardEau.en_vigueur("2025-12", usine=self.usine).cout_m3, Decimal("3775.8821"))
+        self.assertEqual(CoutStandardEau.en_vigueur(MOIS, usine=self.usine).cout_m3, Decimal("4115.0000"))
+        reponse = controle.get(f"/api/eau/reel/evolution/?usine={self.usine.pk}")
+        self.assertEqual(reponse.data["mois"], [{
+            "mois": MOIS, "volume_m3": "200", "cout_m3": "7525.88", "cout_m3_courant": "3775.88", "cout_standard_m3": "4115.00",
+            "ecart_total_pct": "82.89", "ecart_courant_pct": "-8.24", "decision": "NOUVEAU_PROPOSE",
+            "decision_libelle": "Nouveau standard proposé (à valider)",
+            "standard_propose": {"id": propose.pk, "mois_application": "2025-12", "cout_m3": "3775.88", "statut": "VALIDE"},
+        }])
+
+    def test_volume_trop_faible_standard_maintenu(self):
+        """Moins de 50 % du volume prévu : le mois n'est pas représentatif, même avec un gros écart."""
+        self.capter(220, 330)
+        self.produire(30000, 20000, 2000, 0)          # 65 m³ pour 200 prévus
+        self.charges_courantes(500000, 60000, entretien=120000)
+        cloture = cloturer(self.usine, MOIS)
+        self.assertEqual(cloture.decision, "MAINTENU_VOLUME_FAIBLE")
+        self.assertIsNone(cloture.standard_propose)
+        self.assertGreater(abs(cloture.ecart_courant_pct), 5)
+
+    def test_un_standard_ne_change_pas_pour_un_mois_cloture(self):
+        self.mois_1()
+        cloturer(self.usine, MOIS)
+        standard = CoutStandardEau.objects.create(usine=self.usine, mois_application=MOIS, origine="REVISION", volume_m3=1,
+                                                  cout_forage=0, cout_traitement=0, cout_mensuel=1, cout_m3=1)
+        with self.assertRaises(ValueError):
+            standard.valider(None)
+        self.assertEqual(len(evolution(self.usine)["mois"]), 1)
+
+
+# =====================================================================
+# Phase 7 - sorties de stock valorisées en PEPS / FIFO
+# =====================================================================
+
+from apps.stocks.models import MouvementStock, depot_par_defaut  # noqa: E402
+
+
+class PepsTests(BaseScenario):
+
+    def setUp(self):
+        super().setUp()
+        self.sel = Article.objects.create(code="SEL-REG", designation="Sel de régénération", type_article="MATIERE_PREMIERE", unite_mesure="KG")
+        self.magasin = depot_par_defaut("Magasin principal")
+
+    def mouvement(self, type_mouvement, quantite, le, cout=None, element=None):
+        mouvement = MouvementStock.objects.create(
+            article=self.sel, depot=self.magasin, type_mouvement=type_mouvement, quantite=quantite, cout_unitaire=cout,
+            utilisateur=self.responsable, element_eau=element,
+        )
+        MouvementStock.objects.filter(pk=mouvement.pk).update(date_mouvement=timezone.make_aware(timezone.datetime(*le, 9)))
+        return mouvement
+
+    def stock_de_sel(self):
+        """Deux achats (100 kg à 280, puis 200 kg à 320) et 200 kg sortis vers le traitement en novembre."""
+        self.mouvement("ENTREE", 100, (2025, 10, 1), cout=280)
+        self.mouvement("ENTREE", 200, (2025, 10, 20), cout=320)
+        return self.mouvement("SORTIE", 200, (2025, 11, 10), element=self.elements["Sel de régénération"])
+
+    def mois_1_avec_le_sel_en_stock(self):
+        self.capter(220, 330)
+        self.produire(100000, 60000, 4000, 1000)
+        self.imputer("Électricité pompe du forage", 500000)
+        self.imputer("Entretien préventif pompe du forage", 120000, equipement=self.pompe_forage)
+        for libelle, montant in (("Produit de lavage des filtres", 20000), ("Analyses par laboratoire externe", 100000),
+                                 ("Kits de contrôle interne", 43000)):
+            self.imputer(libelle, montant)
+        return self.stock_de_sel()
+
+    def test_sortie_valorisee_en_peps_le_scenario_reste_juste(self):
+        """200 kg = 100 x 280 + 100 x 320 = 60 000 (au CMUP du stock : 200 x 306,6667 = 61 333,34)."""
+        sortie = self.mois_1_avec_le_sel_en_stock()
+        self.assertEqual(sortie.valeur, Decimal("61333.34"))                 # la valeur comptable reste au CMUP
+        calcul = calcul_reel(self.usine, MOIS)
+        self.assertEqual(calcul["sorties_stock"]["valorisation"], "PEPS")
+        self.assertEqual(calcul["sorties_stock"]["mouvements"][0]["valeur"], "60000.00")
+        self.assertEqual(calcul["synthese"]["cout_reel_total"], "788467.27")
+        statuts = {l["libelle"]: l["statut"] for l in calcul["charges_attendues"]}
+        self.assertEqual(statuts["Sel de régénération"], "IMPUTEE")
+        self.assertEqual(calcul["bloquants"], [])
+
+    def test_methode_cmup_si_l_expert_comptable_la_retient(self):
+        self.mois_1_avec_le_sel_en_stock()
+        ParametresEau.objects.filter(usine=self.usine).update(valorisation_sorties_stock="CMUP")
+        calcul = calcul_reel(self.usine, MOIS)
+        self.assertEqual(calcul["sorties_stock"]["mouvements"][0]["valeur"], "61333.34")
+        self.assertEqual(calcul["synthese"]["cout_reel_total"], "789800.61")   # + 1 333,34 au traitement
+
+    def test_un_retour_au_magasin_diminue_la_consommation(self):
+        self.mois_1_avec_le_sel_en_stock()
+        self.mouvement("RETOUR", 20, (2025, 11, 20), cout=300, element=self.elements["Sel de régénération"])
+        self.assertEqual(calcul_reel(self.usine, MOIS)["synthese"]["cout_traitement"], "585705.94")   # - 20 x 300
+
+    def test_les_sorties_suivantes_consomment_les_couches_suivantes(self):
+        self.stock_de_sel()
+        decembre = self.mouvement("SORTIE", 50, (2025, 12, 3), element=self.elements["Sel de régénération"])
+        from apps.eau.peps import valeurs_peps
+        self.assertEqual(valeurs_peps(self.sel)[decembre.pk], (Decimal(16000), Decimal(0)))   # 50 x 320
+
+    def test_regles_des_sorties_vers_l_eau(self):
+        with self.assertRaises(ValidationError):   # une pièce étalée s'installe, elle ne s'impute pas au mois
+            self.mouvement("ENTREE", 10, (2025, 10, 1), cout=1, element=self.elements["Sel de régénération"])
+        self.mouvement("ENTREE", 10, (2025, 10, 1), cout=1)
+        with self.assertRaises(ValidationError):
+            self.mouvement("SORTIE", 1, (2025, 11, 1), element=self.elements["Charbon actif"])
+        with self.assertRaises(ValidationError):
+            self.mouvement("SORTIE", 1, (2025, 11, 1), element=self.elements["Électricité pompe du forage"])

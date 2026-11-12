@@ -28,4 +28,5 @@ urlpatterns = [
     path("maintenance/echeances/", views.echeances_maintenance, name="eau-echeances-maintenance"),
     path("reel/calcul/", views.cout_reel, name="eau-cout-reel"),
     path("reel/charges-attendues/", views.charges_attendues, name="eau-charges-attendues"),
+    path("reel/evolution/", views.evolution_cout, name="eau-evolution-cout"),
 ] + router.urls

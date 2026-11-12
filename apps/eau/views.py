@@ -13,7 +13,7 @@ from rest_framework.response import Response
 from apps.comptes.models import Profil
 from apps.comptes.permissions import acces
 from apps.core.views import HistoriqueMixin
-from . import calculs, maintenance, models, reel, serializers, traitement
+from . import calculs, maintenance, models, reel, revision, serializers, traitement
 
 CONSULTATION = (Profil.DIRECTION, Profil.COMPTABILITE_DAF, Profil.ADMIN_SI)
 PARAMETRES = acces(lecture=CONSULTATION, ecriture=(Profil.CONTROLE_GESTION,))
@@ -374,3 +374,20 @@ def charges_attendues(request):
         "cloture": models.ClotureMoisEau.objects.filter(usine=usine, mois=mois).exists(),
         "charges": reel.charges_attendues(usine, mois),
     })
+
+
+# =====================================================================
+# Phase 6 - révision du standard
+# =====================================================================
+
+@api_view(["GET"])
+@permission_classes([PARAMETRES])
+def evolution_cout(request):
+    """GET /api/eau/reel/evolution/?usine=<id>[&depuis=AAAA-MM&jusqu_a=AAAA-MM] : coût réel, réel hors au besoin et standard, mois par mois."""
+    from apps.industriel.models import Usine
+    valeur = request.query_params.get("usine", "")
+    usine = Usine.objects.filter(pk=valeur).first() if valeur.isdigit() else None
+    bornes = [request.query_params.get(cle) for cle in ("depuis", "jusqu_a")]
+    if usine is None or any(b and not models.FORMAT_MOIS.fullmatch(b) for b in bornes):
+        return Response({"erreur": "Paramètres attendus : usine=<id>, et éventuellement depuis / jusqu_a au format AAAA-MM."}, status=400)
+    return Response(revision.evolution(usine, *bornes))

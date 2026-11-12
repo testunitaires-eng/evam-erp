@@ -122,7 +122,7 @@ class ValidationSansImputationAdmin(admin.ModelAdmin):
 
 @admin.register(models.ClotureMoisEau)
 class ClotureMoisEauAdmin(admin.ModelAdmin):
-    list_display = ("usine", "mois", "volume_m3", "cout_reel_total", "cout_m3", "cout_standard_m3", "ecart", "cloture_par")
+    list_display = ("usine", "mois", "volume_m3", "cout_reel_total", "cout_m3", "cout_standard_m3", "ecart", "decision", "cloture_par")
     list_filter = ("usine",)
 
     def has_change_permission(self, request, obj=None):

@@ -476,9 +476,38 @@ Phase 5 (coût réel et clôture, onglet « Scénario 3 mois ») :
   sont reportés dans les relevés d'eau brute du module Coûts (clé de
   répartition du forage pour Jus et Yaourt) s'ils n'y sont pas déjà.
 
-À venir : révision du standard (décision après clôture, seuil de volume
-minimal), puis valorisation PEPS / FIFO des sorties de stock (en attente
-de l'avis de l'expert-comptable).
+Phase 6 (révision du standard, règle 17) :
+- À chaque clôture, l'écart **hors charges au besoin et exceptionnelles**
+  (coût réel courant au m³ ÷ standard − 1) décide : dans le seuil (5 %),
+  standard maintenu ; au-delà, le coût réel courant au m³ est proposé
+  comme standard du mois suivant (origine « révision »), à valider par le
+  contrôle de gestion ; volume du mois sous le seuil minimal (50 % du
+  volume prévu) : standard maintenu. Une panne isolée ne change donc pas
+  le standard. La décision, l'écart et le standard proposé sont sur la
+  clôture.
+- Un standard révisé peut être validé pour le mois qui suit le mois
+  clôturé même s'il est commencé, tant qu'il n'est pas clôturé (l'eau
+  des OF n'est valorisée qu'à la clôture : rien n'est recalculé).
+- Alertes au contrôle de gestion après la clôture : écart au-delà du
+  seuil, pertes anormales (rejets au-delà du taux toléré).
+- `GET /api/eau/reel/evolution/?usine=<id>[&depuis=&jusqu_a=]` : mois par
+  mois, coût réel au m³, réel hors charges au besoin, standard, écarts,
+  décision et standard proposé.
+
+Phase 7 (sorties de stock valorisées en PEPS / FIFO) :
+- Le magasin indique sur une sortie (ou un retour) de stock sa
+  destination dans le coût de l'eau (`element_eau` : sel, produits, kits,
+  pièces, carburant). Une pièce étalée ne sort pas ainsi : elle
+  s'installe (phase 4).
+- Ces sorties entrent dans le coût réel du mois de la sortie, valorisées
+  en **PEPS** : on rejoue l'historique de l'article (tous dépôts, hors
+  transferts), chaque sortie consomme les couches d'achat les plus
+  anciennes. Sans couche suffisante (stock initial non saisi) : CMUP, avec
+  une alerte. Elles comptent comme imputation d'une charge attendue.
+- **Seul le coût de l'eau change** : la valeur comptable du stock et des
+  mouvements reste au CMUP. Le paramètre du site « valorisation des
+  sorties de stock » (PEPS par défaut, ou CMUP) suit la décision de
+  l'expert-comptable, sans toucher aux mois clôturés.
 
 ---
 

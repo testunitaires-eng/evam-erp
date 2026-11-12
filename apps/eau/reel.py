@@ -10,6 +10,8 @@ du classeur, parties A à E).
     Forage (avant partage) = électricité forage + étalées forage + charges
              imputées au forage ; part du site eau = débitmètres.
     Traitement = électricité traitement + étalées + charges imputées.
+    Sorties de stock vers l'eau (sel, produits, kits, pièces) : au mois de
+             la sortie, valorisées en PEPS / FIFO (peps.py).
     Charges au besoin (réparations, grosses réparations étalées) et
              exceptionnelles (valeurs résiduelles) : à part, hors
              comparaison avec le standard.
@@ -25,9 +27,10 @@ from django.db import transaction
 from django.utils import timezone
 
 from .calculs import CENTIME, CalculImpossible, _montant, _nombre, calcul_previsionnel
+from .peps import consommations_du_mois
 from .models import (
     Bloc, Categorie, ClotureMoisEau, Compteur, CoutStandardEau, ElementCout, Famille, ParametresEau, TypeCompteur,
-    ValidationSansImputation, ValorisationEauOF, VersionElementCout, ajouter_mois, charges_imputees, mois_courant, mois_de,
+    ValidationSansImputation, ValorisationEauOF, ValorisationStock, VersionElementCout, ajouter_mois, est_imputee, mois_courant, mois_de,
     verifier_format_mois,
 )
 from .traitement import bornes_du_mois, heures_machine, synthese_mois, volume_compteur
@@ -183,7 +186,7 @@ def charges_attendues(usine, mois):
         if version is not None and version.retire:
             continue
         validation = ValidationSansImputation.objects.filter(element=element, mois=mois).first()
-        if charges_imputees(element, mois).exists():
+        if est_imputee(element, mois):
             statut, motif = "IMPUTEE", ""
         elif validation is not None:
             statut, motif = "VALIDEE_SANS_IMPUTATION", validation.motif
@@ -226,6 +229,17 @@ def calcul_reel(usine, mois):
     # C. Charges
     prevu = {ligne["element"]: ligne["cout_mensuel"] for ligne in calcul_previsionnel(usine, mois)["charges"]}
     etalees, imputees = _etalees(usine, mois), _charges_imputees(usine, mois)
+    # Sorties de stock vers l'eau (phase 7) : valorisées en PEPS (ou CMUP selon le paramètre du site).
+    methode = parametres.valorisation_sorties_stock if parametres else ValorisationStock.PEPS
+    sorties, lignes_sorties, alertes_sorties = consommations_du_mois(usine, mois, methode)
+    alertes += alertes_sorties
+    for element, valeur in sorties.items():
+        courant_element, besoin_element = imputees.get(element, (ZERO, ZERO))
+        if element.famille == Famille.AU_BESOIN:
+            besoin_element += valeur
+        else:
+            courant_element += valeur
+        imputees[element] = (courant_element, besoin_element)
     blocs = (Bloc.FORAGE, Bloc.TRAITEMENT)
     courant = {bloc: electricite["par_bloc"][bloc] for bloc in blocs}
     besoin = {bloc: ZERO for bloc in blocs}
@@ -303,6 +317,7 @@ def calcul_reel(usine, mois):
         },
         "heures_machine": [{cle: valeur for cle, valeur in ligne.items() if cle != "_exact"} for ligne in heures],
         "charges": lignes,
+        "sorties_stock": {"valorisation": methode, "mouvements": lignes_sorties},
         "charges_attendues": attendues,
         "synthese": {
             "cout_forage_avant_partage": _montant(forage_avant),
@@ -351,7 +366,7 @@ def cloturer(usine, mois, utilisateur=None):
     Clôture le mois : calcul du coût réel conservé, saisies figées, eau des
     OF du mois valorisée au standard (et leur coût réel recalculé),
     volumes des débitmètres reportés dans les relevés d'eau brute du module
-    Coûts (s'ils n'y sont pas déjà).
+    Coûts (s'ils n'y sont pas déjà), puis révision du standard (revision.py).
     """
     from apps.couts.models import CoutReel, VolumeEauSite
     verifier_format_mois(mois, "mois")
@@ -408,7 +423,9 @@ def cloturer(usine, mois, utilisateur=None):
     if reportes:
         cloture.resultat = {**cloture.resultat, "volumes_eau_brute_reportes": reportes}
         ClotureMoisEau.objects.filter(pk=cloture.pk).update(resultat=cloture.resultat)
-    return cloture
+    # Phase 6 : maintien du standard ou proposition d'un nouveau pour le mois suivant.
+    from .revision import reviser
+    return reviser(cloture, calcul, utilisateur)
 
 
 def date_limite_cloture(usine, mois):

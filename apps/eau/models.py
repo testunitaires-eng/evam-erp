@@ -260,6 +260,11 @@ class Versionnee(ValidationAvantEnregistrement, models.Model):
 # Paramètres du site eau
 # =====================================================================
 
+class ValorisationStock(models.TextChoices):
+    PEPS = "PEPS", "PEPS / FIFO (premier entré, premier sorti)"
+    CMUP = "CMUP", "CMUP (coût moyen pondéré du stock)"
+
+
 class ParametresEau(Versionnee):
     """
     Seuils et règles du calcul du coût de l'eau pour un site (onglet
@@ -290,6 +295,12 @@ class ParametresEau(Versionnee):
     jour_cloture = models.PositiveSmallIntegerField(
         "Jour de clôture du mois", default=10,
         help_text="Jour du mois suivant jusqu'auquel on impute les charges du mois (ex : le 10).",
+    )
+    valorisation_sorties_stock = models.CharField(
+        "Valorisation des sorties de stock du traitement", max_length=5, choices=ValorisationStock.choices,
+        default=ValorisationStock.PEPS,
+        help_text="Pour le coût de l'eau seulement (la valeur comptable du stock reste au CMUP). PEPS retenu, "
+                  "à confirmer avec l'expert-comptable.",
     )
 
     class Meta:
@@ -663,10 +674,17 @@ class CoutStandardEau(ValidationAvantEnregistrement, models.Model):
         """
         Règle 14 : un standard validé s'applique à partir du 1er jour du
         mois suivant. Seul le tout premier standard du site (démarrage)
-        peut porter sur le mois en cours ou un mois passé.
+        peut porter sur le mois en cours ou un mois passé, ainsi qu'un
+        standard issu de la révision d'un mois clôturé (pour le mois qui
+        suit ce mois, tant qu'il n'est pas clôturé).
         """
         deja = CoutStandardEau.objects.filter(usine_id=self.usine_id, statut=StatutStandard.VALIDE).exclude(pk=self.pk)
-        if deja.exists() and self.mois_application <= mois_courant():
+        if ClotureMoisEau.objects.filter(usine_id=self.usine_id, mois=self.mois_application).exists():
+            raise ValueError(f"Le mois {self.mois_application} est clôturé : son standard ne change plus.")
+        # Révision (règle 17) : décidée à la clôture d'un mois, pour le mois suivant, même s'il est commencé
+        # (l'eau des OF n'est valorisée qu'à la clôture de leur mois : rien n'est recalculé).
+        revision_du_mois = self.origine == OrigineStandard.REVISION
+        if deja.exists() and self.mois_application <= mois_courant() and not revision_du_mois:
             raise ValueError(
                 "Un standard validé s'applique à partir du mois suivant : "
                 f"proposez-le pour {mois_suivant(mois_courant())} ou plus tard."
@@ -1338,16 +1356,48 @@ class ValidationSansImputation(VerrouCloture, ValidationAvantEnregistrement, mod
         if self.element_id:
             if not self.element.attendue_chaque_mois:
                 raise ValidationError({"element": f"« {self.element.libelle} » n'est pas une charge attendue chaque mois."})
-            if charges_imputees(self.element, self.mois).exists():
+            if est_imputee(self.element, self.mois):
                 raise ValidationError({"element": f"« {self.element.libelle} » est déjà imputée en {self.mois}."})
 
 
-def charges_imputees(element, mois):
-    """Charges du module Coûts imputées à cet élément ce mois-là (électricité : à n'importe quel élément Électricité du site)."""
+def est_imputee(element, mois):
+    """
+    L'élément a-t-il une charge réelle ce mois-là : une charge du module
+    Coûts (électricité : sur n'importe quel élément Électricité du site)
+    ou une sortie de stock vers cet élément ?
+    """
     from apps.couts.models import Charge
+    from apps.stocks.models import MouvementStock
     if element.categorie == Categorie.ELECTRICITE:
-        return Charge.objects.filter(element_eau__usine_id=element.usine_id, element_eau__categorie=Categorie.ELECTRICITE, periode=mois)
-    return Charge.objects.filter(element_eau=element, periode=mois)
+        return Charge.objects.filter(
+            element_eau__usine_id=element.usine_id, element_eau__categorie=Categorie.ELECTRICITE, periode=mois,
+        ).exists()
+    annee, numero = (int(x) for x in mois.split("-"))
+    return Charge.objects.filter(element_eau=element, periode=mois).exists() or MouvementStock.objects.filter(
+        element_eau=element, type_mouvement="SORTIE", date_mouvement__year=annee, date_mouvement__month=numero,
+    ).exists()
+
+
+def verifier_sortie_stock_eau(mouvement):
+    """Règles d'une sortie de stock destinée au coût de l'eau (appelée par MouvementStock.clean)."""
+    if not mouvement.element_eau_id:
+        return
+    element = mouvement.element_eau
+    if mouvement.type_mouvement not in ("SORTIE", "RETOUR"):
+        raise ValidationError({"element_eau": "Seule une sortie (ou un retour) de stock se rattache au coût de l'eau."})
+    if element.famille == Famille.ETALEE:
+        raise ValidationError({"element_eau": (
+            f"« {element.libelle} » est une pièce étalée : enregistrez son installation (contrôle de gestion), "
+            "son coût s'étale sur sa durée de vie."
+        )})
+    if element.categorie == Categorie.ELECTRICITE:
+        raise ValidationError({"element_eau": "L'électricité ne sort pas du stock."})
+
+
+class DecisionRevision(models.TextChoices):
+    MAINTENU = "MAINTENU", "Standard maintenu"
+    MAINTENU_VOLUME_FAIBLE = "MAINTENU_VOLUME_FAIBLE", "Standard maintenu (volume trop faible)"
+    NOUVEAU_PROPOSE = "NOUVEAU_PROPOSE", "Nouveau standard proposé (à valider)"
 
 
 class ClotureMoisEau(ValidationAvantEnregistrement, models.Model):
@@ -1368,6 +1418,15 @@ class ClotureMoisEau(ValidationAvantEnregistrement, models.Model):
     valorisation_of = models.DecimalField("Eau valorisée dans les OF", max_digits=16, decimal_places=2)
     ecart = models.DecimalField("Écart du mois (réel total - eau valorisée)", max_digits=16, decimal_places=2)
     resultat = models.JSONField("Calcul du coût réel au jour de la clôture", default=dict)
+    ecart_courant_pct = models.DecimalField(
+        "Écart hors charges au besoin et exceptionnelles (%)", max_digits=10, decimal_places=4, null=True, blank=True,
+    )
+    volume_prevu_m3 = models.DecimalField("Volume prévu du mois (m³)", max_digits=14, decimal_places=3, null=True, blank=True)
+    decision = models.CharField("Révision du standard", max_length=25, choices=DecisionRevision.choices, blank=True)
+    standard_propose = models.OneToOneField(
+        CoutStandardEau, verbose_name="Nouveau standard proposé", on_delete=models.PROTECT, null=True, blank=True,
+        related_name="cloture_d_origine",
+    )
     cloture_par = models.ForeignKey("comptes.Utilisateur", verbose_name="Clôturé par", on_delete=models.PROTECT, null=True, blank=True, related_name="+")
     date_cloture = models.DateTimeField("Clôturé le", auto_now_add=True)
 

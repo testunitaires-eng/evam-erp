@@ -690,3 +690,292 @@ class MaintenanceTests(BaseMaintenance):
         self.assertNotIn("prix", str(reponse.data))
         self.assertEqual([l["libelle"] for l in reponse.data["preventive"]], [self.entretien.libelle])
         self.assertEqual(technicien.get("/api/eau/maintenance/echeances/").status_code, 400)
+
+
+# =====================================================================
+# Phase 5 - coût réel et clôture (onglet « Scénario 3 mois »)
+# =====================================================================
+
+from apps.couts.models import Charge, CoutReel, NatureCout, VolumeEauSite  # noqa: E402
+from apps.eau.calculs import CalculImpossible as CalculImpossibleReel  # noqa: E402
+from apps.eau.maintenance import envoyer_alertes as envoyer_alertes_eau  # noqa: E402
+from apps.eau.models import ClotureMoisEau, ValidationSansImputation, ValorisationEauOF  # noqa: E402
+from apps.eau.reel import calcul_reel, cloturer  # noqa: E402
+from apps.production.models import OrdreFabrication, SuiviEau  # noqa: E402
+
+MOIS = "2025-11"   # 30 jours, 25 jours du lundi au samedi : 720 h et 200 h comme le classeur
+ATTENDUES = ("Électricité pompe du forage", "Entretien préventif pompe du forage", "Sel de régénération",
+             "Produit de lavage des filtres", "Analyses par laboratoire externe", "Kits de contrôle interne")
+
+
+class BaseScenario(BaseClasseur):
+    def setUp(self):
+        super().setUp()
+        # Paramétrage applicable depuis janvier 2025.
+        for modele in (VersionElementCout, PrevisionVolume, PrevisionCaptage):
+            modele.objects.update(mois_application="2025-01")
+        ParametresEau.objects.create(usine=self.usine, mois_application="2025-01", taux_rejet_tolere_pct=2, seuil_grosse_reparation=500000)
+        CoutStandardEau.objects.create(
+            usine=self.usine, mois_application="2025-01", statut="VALIDE", volume_m3=200, cout_forage=196000,
+            cout_traitement=627000, cout_mensuel=823000, cout_m3=4115,
+        )
+        ElementCout.objects.filter(usine=self.usine, libelle__in=ATTENDUES).update(attendue_chaque_mois=True)
+        self.elements = {element.libelle: element for element in ElementCout.objects.filter(usine=self.usine)}
+        # Équipements et heures (partie B) : forage sur sa ligne, le reste sur la ligne de traitement.
+        etape = lambda code: EtapeStandard.objects.get(code=code)
+        ligne = self.poste_uf.ligne
+        self.pompe_forage.poste = Poste.objects.create(
+            ligne=Ligne.objects.create(designation="Forage", usine=self.usine, activite=ligne.activite), etape=etape("CAPTAGE"),
+        )
+        self.pompe_forage.save()
+        pompe_filtres = Equipement.objects.create(designation="Pompe d'alimentation des filtres", type_equipement="POMPE", usine=self.usine,
+                                                  poste=Poste.objects.create(ligne=ligne, etape=etape("PREFILTRATION")))
+        lampe_uv = Equipement.objects.create(designation="Lampe UV", type_equipement="TRAITEMENT", usine=self.usine,
+                                             poste=Poste.objects.create(ligne=ligne, etape=etape("UV")))
+        for equipement, kw, heures, jours in ((self.pompe_forage, 5, 24, "TOUS"), (pompe_filtres, 2, 8, "LUNDI_SAMEDI"),
+                                              (self.pompe_uf, 3, 8, "LUNDI_SAMEDI"), (lampe_uv, "0.1", 8, "LUNDI_SAMEDI"),
+                                              (self.soutireuse, 10, 8, "LUNDI_SAMEDI")):
+            CaracteristiquesEquipement.objects.create(equipement=equipement, mois_application="2025-01", puissance_kw=Decimal(str(kw)),
+                                                      heures_marche_jour=heures, jours_de_marche=jours)
+        self.ligne = ligne
+        self.site_jus = Usine.objects.create(nom="Site jus scénario")
+        self.debitmetres = {
+            site: Compteur.objects.create(code=f"D-{site.pk}", libelle="Débitmètre", type_compteur="DEBITMETRE", usine=self.usine, site_desservi=site)
+            for site in (self.usine, self.site_jus)
+        }
+        self.nature = NatureCout.objects.create(libelle="Charges du site eau", inducteur="VOLUME_EAU_M3")
+        self.responsable = Utilisateur.objects.create_user("resp_prod", password="x", profil=Profil.RESPONSABLE_PRODUCTION)
+
+    # -- saisies du scénario ------------------------------------------------
+    def capter(self, site_eau, autres):
+        for site, volume in ((self.usine, site_eau), (self.site_jus, autres)):
+            ReleveCompteur.objects.create(compteur=self.debitmetres[site], date=date(2025, 10, 31), index=1000)
+            ReleveCompteur.objects.create(compteur=self.debitmetres[site], date=date(2025, 11, 30), index=1000 + volume)
+
+    def produire(self, conformes_15, conformes_05, conformes_5, rejetees_15):
+        # OF déjà clôturés (créés directement : la recette et le déroulé de production ne sont pas l'objet du test).
+        fin = timezone.make_aware(timezone.datetime(2025, 11, 28, 17))
+        OrdreFabrication.objects.bulk_create([
+            OrdreFabrication(numero=f"OF-EAU-{nom}", article=self.formats[nom], quantite_a_produire=bouteilles,
+                             responsable=self.responsable, statut="CLOTURE", ligne=self.ligne, date_fin=fin)
+            for nom, bouteilles in (("150 cl", conformes_15), ("50 cl", conformes_05), ("500 cl", conformes_5))
+        ])
+        ofs = [OrdreFabrication.objects.get(numero=f"OF-EAU-{nom}") for nom in ("150 cl", "50 cl", "500 cl")]
+        SuiviEau.objects.bulk_create([SuiviEau(
+            ordre_fabrication=ofs[0], volume_capte_l=0, volume_obtenu_traitement_l=0, volume_envoye_embouteillage_l=0,
+            bouteilles_produites=conformes_15 + rejetees_15, bouteilles_conformes=conformes_15, bouteilles_rejetees=rejetees_15,
+        )])
+        return ofs
+
+    def imputer(self, libelle, montant, **champs):
+        return Charge.objects.create(nature=self.nature, periode=MOIS, montant=montant, element_eau=self.elements[libelle], **champs)
+
+    def sans_imputation(self, libelle, motif="Aucun entretien ce mois"):
+        return ValidationSansImputation.objects.create(element=self.elements[libelle], mois=MOIS, motif=motif)
+
+    def charges_courantes(self, electricite, sel, entretien=None):
+        self.imputer("Électricité pompe du forage", electricite, source="Facture d'électricité du site")
+        if entretien:
+            self.imputer("Entretien préventif pompe du forage", entretien, equipement=self.pompe_forage)
+        else:
+            self.sans_imputation("Entretien préventif pompe du forage")
+        self.imputer("Sel de régénération", sel)
+        self.imputer("Produit de lavage des filtres", 20000)
+        self.imputer("Analyses par laboratoire externe", 100000)
+        self.imputer("Kits de contrôle interne", 43000)
+
+    def mois_1(self):
+        self.capter(220, 330)
+        ofs = self.produire(100000, 60000, 4000, 1000)
+        self.charges_courantes(500000, 60000, entretien=120000)
+        return ofs
+
+
+class CoutReelTests(BaseScenario):
+
+    def test_mois_1_normal(self):
+        self.mois_1()
+        calcul = calcul_reel(self.usine, MOIS)
+        self.assertEqual(calcul["bloquants"], [])
+        self.assertEqual(calcul["volumes"]["volume_m3"], "200")
+        self.assertEqual(calcul["volumes"]["part_site_eau"], "0.4")
+        self.assertEqual(calcul["volumes"]["taux_pertes_site"], "0.090909")
+        rejet = next(f for f in calcul["volumes"]["formats"] if f["article"] == self.formats["150 cl"].code)
+        self.assertEqual((rejet["taux_rejet"], rejet["classement_rejet"], rejet["eau_rejetee_m3"]), ("0.009901", "Perte normale", "1.5"))
+        self.assertEqual(calcul["electricite"], {
+            "facture_site": "500000.00", "total_kw_heures": "6620", "part_forage": "271903.32",
+            "part_traitement": "77039.27", "part_production_hors_eau": "151057.40",
+        })
+        self.assertEqual(calcul["synthese"], {
+            "cout_forage_avant_partage": "491903.32", "cout_forage_site_eau": "196761.33", "cout_forage_autres_sites": "295141.99",
+            "cout_traitement": "591705.94", "cout_reel_courant": "788467.27", "charges_au_besoin": "0.00",
+            "charges_exceptionnelles": "0.00", "cout_reel_total": "788467.27", "cout_m3": "3942.34", "cout_m3_courant": "3942.34",
+            "cout_standard_m3": "4115.00", "eau_valorisee_of": "823000.00", "ecart_du_mois": "-34532.73",
+            "valeur_perte_anormale": "0.00", "ecart_total_pct": "-4.2", "ecart_courant_pct": "-4.2",
+        })
+        self.assertEqual({l["statut"] for l in calcul["charges_attendues"]}, {"IMPUTEE"})
+
+    def test_mois_2_panne_de_la_pompe_uf_et_production_reduite(self):
+        self.capter(180, 360)
+        self.produire(85000, 50000, 3000, 3000)
+        ExceptionHeures.objects.create(ligne=self.ligne, date=date(2025, 11, 12), heures_en_moins=8, motif="PANNE")
+        ExceptionHeures.objects.create(ligne=self.ligne, date=date(2025, 11, 13), heures_en_moins=8, motif="PANNE")
+        ExceptionHeures.objects.create(ligne=self.ligne, date=date(2025, 11, 14), heures_en_moins=4, motif="PANNE")
+        self.charges_courantes(450000, 55000)
+        self.imputer("Réparation pompe de l'ultrafiltration", 300000, equipement=self.pompe_uf)
+        calcul = calcul_reel(self.usine, MOIS)
+        self.assertEqual(calcul["bloquants"], [])
+        self.assertEqual(calcul["electricite"]["total_kw_heures"], "6318")
+        self.assertEqual(calcul["electricite"]["part_forage"], "256410.26")
+        rejet = next(f for f in calcul["volumes"]["formats"] if f["article"] == self.formats["150 cl"].code)
+        self.assertEqual((rejet["taux_rejet"], rejet["classement_rejet"]), ("0.034091", "Perte anormale"))
+        synthese = calcul["synthese"]
+        attendu = {
+            "cout_forage_avant_partage": "356410.26", "cout_forage_site_eau": "118803.42", "cout_traitement": "575051.28",
+            "cout_reel_courant": "693854.70", "charges_au_besoin": "300000.00", "cout_reel_total": "993854.70",
+            "cout_m3": "5933.46", "cout_m3_courant": "4142.42", "eau_valorisee_of": "689262.50", "ecart_du_mois": "304592.20",
+            "valeur_perte_anormale": "18517.50", "ecart_total_pct": "44.19", "ecart_courant_pct": "0.67",
+        }
+        self.assertEqual({cle: synthese[cle] for cle in attendu}, attendu)
+        statuts = {l["libelle"]: l["statut"] for l in calcul["charges_attendues"]}
+        self.assertEqual(statuts["Entretien préventif pompe du forage"], "VALIDEE_SANS_IMPUTATION")
+
+    def test_mois_3_remplacement_anticipe_de_la_membrane_dp1(self):
+        self.capter(225, 300)
+        self.produire(100000, 60000, 4000, 1000)
+        self.charges_courantes(500000, 62000)
+        dp1 = self.elements["Membrane DP1 (0,01 µ)"]
+        ancien = Installation.objects.create(element=dp1, mois_installation="2024-11", quantite=1, prix_unitaire=1000000, duree_vie_mois=48)
+        remplacement = Intervention.objects.create(equipement=self.pompe_uf, type_intervention="REMPLACEMENT", date=date(2025, 11, 15),
+                                                   description="Membrane DP1 abîmée", element_remplace=dp1)
+        Installation.objects.create(element=dp1, mois_installation=MOIS, quantite=1, prix_unitaire=1100000, duree_vie_mois=48,
+                                    remplace=ancien, intervention=remplacement)
+        synthese = calcul_reel(self.usine, MOIS)["synthese"]
+        attendu = {
+            "cout_forage_avant_partage": "371903.32", "cout_forage_site_eau": "159387.14", "cout_traitement": "595789.27",
+            "cout_reel_courant": "755176.41", "charges_exceptionnelles": "750000.00", "cout_reel_total": "1505176.41",
+            "cout_m3": "7525.88", "cout_m3_courant": "3775.88", "ecart_du_mois": "682176.41",
+            "ecart_total_pct": "82.89", "ecart_courant_pct": "-8.24",
+        }
+        self.assertEqual({cle: synthese[cle] for cle in attendu}, attendu)
+
+    def test_grosse_reparation_etalee_et_regles_des_imputations(self):
+        self.mois_1()
+        reparation = self.elements["Réparation pompe de l'ultrafiltration"]
+        with self.assertRaises(ValidationError):   # réparation sans équipement
+            self.imputer("Réparation pompe de l'ultrafiltration", 100000)
+        with self.assertRaises(ValidationError):   # sous le seuil de grosse réparation : pas d'étalement
+            self.imputer("Réparation pompe de l'ultrafiltration", 400000, equipement=self.pompe_uf, duree_etalement_eau_mois=12)
+        with self.assertRaises(ValidationError):   # une charge étalée ne s'impute pas
+            self.imputer("Charbon actif", 600000)
+        with self.assertRaises(ValidationError):   # seule une réparation s'étale
+            self.imputer("Sel de régénération", 600000, duree_etalement_eau_mois=12)
+        Charge.objects.create(nature=self.nature, periode=MOIS, montant=600000, element_eau=reparation,
+                              equipement=self.pompe_uf, duree_etalement_eau_mois=12)
+        self.assertEqual(calcul_reel(self.usine, MOIS)["synthese"]["charges_au_besoin"], "50000.00")
+        self.assertEqual(calcul_reel(self.usine, "2026-10")["synthese"]["charges_au_besoin"], "50000.00")
+        self.assertEqual(calcul_reel(self.usine, "2026-11")["synthese"]["charges_au_besoin"], "0.00")
+
+
+class ClotureTests(BaseScenario):
+
+    def test_cloture_valorise_les_of_et_fige_le_mois(self):
+        ofs = self.mois_1()
+        cloture = cloturer(self.usine, MOIS)
+        self.assertEqual((cloture.cout_reel_total, cloture.cout_m3, cloture.valorisation_of, cloture.ecart),
+                         (Decimal("788467.27"), Decimal("3942.3364"), Decimal("823000.00"), Decimal("-34532.73")))
+        valorisation = ValorisationEauOF.objects.get(ordre_fabrication=ofs[0])
+        self.assertEqual((valorisation.volume_m3, valorisation.montant_eau, valorisation.electricite_production),
+                         (Decimal("150.000"), Decimal("617250.00"), Decimal("113293.05")))
+        self.assertEqual(sum(v.montant_eau for v in ValorisationEauOF.objects.all()), Decimal("823000.00"))
+        self.assertEqual(CoutReel.objects.get(ordre_fabrication=ofs[0]).cout_eau, Decimal("730543.05"))
+        # Les volumes des débitmètres alimentent la clé du forage du module Coûts.
+        self.assertEqual({v.usine_id: v.volume_m3 for v in VolumeEauSite.objects.filter(periode=MOIS)},
+                         {self.usine.pk: Decimal("220.000"), self.site_jus.pk: Decimal("330.000")})
+        # Le mois est figé.
+        with self.assertRaises(ValidationError):
+            self.imputer("Sel de régénération", 1000)
+        charge = Charge.objects.get(element_eau=self.elements["Sel de régénération"])
+        charge.montant = 70000
+        with self.assertRaises(ValidationError):
+            charge.save()
+        with self.assertRaises(ValidationError):
+            charge.delete()
+        with self.assertRaises(ValidationError):
+            ReleveCompteur.objects.create(compteur=self.debitmetres[self.usine], date=date(2025, 11, 15), index=1100)
+        with self.assertRaises(ValidationError):
+            ExceptionHeures.objects.create(ligne=self.ligne, date=date(2025, 11, 12), heures_en_moins=2, motif="PANNE")
+        with self.assertRaises(ValidationError):
+            cloture.delete()
+        with self.assertRaises(CalculImpossibleReel):
+            cloturer(self.usine, MOIS)
+        # Le résultat conservé ne change plus.
+        self.assertEqual(ClotureMoisEau.objects.get().resultat["synthese"]["cout_reel_total"], "788467.27")
+
+    def test_cloture_refusee_si_charge_attendue_manquante_ou_mois_en_cours(self):
+        self.capter(220, 330)
+        self.produire(100000, 60000, 4000, 1000)
+        self.imputer("Électricité pompe du forage", 500000)
+        with self.assertRaises(CalculImpossibleReel) as erreur:
+            cloturer(self.usine, MOIS)
+        self.assertIn("Sel de régénération", str(erreur.exception))
+        with self.assertRaises(CalculImpossibleReel):
+            cloturer(self.usine, mois_courant())
+        with self.assertRaises(ValidationError):   # déjà imputée : pas de validation sans imputation
+            self.sans_imputation("Électricité pompe du forage")
+        with self.assertRaises(ValidationError):   # motif obligatoire
+            self.sans_imputation("Sel de régénération", motif=" ")
+
+    def test_les_mois_se_cloturent_dans_l_ordre(self):
+        self.mois_1()
+        cloturer(self.usine, MOIS)
+        with self.assertRaises(CalculImpossibleReel) as erreur:
+            cloturer(self.usine, "2026-01")
+        self.assertIn("2025-12", str(erreur.exception))
+
+    def test_alerte_charge_attendue_cinq_jours_avant_la_limite(self):
+        Utilisateur.objects.create_user("compta", password="x", profil=Profil.COMPTABILITE_DAF)
+        self.imputer("Électricité pompe du forage", 500000)
+        signalees = lambda: Notification.objects.filter(titre__startswith="Charge attendue", destinataire__profil=Profil.COMPTABILITE_DAF).count()
+        envoyer_alertes_eau(date(2025, 12, 4))     # limite le 10/12 : trop tôt
+        self.assertEqual(signalees(), 0)
+        envoyer_alertes_eau(date(2025, 12, 5))     # 5 manquantes (l'électricité est imputée), signalées une seule fois
+        envoyer_alertes_eau(date(2025, 12, 6))
+        self.assertEqual(signalees(), 5)
+
+    def test_api(self):
+        self.mois_1()
+        controle = self.client_pour(Profil.CONTROLE_GESTION)
+        self.assertEqual(self.client_pour(Profil.TECHNICIEN_EAU).get(f"/api/eau/reel/calcul/?usine={self.usine.pk}&mois={MOIS}").status_code, 403)
+        reponse = controle.get(f"/api/eau/reel/calcul/?usine={self.usine.pk}&mois={MOIS}")
+        self.assertEqual((reponse.status_code, reponse.data["synthese"]["cout_reel_total"], reponse.data["cloture"]), (200, "788467.27", None))
+        reponse = self.client_pour(Profil.COMPTABILITE_DAF).get(f"/api/eau/reel/charges-attendues/?usine={self.usine.pk}&mois={MOIS}")
+        self.assertEqual((reponse.data["date_limite"], len(reponse.data["charges"])), ("2025-12-10", 6))
+        self.assertEqual(self.client_pour(Profil.COMPTABILITE_DAF).post("/api/eau/clotures/cloturer/", {"usine": self.usine.pk, "mois": MOIS}, format="json").status_code, 403)
+        reponse = controle.post("/api/eau/clotures/cloturer/", {"usine": self.usine.pk, "mois": MOIS}, format="json")
+        self.assertEqual((reponse.status_code, reponse.data["cout_reel_total"]), (201, "788467.27"))
+        self.assertEqual(controle.post("/api/eau/clotures/cloturer/", {"usine": self.usine.pk, "mois": MOIS}, format="json").status_code, 400)
+        reponse = controle.get(f"/api/eau/reel/calcul/?usine={self.usine.pk}&mois={MOIS}")
+        self.assertIsNotNone(reponse.data["cloture"])
+        self.assertEqual(len(controle.get("/api/eau/valorisations-of/").data["results"] if isinstance(controle.get("/api/eau/valorisations-of/").data, dict) else controle.get("/api/eau/valorisations-of/").data), 3)
+
+
+class CoutReelOFTests(BaseScenario):
+    """Après la clôture, le coût réel de l'OF prend l'eau au standard à la place des charges amont de la cascade."""
+
+    def test_charges_amont_remplacees_par_l_eau_au_standard(self):
+        from apps.couts.models import RepartitionCout
+        of = self.mois_1()[0]
+        amont = Charge.objects.create(nature=NatureCout.objects.create(
+            libelle="Traitement (cascade)", etape=EtapeStandard.objects.get(code="UV"), inducteur="VOLUME_EAU_M3"), periode=MOIS, montant=1000)
+        aval = Charge.objects.create(nature=NatureCout.objects.create(
+            libelle="Soutirage (cascade)", etape=self.poste_remplissage.etape, inducteur="BOUTEILLES"), periode=MOIS, montant=400)
+        for charge in (amont, aval, Charge.objects.get(element_eau=self.elements["Sel de régénération"])):
+            RepartitionCout.objects.create(charge=charge, niveau="PRODUIT", ordre_fabrication=of, article=of.article,
+                                           inducteur=charge.nature.inducteur, quote_part=1, montant=charge.montant, statut="REPARTI")
+        cout = CoutReel.objects.create(ordre_fabrication=of).calculer()
+        self.assertEqual((cout.cout_charges_reparties, cout.cout_eau), (Decimal("61400.00"), 0))
+        cloturer(self.usine, MOIS)
+        cout.refresh_from_db()
+        self.assertEqual((cout.cout_charges_reparties, cout.cout_eau), (Decimal("400.00"), Decimal("730543.05")))
+        self.assertEqual(cout.cout_total, Decimal("730943.05"))

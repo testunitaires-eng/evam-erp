@@ -435,10 +435,50 @@ Phase 4 (maintenance) :
   de la durée de vie), envoyées une seule fois aux techniciens et au
   contrôle de gestion.
 
-À venir : coût réel et clôture (dont le rattachement des factures de
-réparation et l'étalement des grosses réparations), révision du
-standard, puis valorisation PEPS / FIFO (en attente de l'avis de
-l'expert-comptable).
+Phase 5 (coût réel et clôture, onglet « Scénario 3 mois ») :
+- **Une seule saisie des charges réelles** : les charges du module
+  Coûts (`/api/couts/charges/`, HT, au mois de consommation) portent un
+  champ `element_eau` qui les rattache à un élément du coût de l'eau. Une
+  réparation exige l'équipement réparé ; une charge étalée ne s'impute
+  pas (elle se calcule seule : versions et pièces installées) ; une
+  grosse réparation au-delà du seuil peut être étalée
+  (`duree_etalement_eau_mois`).
+- Les charges rattachées à un élément « Électricité » forment la facture
+  du site : elle est répartie aux kW × heures de chaque équipement
+  (forage, traitement, et production hors coût de l'eau).
+- `GET /api/eau/reel/calcul/?usine=<id>&mois=AAAA-MM` : volume (bouteilles
+  conformes des OF du site clôturés dans le mois × contenance), taux de
+  rejet par format (perte anormale au-delà du taux toléré), part réelle
+  du site eau (débitmètres), taux de pertes, électricité répartie, chaque
+  charge (prévu / réel), coût du forage (site eau et autres sites), du
+  traitement, charges au besoin et exceptionnelles (valeurs résiduelles)
+  à part, coût au m³ total et hors charges au besoin, eau valorisée dans
+  les OF au standard, écart du mois, valeur de la perte anormale. Le
+  scénario du classeur est retrouvé au centime sur les 3 mois.
+- **Charges attendues** : un élément coché « attendue chaque mois » doit
+  être imputé ou validé « sans imputation » avec un motif
+  (`/api/eau/validations-sans-imputation/`, comptabilité ou contrôle de
+  gestion) ; état : `GET /api/eau/reel/charges-attendues/?usine=&mois=`.
+  `alertes_eau` prévient la comptabilité et le contrôle de gestion 5 jours
+  avant la date limite (jour de clôture du mois suivant).
+- `POST /api/eau/clotures/cloturer/ {"usine", "mois"}` (contrôle de
+  gestion) : refusée si le mois n'est pas terminé, si le mois précédent
+  n'est pas clôturé, s'il manque une charge attendue, les débitmètres, le
+  volume ou un standard validé. La clôture conserve le calcul du jour,
+  **fige le mois** (relevés, exceptions, pertes, interventions, pièces,
+  charges rattachées à l'eau : ni création, ni modification, ni
+  suppression) et ne s'annule pas.
+- À la clôture, l'eau de chaque OF du mois est valorisée au coût
+  standard (`/api/eau/valorisations-of/`), avec sa part de l'électricité
+  des machines de production. Le coût réel de l'OF prend alors cette
+  valeur **à la place** des charges amont de la cascade (forage,
+  traitement), pour ne rien compter deux fois. Les volumes des débitmètres
+  sont reportés dans les relevés d'eau brute du module Coûts (clé de
+  répartition du forage pour Jus et Yaourt) s'ils n'y sont pas déjà.
+
+À venir : révision du standard (décision après clôture, seuil de volume
+minimal), puis valorisation PEPS / FIFO des sorties de stock (en attente
+de l'avis de l'expert-comptable).
 
 ---
 

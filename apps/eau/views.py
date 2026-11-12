@@ -13,7 +13,7 @@ from rest_framework.response import Response
 from apps.comptes.models import Profil
 from apps.comptes.permissions import acces
 from apps.core.views import HistoriqueMixin
-from . import calculs, maintenance, models, serializers, traitement
+from . import calculs, maintenance, models, reel, serializers, traitement
 
 CONSULTATION = (Profil.DIRECTION, Profil.COMPTABILITE_DAF, Profil.ADMIN_SI)
 PARAMETRES = acces(lecture=CONSULTATION, ecriture=(Profil.CONTROLE_GESTION,))
@@ -261,7 +261,7 @@ def synthese_traitement(request):
     usine = Usine.objects.filter(pk=valeur).first() if valeur.isdigit() else None
     if usine is None or mois is None:
         return Response({"erreur": "Paramètres attendus : usine=<id> et mois=AAAA-MM."}, status=400)
-    return Response(traitement.synthese_mois(usine, mois))
+    return Response(traitement.sans_valeurs_exactes(traitement.synthese_mois(usine, mois)))
 
 
 # =====================================================================
@@ -297,3 +297,80 @@ def echeances_maintenance(request):
     if usine is None:
         return Response({"erreur": "Paramètre attendu : usine=<id>."}, status=400)
     return Response(maintenance.echeances(usine))
+
+
+# =====================================================================
+# Phase 5 - coût réel et clôture
+# =====================================================================
+
+def _usine_et_mois(request, source):
+    from apps.industriel.models import Usine
+    valeur, mois = str(source.get("usine") or ""), source.get("mois") or ""
+    usine = Usine.objects.filter(pk=valeur).first() if valeur.isdigit() else None
+    if usine is None or not models.FORMAT_MOIS.fullmatch(mois):
+        return None, None
+    return usine, mois
+
+
+class ValidationSansImputationViewSet(viewsets.ModelViewSet):
+    """Charges attendues absentes validées « sans imputation » (comptabilité ou contrôle de gestion), avec un motif."""
+    queryset = models.ValidationSansImputation.objects.select_related("element", "valide_par")
+    serializer_class = serializers.ValidationSansImputationSerializer
+    permission_classes = [acces(lecture=CONSULTATION, ecriture=(Profil.COMPTABILITE_DAF, Profil.CONTROLE_GESTION))]
+    filterset_fields = ["element", "element__usine", "mois"]
+
+    def perform_create(self, serializer):
+        serializer.save(valide_par=self.request.user)
+
+
+class ClotureMoisEauViewSet(viewsets.ReadOnlyModelViewSet):
+    """Clôtures des mois (coût réel conservé). POST .../clotures/cloturer/ {"usine", "mois"} : contrôle de gestion."""
+    queryset = models.ClotureMoisEau.objects.select_related("usine", "cloture_par")
+    serializer_class = serializers.ClotureMoisEauSerializer
+    permission_classes = [PARAMETRES]
+    filterset_fields = ["usine", "mois"]
+
+    @action(detail=False, methods=["post"])
+    def cloturer(self, request):
+        usine, mois = _usine_et_mois(request, request.data)
+        if usine is None:
+            return Response({"erreur": "Paramètres attendus : usine=<id> et mois=AAAA-MM."}, status=400)
+        try:
+            cloture = reel.cloturer(usine, mois, request.user)
+        except ValueError as erreur:
+            return Response({"erreur": str(erreur)}, status=400)
+        return Response(self.get_serializer(cloture).data, status=201)
+
+
+class ValorisationEauOFViewSet(viewsets.ReadOnlyModelViewSet):
+    queryset = models.ValorisationEauOF.objects.select_related("cloture", "ordre_fabrication")
+    serializer_class = serializers.ValorisationEauOFSerializer
+    permission_classes = [PARAMETRES]
+    filterset_fields = ["cloture", "cloture__usine", "cloture__mois", "ordre_fabrication"]
+
+
+@api_view(["GET"])
+@permission_classes([PARAMETRES])
+def cout_reel(request):
+    """GET /api/eau/reel/calcul/?usine=<id>&mois=AAAA-MM : coût réel du mois (calculé à la volée ; mois clôturé : le résultat conservé)."""
+    usine, mois = _usine_et_mois(request, request.query_params)
+    if usine is None:
+        return Response({"erreur": "Paramètres attendus : usine=<id> et mois=AAAA-MM."}, status=400)
+    cloture = models.ClotureMoisEau.objects.filter(usine=usine, mois=mois).first()
+    if cloture is not None:
+        return Response({**cloture.resultat, "cloture": serializers.ClotureMoisEauSerializer(cloture).data["date_cloture"]})
+    return Response({**reel.sans_valeurs_exactes(reel.calcul_reel(usine, mois)), "cloture": None})
+
+
+@api_view(["GET"])
+@permission_classes([PARAMETRES])
+def charges_attendues(request):
+    """GET /api/eau/reel/charges-attendues/?usine=<id>&mois=AAAA-MM : imputées, validées sans imputation, manquantes."""
+    usine, mois = _usine_et_mois(request, request.query_params)
+    if usine is None:
+        return Response({"erreur": "Paramètres attendus : usine=<id> et mois=AAAA-MM."}, status=400)
+    return Response({
+        "usine": usine.code, "mois": mois, "date_limite": str(reel.date_limite_cloture(usine, mois)),
+        "cloture": models.ClotureMoisEau.objects.filter(usine=usine, mois=mois).exists(),
+        "charges": reel.charges_attendues(usine, mois),
+    })

@@ -11,6 +11,8 @@ partie B - Alertes), sans aucun coût : consultables par les techniciens.
   à l'échéance.
 - Fin de vie : un lot étalé encore (en partie) en place, dans son
   dernier mois de durée de vie (alerte « 1 mois avant » la fin) ou au-delà.
+- Charge attendue non imputée : 5 jours avant la date limite de clôture
+  du mois précédent (comptabilité et contrôle de gestion).
 
 envoyer_alertes() est appelé chaque jour par la commande `alertes_eau` ;
 chaque alerte n'est envoyée qu'une fois (AlerteEnvoyee).
@@ -151,5 +153,34 @@ def envoyer_alertes(jour=None):
                      f"{usine.code} - installé(e) en {ligne['mois_installation']}, durée de vie {ligne['duree_vie_mois']} mois : "
                      f"dernier mois {ligne['dernier_mois']}. Prévoir le remplacement.",
                      profils=destinataires)
+            envoyees += 1
+    envoyees += _alertes_charges_attendues(jour)
+    return envoyees
+
+
+PREAVIS_CLOTURE_JOURS = 5
+
+
+def _alertes_charges_attendues(jour):
+    """5 jours avant la date limite de clôture : charges attendues ni imputées ni validées sans imputation."""
+    from apps.comptes.models import Profil
+    from apps.core.notifications import notifier
+    from apps.industriel.models import Usine
+    from .models import ClotureMoisEau
+    from .reel import charges_attendues, date_limite_cloture, mois_a_cloturer
+    mois = mois_a_cloturer(jour)
+    envoyees = 0
+    for usine in Usine.objects.filter(elements_cout_eau__attendue_chaque_mois=True).distinct():
+        limite = date_limite_cloture(usine, mois)
+        if jour < limite - timedelta(days=PREAVIS_CLOTURE_JOURS) or ClotureMoisEau.objects.filter(usine=usine, mois=mois).exists():
+            continue
+        for ligne in charges_attendues(usine, mois):
+            if ligne["statut"] != "MANQUANTE" or not _premiere_fois(f"attendue:{ligne['element']}:{mois}"):
+                continue
+            notifier(
+                f"Charge attendue non imputée : {ligne['libelle']}",
+                f"{usine.code} - {mois} : à imputer ou à valider « sans imputation » (avec un motif) avant le {limite:%d/%m/%Y}.",
+                profils=[Profil.COMPTABILITE_DAF, Profil.CONTROLE_GESTION],
+            )
             envoyees += 1
     return envoyees

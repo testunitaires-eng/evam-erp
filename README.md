@@ -379,8 +379,37 @@ Phase 2 (prévisionnel et coût standard, onglet « Calcul coût eau ») :
   puis ne se modifie ni ne se supprime ; `.../en_vigueur/?usine=&mois=`
   donne celui qui s'applique, `.../{id}/historique/` qui a fait quoi.
 
-À venir : saisies du traitement (compteurs, heures, pressions, pertes),
-maintenance, coût réel et clôture, révision du standard, puis
+Phase 3 (module « Traitement de l'eau » : saisies des techniciens, sans
+aucun coût) :
+- `/api/eau/compteurs/` : le compteur du forage (eau captée au total)
+  et un débitmètre par site desservi. `/api/eau/releves-compteurs/` :
+  un index par compteur et par jour ; un index ne baisse jamais.
+- `/api/eau/exceptions-heures/` : heures en moins un jour donné (arrêt,
+  panne, ligne à l'arrêt...) pour un équipement ou une **ligne entière**.
+  Les heures standard (caractéristiques de l'équipement : heures par
+  jour + jours de marche — tous les jours, lundi-samedi ou
+  lundi-vendredi) sont reportées automatiquement chaque jour. La
+  Production saisit aussi les exceptions de ses machines.
+- `/api/eau/releves-pression/` : pression d'une membrane ; au-delà de la
+  pression maximale de l'équipement, les techniciens reçoivent une
+  notification immédiate.
+- `/api/eau/pertes/` : volume estimé ou bouteilles d'un format ; le type
+  (normale / anormale) découle de la cause (rinçage, lavages, CIP,
+  rejets UF = normales ; fuite, débordement, lot rejeté, casse =
+  anormales ; « Autre » : à choisir, avec un commentaire). Saisie par
+  les techniciens et la Production.
+- `GET /api/eau/traitement/synthese/?usine=<id>&mois=AAAA-MM` : volume
+  de chaque compteur (dernier index du mois − dernier index du mois
+  précédent), part réelle du site eau dans le forage, écart entre le
+  compteur du forage et les débitmètres, heures machine par équipement
+  (standard − exceptions, jusqu'à aujourd'hui pour le mois en cours)
+  avec kW × heures, pertes normales et anormales du mois.
+
+Les contrôles qualité restent dans le module `qualite` et les
+consommations dans `stocks` : leur rattachement au coût de l'eau se fera
+avec le coût réel.
+
+À venir : maintenance, coût réel et clôture, révision du standard, puis
 valorisation PEPS / FIFO (en attente de l'avis de l'expert-comptable).
 
 ---

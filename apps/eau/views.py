@@ -13,7 +13,7 @@ from rest_framework.response import Response
 from apps.comptes.models import Profil
 from apps.comptes.permissions import acces
 from apps.core.views import HistoriqueMixin
-from . import calculs, models, serializers
+from . import calculs, models, serializers, traitement
 
 CONSULTATION = (Profil.DIRECTION, Profil.COMPTABILITE_DAF, Profil.ADMIN_SI)
 PARAMETRES = acces(lecture=CONSULTATION, ecriture=(Profil.CONTROLE_GESTION,))
@@ -195,3 +195,70 @@ class CoutStandardEauViewSet(HistoriqueMixin, viewsets.ReadOnlyModelViewSet):
             return Response({"erreur": "Le mois doit être au format AAAA-MM."}, status=400)
         standard = models.CoutStandardEau.en_vigueur(mois, usine_id=request.query_params.get("usine"))
         return Response(self.get_serializer(standard).data if standard else None)
+
+
+# =====================================================================
+# Phase 3 - saisies du traitement de l'eau (techniciens, sans coûts)
+# =====================================================================
+
+LECTEURS_TRAITEMENT = CONSULTATION + (Profil.CONTROLE_GESTION, Profil.TECHNICIEN_EAU, Profil.RESPONSABLE_PRODUCTION)
+SAISIE_TECHNICIENS = acces(lecture=LECTEURS_TRAITEMENT, ecriture=(Profil.TECHNICIEN_EAU,))
+
+
+class SaisieViewSet(viewsets.ModelViewSet):
+    def perform_create(self, serializer):
+        serializer.save(saisi_par=self.request.user)
+
+
+class CompteurViewSet(viewsets.ModelViewSet):
+    """Compteur du forage et débitmètres (renseignés par les techniciens)."""
+    queryset = models.Compteur.objects.select_related("usine", "site_desservi")
+    serializer_class = serializers.CompteurSerializer
+    permission_classes = [acces(lecture=LECTEURS_TRAITEMENT, ecriture=(Profil.TECHNICIEN_EAU, Profil.CONTROLE_GESTION))]
+    filterset_fields = ["usine", "type_compteur", "site_desservi", "actif"]
+
+
+class ReleveCompteurViewSet(SaisieViewSet):
+    queryset = models.ReleveCompteur.objects.select_related("compteur", "saisi_par")
+    serializer_class = serializers.ReleveCompteurSerializer
+    permission_classes = [SAISIE_TECHNICIENS]
+    filterset_fields = {"compteur": ["exact"], "compteur__usine": ["exact"], "date": ["exact", "gte", "lte"]}
+
+
+class ExceptionHeuresViewSet(SaisieViewSet):
+    """Exceptions d'heures machine : techniciens, et la Production pour ses machines."""
+    queryset = models.ExceptionHeures.objects.select_related("equipement", "ligne", "saisi_par")
+    serializer_class = serializers.ExceptionHeuresSerializer
+    permission_classes = [acces(lecture=LECTEURS_TRAITEMENT, ecriture=(Profil.TECHNICIEN_EAU, Profil.RESPONSABLE_PRODUCTION))]
+    filterset_fields = {"equipement": ["exact"], "ligne": ["exact"], "motif": ["exact"], "date": ["exact", "gte", "lte"]}
+
+
+class RelevePressionViewSet(SaisieViewSet):
+    queryset = models.RelevePression.objects.select_related("equipement", "saisi_par")
+    serializer_class = serializers.RelevePressionSerializer
+    permission_classes = [SAISIE_TECHNICIENS]
+    filterset_fields = {"equipement": ["exact"], "date": ["exact", "gte", "lte"]}
+
+
+class PerteEauViewSet(SaisieViewSet):
+    """Pertes d'eau : techniciens et production."""
+    queryset = models.PerteEau.objects.select_related("usine", "article", "saisi_par")
+    serializer_class = serializers.PerteEauSerializer
+    permission_classes = [acces(
+        lecture=LECTEURS_TRAITEMENT,
+        ecriture=(Profil.TECHNICIEN_EAU, Profil.RESPONSABLE_PRODUCTION, Profil.AGENT_PRODUCTION),
+    )]
+    filterset_fields = {"usine": ["exact"], "type_perte": ["exact"], "cause": ["exact"], "date": ["exact", "gte", "lte"]}
+
+
+@api_view(["GET"])
+@permission_classes([acces(lecture=LECTEURS_TRAITEMENT)])
+def synthese_traitement(request):
+    """GET /api/eau/traitement/synthese/?usine=<id>&mois=AAAA-MM : volumes, partage du forage, heures machine, pertes du mois."""
+    from apps.industriel.models import Usine
+    mois = _mois_demande(request)
+    valeur = request.query_params.get("usine", "")
+    usine = Usine.objects.filter(pk=valeur).first() if valeur.isdigit() else None
+    if usine is None or mois is None:
+        return Response({"erreur": "Paramètres attendus : usine=<id> et mois=AAAA-MM."}, status=400)
+    return Response(traitement.synthese_mois(usine, mois))

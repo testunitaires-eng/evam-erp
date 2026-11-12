@@ -53,3 +53,40 @@ class CoutStandardEauAdmin(admin.ModelAdmin):
     list_display = ("usine", "mois_application", "cout_m3", "statut", "origine", "propose_par", "valide_par", "date_validation")
     list_filter = ("usine", "statut", "origine")
     readonly_fields = [champ.name for champ in models.CoutStandardEau._meta.fields]
+
+
+@admin.register(models.Compteur)
+class CompteurAdmin(admin.ModelAdmin):
+    list_display = ("code", "libelle", "type_compteur", "usine", "site_desservi", "actif")
+    list_filter = ("usine", "type_compteur", "actif")
+
+
+@admin.register(models.ReleveCompteur)
+class ReleveCompteurAdmin(admin.ModelAdmin):
+    list_display = ("compteur", "date", "index", "saisi_par")
+    list_filter = ("compteur",)
+    date_hierarchy = "date"
+    readonly_fields = ("saisi_par", "date_saisie")
+
+
+@admin.register(models.ExceptionHeures)
+class ExceptionHeuresAdmin(admin.ModelAdmin):
+    list_display = ("date", "equipement", "ligne", "heures_en_moins", "motif", "saisi_par")
+    list_filter = ("motif",)
+    date_hierarchy = "date"
+    readonly_fields = ("saisi_par", "date_saisie")
+
+
+@admin.register(models.RelevePression)
+class RelevePressionAdmin(admin.ModelAdmin):
+    list_display = ("equipement", "date", "pression_bar", "saisi_par")
+    date_hierarchy = "date"
+    readonly_fields = ("saisi_par", "date_saisie")
+
+
+@admin.register(models.PerteEau)
+class PerteEauAdmin(admin.ModelAdmin):
+    list_display = ("date", "usine", "cause", "type_perte", "volume_estime_m3", "article", "nombre_bouteilles", "saisi_par")
+    list_filter = ("usine", "type_perte", "cause")
+    date_hierarchy = "date"
+    readonly_fields = ("saisi_par", "date_saisie")

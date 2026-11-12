@@ -78,3 +78,52 @@ class CoutStandardEauSerializer(serializers.ModelSerializer):
         model = models.CoutStandardEau
         fields = "__all__"
         read_only_fields = [champ.name for champ in models.CoutStandardEau._meta.fields]
+
+
+# Phase 3 - saisies du traitement de l'eau
+
+class CompteurSerializer(ValidationModeleMixin, serializers.ModelSerializer):
+    class Meta:
+        model = models.Compteur
+        fields = "__all__"
+
+
+class SaisieSerializer(ValidationModeleMixin, serializers.ModelSerializer):
+    saisi_par_nom = serializers.CharField(source="saisi_par.username", read_only=True, default=None)
+
+
+class ReleveCompteurSerializer(SaisieSerializer):
+    compteur_code = serializers.CharField(source="compteur.code", read_only=True)
+
+    class Meta:
+        model = models.ReleveCompteur
+        fields = "__all__"
+        read_only_fields = ["saisi_par", "date_saisie"]
+
+
+class ExceptionHeuresSerializer(SaisieSerializer):
+    class Meta:
+        model = models.ExceptionHeures
+        fields = "__all__"
+        read_only_fields = ["saisi_par", "date_saisie"]
+
+
+class RelevePressionSerializer(SaisieSerializer):
+    equipement_code = serializers.CharField(source="equipement.code", read_only=True)
+    pression_max = serializers.DecimalField(max_digits=8, decimal_places=3, read_only=True, allow_null=True)
+    au_dessus_du_seuil = serializers.BooleanField(read_only=True)
+
+    class Meta:
+        model = models.RelevePression
+        fields = "__all__"
+        read_only_fields = ["saisi_par", "date_saisie"]
+
+
+class PerteEauSerializer(SaisieSerializer):
+    volume_m3 = serializers.DecimalField(max_digits=12, decimal_places=3, read_only=True, allow_null=True)
+
+    class Meta:
+        model = models.PerteEau
+        fields = "__all__"
+        read_only_fields = ["saisi_par", "date_saisie"]
+        extra_kwargs = {"type_perte": {"required": False}}

@@ -302,6 +302,20 @@ class ParametresEau(Versionnee):
 # Caractéristiques des équipements
 # =====================================================================
 
+class JoursMarche(models.TextChoices):
+    TOUS = "TOUS", "Tous les jours"
+    LUNDI_SAMEDI = "LUNDI_SAMEDI", "Du lundi au samedi"
+    LUNDI_VENDREDI = "LUNDI_VENDREDI", "Du lundi au vendredi"
+
+
+# Jours de la semaine concernés (lundi = 0).
+JOURS_DE_LA_SEMAINE = {
+    JoursMarche.TOUS: frozenset(range(7)),
+    JoursMarche.LUNDI_SAMEDI: frozenset(range(6)),
+    JoursMarche.LUNDI_VENDREDI: frozenset(range(5)),
+}
+
+
 class CaracteristiquesEquipement(Versionnee):
     """
     Puissance et heures de marche standard d'un équipement (onglet
@@ -323,6 +337,14 @@ class CaracteristiquesEquipement(Versionnee):
         "Heures de marche standard par jour", max_digits=4, decimal_places=2, null=True, blank=True,
         help_text="Ex : pompe du forage 24 h/jour.",
     )
+    jours_de_marche = models.CharField(
+        "Jours de marche", max_length=15, choices=JoursMarche.choices, default=JoursMarche.TOUS,
+        help_text="Jours où les heures standard sont reportées (ex : pompes du traitement selon le planning de production).",
+    )
+    pression_max_bar = models.DecimalField(
+        "Pression maximale (bar)", max_digits=8, decimal_places=3, null=True, blank=True,
+        help_text="Membranes : au-delà, alerte d'encrassement aux techniciens.",
+    )
 
     class Meta:
         verbose_name = "Caractéristiques d'un équipement (eau)"
@@ -341,8 +363,9 @@ class CaracteristiquesEquipement(Versionnee):
 
     def clean(self):
         self.clean_version()
-        if self.puissance_kw is None and self.heures_marche_jour is None:
-            raise ValidationError("Indiquez au moins la puissance ou les heures de marche standard.")
+        if self.puissance_kw is None and self.heures_marche_jour is None and self.pression_max_bar is None:
+            raise ValidationError("Indiquez au moins la puissance, les heures de marche standard ou la pression maximale.")
+        exiger_positif_optionnel(self.pression_max_bar, "pression_max_bar", "La pression maximale", strict=True)
         exiger_positif_optionnel(self.puissance_kw, "puissance_kw", "La puissance", strict=True)
         exiger_positif_optionnel(self.heures_marche_jour, "heures_marche_jour", "Les heures de marche")
         if self.heures_marche_jour is not None and self.heures_marche_jour > 24:
@@ -635,3 +658,273 @@ class CoutStandardEau(ValidationAvantEnregistrement, models.Model):
         if not (motif or "").strip():
             raise ValueError("Le motif du rejet est obligatoire.")
         self._decider(utilisateur, StatutStandard.REJETE, motif)
+
+
+# =====================================================================
+# Phase 3 - Saisies du module « Traitement de l'eau » (techniciens)
+# =====================================================================
+
+def _pas_dans_le_futur(jour, champ="date"):
+    if jour and jour > timezone.localdate():
+        raise ValidationError({champ: "On ne saisit pas une date future."})
+
+
+class TypeCompteur(models.TextChoices):
+    COMPTEUR_FORAGE = "COMPTEUR_FORAGE", "Compteur du forage (eau captée au total)"
+    DEBITMETRE = "DEBITMETRE", "Débitmètre forage -> site"
+
+
+class Compteur(ValidationAvantEnregistrement, models.Model):
+    """
+    Instrument de mesure relevé chaque jour par les techniciens du site
+    eau : le compteur du forage (eau captée au total) et un débitmètre
+    par site desservi. Les débitmètres donnent la part de chaque site
+    dans le forage ; le compteur du forage, le contrôle des pertes.
+    """
+    code = models.CharField("Code", max_length=30, unique=True)
+    libelle = models.CharField("Libellé", max_length=100)
+    type_compteur = models.CharField("Type", max_length=20, choices=TypeCompteur.choices)
+    usine = models.ForeignKey(
+        "industriel.Usine", verbose_name="Site qui le relève", on_delete=models.PROTECT, related_name="compteurs_eau",
+    )
+    site_desservi = models.ForeignKey(
+        "industriel.Usine", verbose_name="Site desservi", on_delete=models.PROTECT, null=True, blank=True, related_name="+",
+        help_text="Débitmètre : le site vers lequel part l'eau mesurée.",
+    )
+    actif = models.BooleanField("Actif", default=True)
+
+    class Meta:
+        verbose_name = "Compteur / débitmètre"
+        verbose_name_plural = "Compteurs et débitmètres"
+        ordering = ["usine", "type_compteur", "code"]
+
+    def __str__(self):
+        return f"{self.code} - {self.libelle}"
+
+    def clean(self):
+        if self.type_compteur == TypeCompteur.DEBITMETRE and not self.site_desservi_id:
+            raise ValidationError({"site_desservi": "Indiquez le site desservi par ce débitmètre."})
+        if self.type_compteur == TypeCompteur.COMPTEUR_FORAGE and self.site_desservi_id:
+            raise ValidationError({"site_desservi": "Le compteur du forage mesure l'eau captée au total : pas de site desservi."})
+
+
+class ReleveCompteur(ValidationAvantEnregistrement, models.Model):
+    """Index d'un compteur un jour donné. Les index ne baissent jamais d'un relevé à l'autre."""
+    compteur = models.ForeignKey(Compteur, verbose_name="Compteur", on_delete=models.PROTECT, related_name="releves")
+    date = models.DateField("Date du relevé")
+    index = models.DecimalField("Index (m³)", max_digits=14, decimal_places=3)
+    observations = models.CharField("Observations", max_length=200, blank=True)
+    saisi_par = models.ForeignKey("comptes.Utilisateur", verbose_name="Saisi par", on_delete=models.PROTECT, null=True, blank=True, related_name="+")
+    date_saisie = models.DateTimeField("Saisi le", auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Relevé de compteur"
+        verbose_name_plural = "Relevés de compteurs"
+        ordering = ["compteur", "-date"]
+        constraints = [models.UniqueConstraint(fields=["compteur", "date"], name="releve_compteur_unique_par_jour")]
+
+    def __str__(self):
+        return f"{self.compteur.code} {self.date} : {self.index}"
+
+    def clean(self):
+        _pas_dans_le_futur(self.date)
+        exiger_positif(self.index, "index", "L'index", strict=False)
+        if not self.compteur_id or not self.date:
+            return
+        if not self.compteur.actif:
+            raise ValidationError({"compteur": "Ce compteur n'est plus actif."})
+        autres = ReleveCompteur.objects.filter(compteur_id=self.compteur_id).exclude(pk=self.pk)
+        if autres.filter(date=self.date).exists():
+            raise ValidationError({"date": f"Ce compteur est déjà relevé le {self.date:%d/%m/%Y} : corrigez ce relevé."})
+        avant = autres.filter(date__lt=self.date).order_by("-date").first()
+        apres = autres.filter(date__gt=self.date).order_by("date").first()
+        if avant is not None and self.index < avant.index:
+            raise ValidationError({"index": f"L'index ne peut pas baisser : {avant.index} relevé le {avant.date:%d/%m/%Y}."})
+        if apres is not None and self.index > apres.index:
+            raise ValidationError({"index": f"L'index dépasse celui relevé le {apres.date:%d/%m/%Y} ({apres.index})."})
+
+
+class MotifArret(models.TextChoices):
+    ARRET_PROGRAMME = "ARRET_PROGRAMME", "Arrêt programmé"
+    PANNE = "PANNE", "Panne"
+    LIGNE_ARRETEE = "LIGNE_ARRETEE", "Ligne à l'arrêt"
+    MAINTENANCE = "MAINTENANCE", "Maintenance"
+    COUPURE_COURANT = "COUPURE_COURANT", "Coupure de courant"
+    AUTRE = "AUTRE", "Autre"
+
+
+class ExceptionHeures(ValidationAvantEnregistrement, models.Model):
+    """
+    Heures de marche en moins un jour donné, pour un équipement ou pour
+    une ligne entière (tous les équipements dont le poste est sur la
+    ligne). Les heures standard sont reportées automatiquement chaque
+    jour : seules les exceptions se saisissent (règle 8).
+    """
+    date = models.DateField("Date")
+    equipement = models.ForeignKey(
+        "industriel.Equipement", verbose_name="Équipement", on_delete=models.PROTECT, null=True, blank=True, related_name="+",
+    )
+    ligne = models.ForeignKey(
+        "industriel.Ligne", verbose_name="Ligne entière", on_delete=models.PROTECT, null=True, blank=True, related_name="+",
+    )
+    heures_en_moins = models.DecimalField("Heures en moins", max_digits=4, decimal_places=2)
+    motif = models.CharField("Motif", max_length=20, choices=MotifArret.choices)
+    commentaire = models.CharField("Commentaire", max_length=200, blank=True)
+    saisi_par = models.ForeignKey("comptes.Utilisateur", verbose_name="Saisi par", on_delete=models.PROTECT, null=True, blank=True, related_name="+")
+    date_saisie = models.DateTimeField("Saisi le", auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Exception d'heures machine"
+        verbose_name_plural = "Exceptions d'heures machine"
+        ordering = ["-date", "pk"]
+
+    def __str__(self):
+        cible = self.equipement.code if self.equipement_id else f"ligne {self.ligne.code}"
+        return f"{cible} {self.date} : -{self.heures_en_moins} h"
+
+    def clean(self):
+        _pas_dans_le_futur(self.date)
+        if bool(self.equipement_id) == bool(self.ligne_id):
+            raise ValidationError("Indiquez soit un équipement, soit une ligne entière.")
+        exiger_positif(self.heures_en_moins, "heures_en_moins", "Le nombre d'heures en moins")
+        if self.heures_en_moins > 24:
+            raise ValidationError({"heures_en_moins": "Une journée compte au plus 24 heures."})
+        if self.motif == MotifArret.AUTRE and not (self.commentaire or "").strip():
+            raise ValidationError({"commentaire": "Précisez le motif."})
+
+
+class RelevePression(ValidationAvantEnregistrement, models.Model):
+    """
+    Relevé de pression (« DP ») d'une membrane. Au-delà de la pression
+    maximale paramétrée pour l'équipement, les techniciens sont alertés
+    immédiatement (encrassement).
+    """
+    equipement = models.ForeignKey("industriel.Equipement", verbose_name="Membrane / équipement", on_delete=models.PROTECT, related_name="+")
+    date = models.DateField("Date")
+    pression_bar = models.DecimalField("Pression (bar)", max_digits=8, decimal_places=3)
+    observations = models.CharField("Observations", max_length=200, blank=True)
+    saisi_par = models.ForeignKey("comptes.Utilisateur", verbose_name="Saisi par", on_delete=models.PROTECT, null=True, blank=True, related_name="+")
+    date_saisie = models.DateTimeField("Saisi le", auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Relevé de pression"
+        verbose_name_plural = "Relevés de pression"
+        ordering = ["-date", "equipement"]
+
+    def __str__(self):
+        return f"{self.equipement.code} {self.date} : {self.pression_bar} bar"
+
+    @property
+    def pression_max(self):
+        if not self.equipement_id or not self.date:
+            return None
+        version = CaracteristiquesEquipement.en_vigueur(mois_de(self.date), equipement_id=self.equipement_id)
+        return version.pression_max_bar if version else None
+
+    @property
+    def au_dessus_du_seuil(self):
+        seuil = self.pression_max
+        return seuil is not None and self.pression_bar > seuil
+
+    def clean(self):
+        _pas_dans_le_futur(self.date)
+        exiger_positif(self.pression_bar, "pression_bar", "La pression", strict=False)
+
+    def save(self, *args, **kwargs):
+        creation = self._state.adding
+        super().save(*args, **kwargs)
+        if creation and self.au_dessus_du_seuil:
+            from apps.comptes.models import Profil
+            from apps.core.notifications import notifier
+            notifier(
+                f"Pression trop haute : {self.equipement.designation}",
+                f"{self.pression_bar} bar le {self.date:%d/%m/%Y} (maximum {self.pression_max} bar) : encrassement probable.",
+                document=self, profils=[Profil.TECHNICIEN_EAU],
+            )
+
+
+class TypePerte(models.TextChoices):
+    NORMALE = "NORMALE", "Perte normale (absorbée dans le coût au m³)"
+    ANORMALE = "ANORMALE", "Perte anormale (exclue du coût standard, suivie à part)"
+
+
+class CausePerte(models.TextChoices):
+    RINCAGE_BOUTEILLES = "RINCAGE_BOUTEILLES", "Rinçage des bouteilles"
+    LAVAGE_FILTRES = "LAVAGE_FILTRES", "Lavage des filtres"
+    CIP = "CIP", "Eau brute du CIP"
+    REJET_ULTRAFILTRATION = "REJET_ULTRAFILTRATION", "Rejets de l'ultrafiltration"
+    FUITE = "FUITE", "Fuite"
+    DEBORDEMENT = "DEBORDEMENT", "Débordement"
+    LOT_REJETE = "LOT_REJETE", "Lot rejeté"
+    CASSE = "CASSE", "Casse"
+    AUTRE = "AUTRE", "Autre"
+
+
+# Onglet Paramétrage, « Types de pertes d'eau ».
+TYPE_DE_LA_CAUSE = {
+    CausePerte.RINCAGE_BOUTEILLES: TypePerte.NORMALE, CausePerte.LAVAGE_FILTRES: TypePerte.NORMALE,
+    CausePerte.CIP: TypePerte.NORMALE, CausePerte.REJET_ULTRAFILTRATION: TypePerte.NORMALE,
+    CausePerte.FUITE: TypePerte.ANORMALE, CausePerte.DEBORDEMENT: TypePerte.ANORMALE,
+    CausePerte.LOT_REJETE: TypePerte.ANORMALE, CausePerte.CASSE: TypePerte.ANORMALE,
+}
+
+
+class PerteEau(ValidationAvantEnregistrement, models.Model):
+    """
+    Perte d'eau déclarée par les techniciens ou la production (règle 5) :
+    un volume estimé, ou un nombre de bouteilles d'un format. Le type
+    (normale / anormale) découle de la cause ; pour « Autre », on le choisit.
+    Les pertes anormales seront valorisées au coût standard, hors standard.
+    """
+    usine = models.ForeignKey("industriel.Usine", verbose_name="Site eau", on_delete=models.PROTECT, related_name="+")
+    date = models.DateField("Date")
+    cause = models.CharField("Cause", max_length=25, choices=CausePerte.choices)
+    type_perte = models.CharField("Type", max_length=10, choices=TypePerte.choices, blank=True)
+    volume_estime_m3 = models.DecimalField("Volume estimé (m³)", max_digits=12, decimal_places=3, null=True, blank=True)
+    article = models.ForeignKey(
+        "referentiel.Article", verbose_name="Format des bouteilles", on_delete=models.PROTECT, null=True, blank=True, related_name="+",
+    )
+    nombre_bouteilles = models.PositiveIntegerField("Nombre de bouteilles", null=True, blank=True)
+    commentaire = models.CharField("Commentaire", max_length=200, blank=True)
+    saisi_par = models.ForeignKey("comptes.Utilisateur", verbose_name="Saisi par", on_delete=models.PROTECT, null=True, blank=True, related_name="+")
+    date_saisie = models.DateTimeField("Saisi le", auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Perte d'eau"
+        verbose_name_plural = "Pertes d'eau"
+        ordering = ["-date", "pk"]
+
+    def __str__(self):
+        return f"{self.get_cause_display()} {self.date} : {self.volume_m3} m³"
+
+    @property
+    def volume_m3(self):
+        if self.volume_estime_m3 is not None:
+            return self.volume_estime_m3
+        if self.article_id and self.nombre_bouteilles and self.article.contenance:
+            return Decimal(self.nombre_bouteilles) * self.article.contenance / 1000
+        return None
+
+    def clean(self):
+        _pas_dans_le_futur(self.date)
+        if self.cause in TYPE_DE_LA_CAUSE:
+            attendu = TYPE_DE_LA_CAUSE[self.cause]
+            if self.type_perte and self.type_perte != attendu:
+                raise ValidationError({"type_perte": f"« {CausePerte(self.cause).label} » est une {TypePerte(attendu).label.split(' (')[0].lower()}."})
+            self.type_perte = attendu
+        elif self.cause == CausePerte.AUTRE:
+            if not self.type_perte:
+                raise ValidationError({"type_perte": "Pour une cause « Autre », indiquez si la perte est normale ou anormale."})
+            if not (self.commentaire or "").strip():
+                raise ValidationError({"commentaire": "Précisez la cause."})
+        par_volume = self.volume_estime_m3 is not None
+        par_bouteilles = bool(self.article_id or self.nombre_bouteilles)
+        if par_volume == par_bouteilles:
+            raise ValidationError("Indiquez soit un volume estimé, soit un nombre de bouteilles avec leur format.")
+        if par_volume:
+            exiger_positif(self.volume_estime_m3, "volume_estime_m3", "Le volume estimé")
+        else:
+            if not (self.article_id and self.nombre_bouteilles):
+                raise ValidationError({"nombre_bouteilles": "Indiquez le format et le nombre de bouteilles."})
+            if not self.article.contenance or self.article.unite_contenance != "L":
+                raise ValidationError({"article": f"La contenance en litres du format {self.article.code} n'est pas renseignée."})

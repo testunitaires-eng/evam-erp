@@ -1,14 +1,17 @@
+from datetime import date, timedelta
 from decimal import Decimal
 
 from django.core.exceptions import ValidationError
 from django.test import TestCase
+from django.utils import timezone
 from rest_framework.test import APIClient
 
 from apps.comptes.models import Profil, Utilisateur
 from apps.eau.calculs import CalculImpossible, calcul_previsionnel, proposer_standard
+from apps.eau.traitement import synthese_mois
 from apps.eau.models import (
-    Bloc, CaracteristiquesEquipement, CoutStandardEau, ElementCout, ParametresEau, Periode, PrevisionCaptage,
-    PrevisionVolume, VersionElementCout, bloc_de_l_equipement, coefficient_mensuel, montant_mensuel_etale,
+    Bloc, CaracteristiquesEquipement, Compteur, CoutStandardEau, ElementCout, ExceptionHeures, ParametresEau, PerteEau,
+    Periode, PrevisionCaptage, PrevisionVolume, ReleveCompteur, VersionElementCout, bloc_de_l_equipement, coefficient_mensuel, montant_mensuel_etale,
     montant_mensuel_frequence, mois_courant, mois_suivant,
 )
 from apps.industriel.models import Activite, Equipement, EtapeStandard, Ligne, Poste, Usine
@@ -359,3 +362,134 @@ class CoutStandardTests(BaseClasseur):
         }, format="json")
         self.assertEqual(reponse.status_code, 201, reponse.content)
         self.assertEqual(reponse.data["volume_m3"], "35.000")
+
+
+# =====================================================================
+# Phase 3 - saisies du traitement de l'eau
+# =====================================================================
+
+NOVEMBRE = "2025-11"   # 30 jours, 5 dimanches : 25 jours du lundi au samedi
+
+
+def jour(numero, mois=11, annee=2025):
+    return date(annee, mois, numero)
+
+
+class BaseTraitement(BaseEau):
+    def setUp(self):
+        super().setUp()
+        self.site_jus = Usine.objects.create(nom="Site jus test")
+        self.compteur_forage = Compteur.objects.create(code="CF", libelle="Compteur du forage", type_compteur="COMPTEUR_FORAGE", usine=self.usine)
+        self.debit_eau = Compteur.objects.create(code="D1", libelle="Forage -> site eau", type_compteur="DEBITMETRE", usine=self.usine, site_desservi=self.usine)
+        self.debit_jus = Compteur.objects.create(code="D2", libelle="Forage -> site jus", type_compteur="DEBITMETRE", usine=self.usine, site_desservi=self.site_jus)
+        # Le forage n'est pas sur la ligne de traitement (sa propre ligne).
+        ligne_forage = Ligne.objects.create(designation="Forage", usine=self.usine, activite=self.poste_uf.ligne.activite)
+        self.pompe_forage.poste = Poste.objects.create(ligne=ligne_forage, etape=self.poste_captage.etape)
+        self.pompe_forage.save()
+        self.ligne_traitement = self.poste_uf.ligne
+        self.technicien = self.client_pour(Profil.TECHNICIEN_EAU)
+
+    def relever(self, compteur, le, index):
+        return ReleveCompteur.objects.create(compteur=compteur, date=le, index=index)
+
+    def caracteristiques(self, equipement, **champs):
+        return CaracteristiquesEquipement.objects.create(equipement=equipement, mois_application=NOVEMBRE, **champs)
+
+
+class TraitementTests(BaseTraitement):
+
+    def test_volumes_du_mois_et_part_du_site_eau(self):
+        for compteur, octobre, mi_mois, fin in ((self.compteur_forage, 1000, 1300, 1560), (self.debit_eau, 400, 500, 620), (self.debit_jus, 600, 800, 930)):
+            self.relever(compteur, jour(31, 10), octobre)
+            self.relever(compteur, jour(15), mi_mois)
+            self.relever(compteur, jour(30), fin)
+        partage = synthese_mois(self.usine, NOVEMBRE)["partage_forage"]
+        self.assertEqual(partage, {
+            "volume_site_eau_m3": "220", "volume_autres_sites_m3": "330", "part_site_eau": "0.4",
+            "compteur_forage_m3": "560", "ecart_compteur_debitmetres_m3": "10",
+        })
+
+    def test_un_debitmetre_non_releve_bloque_la_part(self):
+        self.relever(self.debit_eau, jour(30), 100)
+        synthese = synthese_mois(self.usine, NOVEMBRE)
+        self.assertIsNone(synthese["partage_forage"]["part_site_eau"])
+        self.assertTrue(any("D2" in alerte for alerte in synthese["alertes"]))
+
+    def test_index_jamais_en_baisse_ni_dans_le_futur(self):
+        self.relever(self.debit_eau, jour(10), 500)
+        self.relever(self.debit_eau, jour(20), 600)
+        for le, index in ((jour(15), 450), (jour(15), 650), (jour(25), 590), (jour(10), 520)):
+            with self.assertRaises(ValidationError):
+                self.relever(self.debit_eau, le, index)
+        with self.assertRaises(ValidationError):
+            self.relever(self.debit_eau, timezone.localdate() + timedelta(days=1), 900)
+
+    def test_heures_standard_moins_les_exceptions(self):
+        self.caracteristiques(self.pompe_forage, puissance_kw=5, heures_marche_jour=24)
+        self.caracteristiques(self.pompe_uf, puissance_kw=3, heures_marche_jour=8, jours_de_marche="LUNDI_SAMEDI")
+        self.caracteristiques(self.soutireuse, puissance_kw=10, heures_marche_jour=8, jours_de_marche="LUNDI_SAMEDI")
+        heures = lambda: {l["designation"]: (l["heures_retenues"], l["kw_heures"], l["bloc"]) for l in synthese_mois(self.usine, NOVEMBRE)["heures_machine"]}
+        self.assertEqual(heures(), {
+            "Pompe du forage": ("720", "3600", "FORAGE"), "Pompe UF": ("200", "600", "TRAITEMENT"), "Soutireuse": ("200", "2000", None),
+        })
+        # Scénario, mois 2 : la ligne de traitement s'arrête 20 h (8 + 8 + 4).
+        for numero, heures_arret in ((3, 8), (4, 8), (5, 4)):
+            ExceptionHeures.objects.create(date=jour(numero), ligne=self.ligne_traitement, heures_en_moins=heures_arret, motif="PANNE")
+        ExceptionHeures.objects.create(date=jour(2), ligne=self.ligne_traitement, heures_en_moins=5, motif="PANNE")    # dimanche : ne tourne pas
+        ExceptionHeures.objects.create(date=jour(6), equipement=self.pompe_uf, heures_en_moins=12, motif="PANNE")    # plafonné aux 8 h du jour
+        self.assertEqual(heures(), {
+            "Pompe du forage": ("720", "3600", "FORAGE"), "Pompe UF": ("172", "516", "TRAITEMENT"), "Soutireuse": ("180", "1800", None),
+        })
+        self.assertEqual(synthese_mois(self.usine, NOVEMBRE)["total_kw_heures"], "5916")
+
+    def test_exception_sur_un_equipement_ou_une_ligne(self):
+        for champs in ({}, {"equipement": self.pompe_uf, "ligne": self.ligne_traitement}, {"equipement": self.pompe_uf, "heures_en_moins": 25},
+                       {"equipement": self.pompe_uf, "motif": "AUTRE"}):
+            donnees = {"date": jour(3), "heures_en_moins": 2, "motif": "PANNE", **champs}
+            with self.assertRaises(ValidationError):
+                ExceptionHeures.objects.create(**donnees)
+
+    def test_alerte_pression_trop_haute(self):
+        from apps.core.models import Notification
+        membrane = Equipement.objects.create(designation="Membrane DP1", type_equipement="TRAITEMENT", usine=self.usine, poste=self.poste_uf)
+        CaracteristiquesEquipement.objects.create(equipement=membrane, mois_application=self.passe, pression_max_bar=Decimal("2.5"))
+        Utilisateur.objects.create_user("technicien2", password="x", profil=Profil.TECHNICIEN_EAU)
+        reponse = self.technicien.post("/api/eau/releves-pression/", {"equipement": membrane.pk, "date": str(timezone.localdate()), "pression_bar": "2.4"}, format="json")
+        self.assertEqual(reponse.status_code, 201, reponse.content)
+        self.assertFalse(reponse.data["au_dessus_du_seuil"])
+        self.assertFalse(Notification.objects.exists())
+        reponse = self.technicien.post("/api/eau/releves-pression/", {"equipement": membrane.pk, "date": str(timezone.localdate()), "pression_bar": "3"}, format="json")
+        self.assertTrue(reponse.data["au_dessus_du_seuil"])
+        # L'auteur n'est pas notifié de sa propre saisie ; l'autre technicien l'est.
+        self.assertEqual(list(Notification.objects.values_list("destinataire__username", flat=True)), ["technicien2"])
+
+    def test_pertes_type_selon_la_cause_et_volume(self):
+        format_15 = Article.objects.create(
+            type_article="PRODUIT_FINI", unite_mesure="UNITE", famille=FamilleArticle.objects.get_or_create(nom="Eau")[0],
+            format=FormatArticle.objects.get_or_create(valeur="150 cl")[0], contenance=Decimal("1.5"), unite_contenance="L",
+            unite_vente=UniteVenteArticle.objects.get_or_create(nom="Pack de 6")[0],
+        )
+        fuite = PerteEau.objects.create(usine=self.usine, date=jour(4), cause="FUITE", volume_estime_m3=2)
+        self.assertEqual(fuite.type_perte, "ANORMALE")
+        rinçage = PerteEau.objects.create(usine=self.usine, date=jour(5), cause="RINCAGE_BOUTEILLES", article=format_15, nombre_bouteilles=1000)
+        self.assertEqual((rinçage.type_perte, rinçage.volume_m3), ("NORMALE", Decimal("1.5")))
+        for champs in ({"cause": "FUITE", "type_perte": "NORMALE", "volume_estime_m3": 1}, {"cause": "AUTRE", "volume_estime_m3": 1, "commentaire": "x"},
+                       {"cause": "AUTRE", "type_perte": "NORMALE", "volume_estime_m3": 1}, {"cause": "CASSE"},
+                       {"cause": "CASSE", "volume_estime_m3": 1, "nombre_bouteilles": 10}, {"cause": "CASSE", "nombre_bouteilles": 10}):
+            with self.assertRaises(ValidationError, msg=champs):
+                PerteEau.objects.create(usine=self.usine, date=jour(6), **champs)
+        self.assertEqual(synthese_mois(self.usine, NOVEMBRE)["pertes"], {"normales_m3": "1.5", "anormales_m3": "2", "declarations": 2})
+
+    def test_droits_des_saisies(self):
+        donnees = {"compteur": self.debit_eau.pk, "date": str(timezone.localdate()), "index": "100"}
+        self.assertEqual(self.client_pour(Profil.CONTROLE_GESTION).post("/api/eau/releves-compteurs/", donnees, format="json").status_code, 403)
+        reponse = self.technicien.post("/api/eau/releves-compteurs/", donnees, format="json")
+        self.assertEqual(reponse.status_code, 201, reponse.content)
+        self.assertEqual(reponse.data["saisi_par_nom"], "technicien_eau")
+        perte = {"usine": self.usine.pk, "date": str(timezone.localdate()), "cause": "CASSE", "volume_estime_m3": "0.5"}
+        reponse = self.client_pour(Profil.AGENT_PRODUCTION).post("/api/eau/pertes/", perte, format="json")
+        self.assertEqual((reponse.status_code, reponse.data.get("type_perte")), (201, "ANORMALE"))
+        url = f"/api/eau/traitement/synthese/?usine={self.usine.pk}&mois={self.courant}"
+        for profil in (Profil.TECHNICIEN_EAU, Profil.CONTROLE_GESTION, Profil.COMPTABILITE_DAF):
+            self.assertEqual(self.client_pour(profil).get(url).status_code, 200)
+        self.assertEqual(self.client_pour(Profil.CAISSIER).get(url).status_code, 403)

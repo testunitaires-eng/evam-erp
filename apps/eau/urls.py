@@ -11,5 +11,13 @@ router.register("previsions-captage", views.PrevisionCaptageViewSet, basename="p
 router.register("elements-cout", views.ElementCoutViewSet, basename="elementcout")
 router.register("versions-elements-cout", views.VersionElementCoutViewSet, basename="versionelementcout")
 router.register("couts-standards", views.CoutStandardEauViewSet, basename="coutstandardeau")
+router.register("compteurs", views.CompteurViewSet, basename="compteur")
+router.register("releves-compteurs", views.ReleveCompteurViewSet, basename="relevecompteur")
+router.register("exceptions-heures", views.ExceptionHeuresViewSet, basename="exceptionheures")
+router.register("releves-pression", views.RelevePressionViewSet, basename="relevepression")
+router.register("pertes", views.PerteEauViewSet, basename="perteeau")
 
-urlpatterns = [path("listes/", views.listes, name="eau-listes")] + router.urls
+urlpatterns = [
+    path("listes/", views.listes, name="eau-listes"),
+    path("traitement/synthese/", views.synthese_traitement, name="eau-synthese-traitement"),
+] + router.urls

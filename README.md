@@ -409,8 +409,36 @@ Les contrôles qualité restent dans le module `qualite` et les
 consommations dans `stocks` : leur rattachement au coût de l'eau se fera
 avec le coût réel.
 
-À venir : maintenance, coût réel et clôture, révision du standard, puis
-valorisation PEPS / FIFO (en attente de l'avis de l'expert-comptable).
+Phase 4 (maintenance) :
+- Le **plan de maintenance préventive**, ce sont les éléments de coût
+  de la famille « Préventive » (opération, équipement, fréquence +
+  période, versionnés) : rien n'est saisi deux fois.
+- `/api/eau/interventions/` (techniciens, sans montant) : préventive
+  (rattachée à une opération du plan), au besoin (équipement réparé
+  obligatoire) ou remplacement (pièce étalée remplacée + quantité), sur
+  un équipement du forage ou du traitement. Réparations et
+  remplacements notifient le contrôle de gestion et la comptabilité
+  (facture à rattacher, nouvelle pièce à enregistrer).
+- `/api/eau/installations/` (contrôle de gestion, avec les prix) : les
+  pièces étalées réellement en place, lot par lot (mois d'installation,
+  quantité, prix, durée de vie). Un lot qui en remplace un autre retire
+  la quantité de l'ancien à partir de son mois ; la part pas encore
+  étalée de l'ancien prix est la **valeur résiduelle**, charge
+  exceptionnelle du mois (membrane de 1 000 000 sur 48 mois remplacée
+  après 12 mois → 750 000). Un lot déjà remplacé ne se modifie plus.
+- `GET /api/eau/maintenance/echeances/?usine=<id>` (sans aucun prix) :
+  prochaine échéance de chaque opération préventive (dernière
+  intervention + durée de la période ÷ fréquence, ex : 3 fois par an =
+  tous les 122 jours) et fin de vie de chaque lot en place.
+- `python manage.py alertes_eau`, à planifier chaque jour : préventive à
+  faire (7 jours avant, puis à l'échéance) et fin de vie (dernier mois
+  de la durée de vie), envoyées une seule fois aux techniciens et au
+  contrôle de gestion.
+
+À venir : coût réel et clôture (dont le rattachement des factures de
+réparation et l'étalement des grosses réparations), révision du
+standard, puis valorisation PEPS / FIFO (en attente de l'avis de
+l'expert-comptable).
 
 ---
 
@@ -479,4 +507,5 @@ python manage.py creer_comptes_demo               # comptes de démonstration (u
 python manage.py initialiser_matrice_fiscale      # codes fiscaux de départ
 python manage.py initialiser_referentiel_valeurs  # valeurs de référence de départ
 python manage.py detecter_anomalies               # contrôles d'anomalies périodiques
+python manage.py alertes_eau                      # alertes de maintenance du site eau (chaque jour)
 ```

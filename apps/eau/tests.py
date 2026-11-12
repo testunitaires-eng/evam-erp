@@ -493,3 +493,200 @@ class TraitementTests(BaseTraitement):
         for profil in (Profil.TECHNICIEN_EAU, Profil.CONTROLE_GESTION, Profil.COMPTABILITE_DAF):
             self.assertEqual(self.client_pour(profil).get(url).status_code, 200)
         self.assertEqual(self.client_pour(Profil.CAISSIER).get(url).status_code, 403)
+
+
+# =====================================================================
+# Phase 4 - maintenance
+# =====================================================================
+
+from apps.core.models import Notification  # noqa: E402
+from apps.eau.maintenance import Statut, echeances_preventives, envoyer_alertes, fins_de_vie, intervalle_jours  # noqa: E402
+from apps.eau.models import AlerteEnvoyee, Installation, Intervention  # noqa: E402
+
+
+class BaseMaintenance(BaseEau):
+    def setUp(self):
+        super().setUp()
+        etape = lambda code: EtapeStandard.objects.get(code=code)
+        self.membrane = Equipement.objects.create(designation="Membrane DP1", type_equipement="TRAITEMENT", usine=self.usine, poste=self.poste_uf)
+        self.dp1 = ElementCout.objects.create(
+            usine=self.usine, libelle="Membrane DP1", etape=etape("ULTRAFILTRATION"), equipement=self.membrane,
+            famille="ETALEE", categorie="DUREE_DE_VIE", unite="unité",
+        )
+        VersionElementCout.objects.create(element=self.dp1, mois_application="2025-01", quantite=1, prix_unitaire=1000000, duree_vie_mois=48)
+        self.entretien = ElementCout.objects.create(
+            usine=self.usine, libelle="Entretien préventif pompe du forage", etape=etape("CAPTAGE"), equipement=self.pompe_forage,
+            famille="PREVENTIVE", categorie="MAINTENANCE_PREVENTIVE", unite="intervention",
+        )
+        VersionElementCout.objects.create(element=self.entretien, mois_application="2025-01", quantite=1, prix_unitaire=120000, frequence=3, periode="AN")
+        self.panne = ElementCout.objects.create(
+            usine=self.usine, libelle="Réparations UF", etape=etape("ULTRAFILTRATION"), famille="AU_BESOIN", categorie="MAINTENANCE_AU_BESOIN",
+        )
+
+    def intervenir(self, type_intervention, le, **champs):
+        equipement = champs.pop("equipement", self.pompe_forage if type_intervention == "PREVENTIVE" else self.membrane)
+        return Intervention.objects.create(
+            equipement=equipement, type_intervention=type_intervention, date=le, description="Intervention test", **champs,
+        )
+
+    def lot_dp1(self, mois="2025-01", **champs):
+        valeurs = {"quantite": 1, "prix_unitaire": 1000000, "duree_vie_mois": 48, **champs}
+        return Installation.objects.create(element=self.dp1, mois_installation=mois, **valeurs)
+
+
+class MaintenanceTests(BaseMaintenance):
+
+    def test_intervalle_entre_deux_operations(self):
+        self.assertEqual(intervalle_jours(3, Periode.AN), 122)
+        self.assertEqual(intervalle_jours(2, Periode.MOIS), 15)
+        self.assertEqual(intervalle_jours(1, Periode.SEMAINE), 7)
+        self.assertEqual(intervalle_jours(4, Periode.JOUR), 1)
+
+    def test_remplacement_anticipe_de_la_membrane_dp1_scenario_mois_3(self):
+        """Onglet « Scénario 3 mois » : 1 000 000 x (48 - 12) ÷ 48 = 750 000 ; étalement +2 083,33 au mois du remplacement."""
+        ancien = self.lot_dp1("2025-01")
+        remplacement = self.intervenir("REMPLACEMENT", date(2026, 1, 15), element_remplace=self.dp1)
+        self.assertEqual(remplacement.quantite_remplacee, 1)
+        nouveau = self.lot_dp1("2026-01", prix_unitaire=1100000, remplace=ancien, intervention=remplacement)
+        self.assertEqual(nouveau.mois_deja_etales, 12)
+        self.assertEqual(nouveau.valeur_residuelle, Decimal(750000))
+        self.assertEqual(ancien.montant_etale("2025-12").quantize(CENTIME), Decimal("20833.33"))
+        self.assertEqual(ancien.montant_etale("2026-01"), 0)        # sa part du mois est dans la valeur résiduelle
+        self.assertEqual(nouveau.montant_etale("2025-12"), 0)
+        self.assertEqual(nouveau.montant_etale("2026-01").quantize(CENTIME), Decimal("22916.67"))
+        variation = nouveau.montant_etale("2026-01") - ancien.montant_etale("2025-12")
+        self.assertEqual(variation.quantize(CENTIME), Decimal("2083.33"))
+        # Étalé jusqu'au bout de sa durée de vie, puis plus rien.
+        self.assertEqual(nouveau.dernier_mois, "2029-12")
+        self.assertEqual(nouveau.montant_etale("2030-01"), 0)
+
+    def test_remplacement_apres_la_fin_de_vie_sans_valeur_residuelle(self):
+        ancien = self.lot_dp1("2020-01")
+        self.assertEqual(self.lot_dp1("2025-03", remplace=ancien).valeur_residuelle, 0)
+
+    def test_remplacement_partiel_d_un_lot(self):
+        lampes = ElementCout.objects.create(
+            usine=self.usine, libelle="Lampes UV", etape=EtapeStandard.objects.get(code="UV"), famille="ETALEE", categorie="DUREE_DE_VIE",
+        )
+        lot = Installation.objects.create(element=lampes, mois_installation="2025-01", quantite=2, prix_unitaire=120000, duree_vie_mois=12)
+        neuve = Installation.objects.create(element=lampes, mois_installation="2025-07", quantite=1, prix_unitaire=130000, duree_vie_mois=12, remplace=lot)
+        self.assertEqual(neuve.valeur_residuelle, Decimal(60000))   # 120 000 x 1 x 6 ÷ 12
+        self.assertEqual(lot.quantite_en_place("2025-07"), 1)
+        self.assertEqual(lot.montant_etale("2025-07"), Decimal(10000))
+        with self.assertRaises(ValidationError):   # il ne reste qu'une lampe dans l'ancien lot
+            Installation.objects.create(element=lampes, mois_installation="2025-08", quantite=2, prix_unitaire=1, duree_vie_mois=12, remplace=lot)
+
+    def test_regles_des_lots(self):
+        ancien = self.lot_dp1("2025-01")
+        with self.assertRaises(ValidationError):   # pas un élément étalé
+            Installation.objects.create(element=self.entretien, mois_installation="2025-01", quantite=1, prix_unitaire=1, duree_vie_mois=1)
+        with self.assertRaises(ValidationError):   # remplacement avant l'installation de l'ancien lot
+            self.lot_dp1("2025-01", remplace=ancien)
+        remplacement = self.intervenir("REMPLACEMENT", date(2026, 1, 15), element_remplace=self.dp1)
+        with self.assertRaises(ValidationError):   # pas le mois de l'intervention
+            self.lot_dp1("2026-02", remplace=ancien, intervention=remplacement)
+        with self.assertRaises(ValidationError):   # intervention sans lot remplacé
+            self.lot_dp1("2026-01", intervention=remplacement)
+        self.lot_dp1("2026-01", remplace=ancien, intervention=remplacement)
+        ancien.prix_unitaire = 900000
+        with self.assertRaises(ValidationError):   # lot déjà remplacé : figé
+            ancien.save()
+        with self.assertRaises(ValidationError):
+            ancien.delete()
+        with self.assertRaises(ValidationError):   # sa nouvelle pièce est enregistrée
+            remplacement.delete()
+
+    def test_regles_des_interventions(self):
+        with self.assertRaises(ValidationError):   # préventive sans opération du plan
+            self.intervenir("PREVENTIVE", date(2025, 3, 1))
+        with self.assertRaises(ValidationError):   # l'opération n'est pas préventive
+            self.intervenir("PREVENTIVE", date(2025, 3, 1), operation=self.dp1)
+        with self.assertRaises(ValidationError):   # opération d'un autre équipement
+            self.intervenir("PREVENTIVE", date(2025, 3, 1), operation=self.entretien, equipement=self.pompe_uf)
+        with self.assertRaises(ValidationError):   # soutireuse : hors coût de l'eau
+            self.intervenir("AU_BESOIN", date(2025, 3, 1), equipement=self.soutireuse)
+        with self.assertRaises(ValidationError):   # remplacement sans pièce
+            self.intervenir("REMPLACEMENT", date(2025, 3, 1))
+        with self.assertRaises(ValidationError):   # pièce remplacée sur une réparation
+            self.intervenir("AU_BESOIN", date(2025, 3, 1), element_remplace=self.dp1)
+        with self.assertRaises(ValidationError):   # date future
+            self.intervenir("AU_BESOIN", timezone.localdate() + timedelta(days=1))
+        self.intervenir("AU_BESOIN", date(2025, 3, 1), equipement=self.pompe_uf)
+
+    def test_echeances_de_la_maintenance_preventive(self):
+        """3 fois par an = tous les 122 jours, depuis le début du plan (01/01/2025) puis depuis la dernière intervention."""
+        statut = lambda jour: {l["libelle"]: (l["prochaine_echeance"], l["statut"]) for l in echeances_preventives(self.usine, jour)}
+        cle = self.entretien.libelle
+        self.assertEqual(statut(date(2025, 4, 1))[cle], ("2025-05-03", Statut.A_VENIR))
+        self.assertEqual(statut(date(2025, 4, 28))[cle], ("2025-05-03", Statut.A_FAIRE))
+        self.assertEqual(statut(date(2025, 5, 10))[cle], ("2025-05-03", Statut.EN_RETARD))
+        self.intervenir("PREVENTIVE", date(2025, 5, 10), operation=self.entretien)
+        self.assertEqual(statut(date(2025, 5, 10))[cle], ("2025-09-09", Statut.A_VENIR))
+        # Opération retirée du plan : plus d'échéance.
+        VersionElementCout.objects.create(element=self.entretien, mois_application=self.suivant, retire=True)
+        annee, numero = (int(x) for x in self.suivant.split("-"))
+        self.assertNotIn(cle, statut(date(annee, numero, 1)))
+
+    def test_fin_de_vie(self):
+        Installation.objects.create(
+            element=ElementCout.objects.create(usine=self.usine, libelle="Charbon actif", etape=EtapeStandard.objects.get(code="PREFILTRATION"),
+                                               famille="ETALEE", categorie="DUREE_DE_VIE"),
+            mois_installation="2025-01", quantite=200, prix_unitaire=3000, duree_vie_mois=12,
+        )
+        statut = lambda jour: {l["libelle"]: l["statut"] for l in fins_de_vie(self.usine, jour)}
+        self.assertEqual(statut(date(2025, 11, 30))["Charbon actif"], Statut.EN_SERVICE)
+        self.assertEqual(statut(date(2025, 12, 1))["Charbon actif"], Statut.FIN_DE_VIE_PROCHE)
+        self.assertEqual(statut(date(2026, 1, 1))["Charbon actif"], Statut.FIN_DE_VIE_DEPASSEE)
+
+    def test_alertes_envoyees_une_seule_fois(self):
+        for profil in (Profil.TECHNICIEN_EAU, Profil.CONTROLE_GESTION, Profil.COMPTABILITE_DAF):
+            Utilisateur.objects.create_user(profil.lower(), password="x", profil=profil)
+        self.lot_dp1("2025-01", duree_vie_mois=12)
+        recues = lambda: Notification.objects.filter(destinataire__profil=Profil.TECHNICIEN_EAU).count()
+        self.assertEqual(envoyer_alertes(date(2025, 4, 1)), 0)
+        self.assertEqual(envoyer_alertes(date(2025, 4, 28)), 1)    # 7 jours avant
+        self.assertEqual(envoyer_alertes(date(2025, 4, 29)), 0)    # déjà envoyée
+        self.assertEqual(envoyer_alertes(date(2025, 5, 3)), 1)     # à l'échéance
+        self.assertEqual(envoyer_alertes(date(2025, 12, 1)), 1)    # toujours en retard (déjà signalé) ; fin de vie de la membrane
+        self.assertEqual(envoyer_alertes(date(2025, 12, 2)), 0)
+        self.assertEqual(recues(), 3)
+        self.assertEqual(Notification.objects.filter(destinataire__profil=Profil.CONTROLE_GESTION).count(), 3)
+        self.assertEqual(Notification.objects.filter(destinataire__profil=Profil.COMPTABILITE_DAF).count(), 0)
+        self.assertEqual(AlerteEnvoyee.objects.count(), 3)
+
+    def test_reparation_et_remplacement_notifient_controle_de_gestion_et_comptabilite(self):
+        for profil in (Profil.TECHNICIEN_EAU, Profil.CONTROLE_GESTION, Profil.COMPTABILITE_DAF):
+            Utilisateur.objects.create_user(profil.lower(), password="x", profil=profil)
+        self.intervenir("PREVENTIVE", date(2025, 3, 1), operation=self.entretien)
+        self.assertFalse(Notification.objects.exists())
+        self.intervenir("AU_BESOIN", date(2025, 3, 2), equipement=self.pompe_uf)
+        self.intervenir("REMPLACEMENT", date(2025, 3, 3), element_remplace=self.dp1)
+        for profil in (Profil.CONTROLE_GESTION, Profil.COMPTABILITE_DAF):
+            self.assertEqual(Notification.objects.filter(destinataire__profil=profil).count(), 2)
+        self.assertFalse(Notification.objects.filter(destinataire__profil=Profil.TECHNICIEN_EAU).exists())
+
+    def test_droits_et_api(self):
+        technicien = self.client_pour(Profil.TECHNICIEN_EAU)
+        controle = self.client_pour(Profil.CONTROLE_GESTION)
+        reponse = technicien.post("/api/eau/interventions/", {
+            "equipement": self.membrane.pk, "type_intervention": "REMPLACEMENT", "date": "2026-01-15",
+            "description": "Membrane abîmée", "element_remplace": self.dp1.pk,
+        }, format="json")
+        self.assertEqual(reponse.status_code, 201, reponse.data)
+        self.assertFalse(reponse.data["nouvelle_piece_enregistree"])
+        self.assertEqual(controle.post("/api/eau/interventions/", {}, format="json").status_code, 403)
+        # Les lots portent les prix : pas les techniciens.
+        self.assertEqual(technicien.get("/api/eau/installations/").status_code, 403)
+        ancien = self.lot_dp1("2025-01")
+        reponse = controle.post("/api/eau/installations/", {
+            "element": self.dp1.pk, "quantite": 1, "prix_unitaire": 1100000, "duree_vie_mois": 48,
+            "mois_installation": "2026-01", "remplace": ancien.pk, "intervention": Intervention.objects.get().pk,
+        }, format="json")
+        self.assertEqual(reponse.status_code, 201, reponse.data)
+        self.assertEqual((reponse.data["valeur_residuelle"], reponse.data["montant_etale_mensuel"]), ("750000.00", "22916.67"))
+        # Échéances : consultables par les techniciens, sans aucun prix.
+        reponse = technicien.get(f"/api/eau/maintenance/echeances/?usine={self.usine.pk}")
+        self.assertEqual(reponse.status_code, 200)
+        self.assertNotIn("prix", str(reponse.data))
+        self.assertEqual([l["libelle"] for l in reponse.data["preventive"]], [self.entretien.libelle])
+        self.assertEqual(technicien.get("/api/eau/maintenance/echeances/").status_code, 400)

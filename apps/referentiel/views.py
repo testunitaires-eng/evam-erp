@@ -21,7 +21,9 @@ class ArticleViewSet(viewsets.ModelViewSet):
     queryset = models.Article.objects.all()
     serializer_class = serializers.ArticleSerializer
     permission_classes = [acces(
-        lecture=(Profil.DIRECTION, Profil.RESPONSABLE_QUALITE, Profil.MAGASINIER, Profil.COMMERCIAL, Profil.COMPTABILITE_DAF,),
+        # Contrôle de gestion et techniciens de l'eau : choix du format (prévisions de bouteilles, pertes en bouteilles).
+        lecture=(Profil.DIRECTION, Profil.RESPONSABLE_QUALITE, Profil.MAGASINIER, Profil.COMMERCIAL, Profil.COMPTABILITE_DAF,
+                 Profil.CONTROLE_GESTION, Profil.TECHNICIEN_EAU),
         ecriture=(Profil.RESPONSABLE_PRODUCTION, Profil.RESPONSABLE_ACHATS, Profil.ADMIN_SI,),
     )]
     filterset_fields = ["type_article", "famille", "actif"]

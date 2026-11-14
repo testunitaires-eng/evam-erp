@@ -103,7 +103,8 @@ class ChargeViewSet(viewsets.ModelViewSet):
     """Charges de la période (factures, salaires, amortissements...), saisies par la DAF."""
     queryset = models.Charge.objects.select_related("nature", "nature__etape", "activite", "usine", "facture", "ordre_fabrication")
     serializer_class = serializers.ChargeSerializer
-    permission_classes = [PROFILS_COUTS]
+    # Le contrôle de gestion consulte les charges (il donne les ordres d'imputation du coût de l'eau).
+    permission_classes = [acces(lecture=(Profil.DIRECTION, Profil.CONTROLE_GESTION), ecriture=(Profil.COMPTABILITE_DAF, Profil.ADMIN_SI))]
     filterset_fields = ["periode", "nature", "activite", "usine", "facture", "equipement", "ordre_fabrication", "tournee",
                         "statut_donnee", "statut_repartition", "nature__categorie"]
     search_fields = ["numero", "source"]

@@ -1354,6 +1354,8 @@ class ValidationSansImputation(VerrouCloture, ValidationAvantEnregistrement, mod
         if self.mois > mois_courant():
             raise ValidationError({"mois": "On ne valide pas à l'avance un mois qui n'a pas commencé."})
         if self.element_id:
+            if ValidationSansImputation.objects.filter(element_id=self.element_id, mois=self.mois).exclude(pk=self.pk).exists():
+                raise ValidationError({"mois": f"« {self.element.libelle} » est déjà validée sans imputation pour {self.mois}."})
             if not self.element.attendue_chaque_mois:
                 raise ValidationError({"element": f"« {self.element.libelle} » n'est pas une charge attendue chaque mois."})
             if est_imputee(self.element, self.mois):

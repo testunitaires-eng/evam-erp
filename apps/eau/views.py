@@ -121,9 +121,13 @@ class PrevisionCaptageViewSet(VersionneeViewSet):
 
 
 class ElementCoutViewSet(viewsets.ModelViewSet):
+    """
+    Éléments du coût de l'eau (sans prix : ils sont dans les versions). En lecture aussi pour les techniciens
+    (opération du plan préventif, pièce remplacée) et le magasin (destination d'une sortie de stock).
+    """
     queryset = models.ElementCout.objects.select_related("etape__sous_etape_de", "equipement", "usine")
     serializer_class = serializers.ElementCoutSerializer
-    permission_classes = [PARAMETRES]
+    permission_classes = [acces(lecture=CONSULTATION + (Profil.TECHNICIEN_EAU, Profil.MAGASINIER), ecriture=(Profil.CONTROLE_GESTION,))]
     filterset_fields = ["usine", "etape", "equipement", "famille", "categorie"]
     search_fields = ["libelle"]
 

@@ -1140,3 +1140,72 @@ class PepsTests(BaseScenario):
             self.mouvement("SORTIE", 1, (2025, 11, 1), element=self.elements["Charbon actif"])
         with self.assertRaises(ValidationError):
             self.mouvement("SORTIE", 1, (2025, 11, 1), element=self.elements["Électricité pompe du forage"])
+
+
+# =====================================================================
+# Corrections : droits de lecture et messages de doublon
+# =====================================================================
+
+class DroitsEtDoublonsTests(BaseMaintenance):
+
+    def message(self, reponse):
+        return str(reponse.data)
+
+    def test_controle_de_gestion_et_technicien_lisent_les_formats(self):
+        for profil in (Profil.CONTROLE_GESTION, Profil.TECHNICIEN_EAU):
+            self.assertEqual(self.client_pour(profil).get("/api/referentiel/articles/").status_code, 200, profil)
+        self.assertEqual(self.client_pour(Profil.TECHNICIEN_EAU).post("/api/referentiel/articles/", {}, format="json").status_code, 403)
+
+    def test_technicien_et_magasin_lisent_les_elements_sans_les_prix(self):
+        for profil in (Profil.TECHNICIEN_EAU, Profil.MAGASINIER):
+            api = self.client_pour(profil)
+            self.assertEqual(api.get("/api/eau/elements-cout/").status_code, 200, profil)
+            self.assertEqual(api.post("/api/eau/elements-cout/", {}, format="json").status_code, 403, profil)
+            self.assertEqual(api.get("/api/eau/versions-elements-cout/").status_code, 403, profil)   # les prix restent fermés
+
+    def test_technicien_saisit_une_intervention_preventive_et_un_remplacement(self):
+        technicien = self.client_pour(Profil.TECHNICIEN_EAU)
+        elements = technicien.get("/api/eau/elements-cout/").data
+        elements = elements["results"] if isinstance(elements, dict) else elements
+        par_libelle = {e["libelle"]: e["id"] for e in elements}
+        reponse = technicien.post("/api/eau/interventions/", {
+            "equipement": self.pompe_forage.pk, "type_intervention": "PREVENTIVE", "date": "2025-05-10",
+            "description": "Entretien de la pompe", "operation": par_libelle["Entretien préventif pompe du forage"],
+        }, format="json")
+        self.assertEqual(reponse.status_code, 201, reponse.data)
+        reponse = technicien.post("/api/eau/interventions/", {
+            "equipement": self.membrane.pk, "type_intervention": "REMPLACEMENT", "date": "2025-05-11",
+            "description": "Membrane abîmée", "element_remplace": par_libelle["Membrane DP1"],
+        }, format="json")
+        self.assertEqual(reponse.status_code, 201, reponse.data)
+
+    def test_messages_metier_pour_les_doublons(self):
+        controle = self.client_pour(Profil.CONTROLE_GESTION)
+        donnees = {"usine": self.usine.pk, "mois_application": "2025-01", "jour_cloture": 10}
+        self.assertEqual(controle.post("/api/eau/parametres/", donnees, format="json").status_code, 201)
+        reponse = controle.post("/api/eau/parametres/", donnees, format="json")
+        self.assertEqual(reponse.status_code, 400)
+        self.assertIn("Une version existe déjà pour 2025-01", self.message(reponse))
+        reponse = controle.post("/api/eau/versions-elements-cout/", {
+            "element": self.dp1.pk, "mois_application": "2025-01", "quantite": 1, "prix_unitaire": 1, "duree_vie_mois": 12,
+        }, format="json")
+        self.assertIn("Une version existe déjà pour 2025-01", self.message(reponse))
+
+        compteur = Compteur.objects.create(code="CF-T", libelle="Compteur du forage", type_compteur="COMPTEUR_FORAGE", usine=self.usine)
+        technicien = self.client_pour(Profil.TECHNICIEN_EAU)
+        releve = {"compteur": compteur.pk, "date": "2025-05-10", "index": 100}
+        self.assertEqual(technicien.post("/api/eau/releves-compteurs/", releve, format="json").status_code, 201)
+        reponse = technicien.post("/api/eau/releves-compteurs/", {**releve, "index": 120}, format="json")
+        self.assertEqual(reponse.status_code, 400)
+        self.assertIn("Ce compteur est déjà relevé le 10/05/2025", self.message(reponse))
+
+        ElementCout.objects.filter(pk=self.entretien.pk).update(attendue_chaque_mois=True)
+        validation = {"element": self.entretien.pk, "mois": "2025-05", "motif": "Aucun entretien ce mois"}
+        self.assertEqual(controle.post("/api/eau/validations-sans-imputation/", validation, format="json").status_code, 201)
+        reponse = controle.post("/api/eau/validations-sans-imputation/", validation, format="json")
+        self.assertIn("déjà validée sans imputation pour 2025-05", self.message(reponse))
+
+    def test_controle_de_gestion_lit_les_charges(self):
+        controle = self.client_pour(Profil.CONTROLE_GESTION)
+        self.assertEqual(controle.get("/api/couts/charges/").status_code, 200)
+        self.assertEqual(controle.post("/api/couts/charges/", {}, format="json").status_code, 403)

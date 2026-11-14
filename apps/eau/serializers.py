@@ -16,6 +16,7 @@ class ParametresEauSerializer(VersionneeSerializer):
 
     class Meta:
         model = models.ParametresEau
+        validators = []   # doublon : message métier du clean() du modèle (la contrainte en base reste)
         fields = "__all__"
         read_only_fields = ["saisi_par", "date_saisie"]
 
@@ -27,6 +28,7 @@ class CaracteristiquesEquipementSerializer(VersionneeSerializer):
 
     class Meta:
         model = models.CaracteristiquesEquipement
+        validators = []   # doublon : message métier du clean() du modèle (la contrainte en base reste)
         fields = "__all__"
         read_only_fields = ["saisi_par", "date_saisie"]
 
@@ -37,6 +39,7 @@ class PrevisionVolumeSerializer(VersionneeSerializer):
 
     class Meta:
         model = models.PrevisionVolume
+        validators = []   # doublon : message métier du clean() du modèle (la contrainte en base reste)
         fields = "__all__"
         read_only_fields = ["saisi_par", "date_saisie"]
 
@@ -46,6 +49,7 @@ class PrevisionCaptageSerializer(VersionneeSerializer):
 
     class Meta:
         model = models.PrevisionCaptage
+        validators = []   # doublon : message métier du clean() du modèle (la contrainte en base reste)
         fields = "__all__"
         read_only_fields = ["saisi_par", "date_saisie"]
 
@@ -66,6 +70,7 @@ class VersionElementCoutSerializer(VersionneeSerializer):
 
     class Meta:
         model = models.VersionElementCout
+        validators = []   # doublon : message métier du clean() du modèle (la contrainte en base reste)
         fields = "__all__"
         read_only_fields = ["saisi_par", "date_saisie"]
 
@@ -99,6 +104,7 @@ class ReleveCompteurSerializer(SaisieSerializer):
 
     class Meta:
         model = models.ReleveCompteur
+        validators = []   # doublon : message métier du clean() du modèle (la contrainte en base reste)
         fields = "__all__"
         read_only_fields = ["saisi_par", "date_saisie"]
 
@@ -180,6 +186,7 @@ class ValidationSansImputationSerializer(ValidationModeleMixin, serializers.Mode
 
     class Meta:
         model = models.ValidationSansImputation
+        validators = []   # doublon : message métier du clean() du modèle (la contrainte en base reste)
         fields = "__all__"
         read_only_fields = ["valide_par", "date_validation"]
 
